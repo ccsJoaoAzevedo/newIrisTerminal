@@ -6,6 +6,7 @@ use egui::{Context, Key};
 use crate::config::{self, ensure_config_tree, load_themes, LogMode, Profile, Settings, Theme};
 use crate::features::autologon::{Autologon, State as AutoState};
 use crate::features::export::{self, Range};
+use crate::features::global_browser;
 use crate::features::logging::{self, SessionLog};
 use crate::features::macros::{self, MacroGroup};
 use crate::plugins::PluginHost;
@@ -16,16 +17,56 @@ use crate::ui::input;
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
 use crate::ui::terminal_view::{self, ViewState};
 
-/// Initial PTY size. The first rendered frame resizes to fit, but IRIS reads
-/// the dimensions at login, so a sane starting value avoids a visible repaint.
-const INITIAL_COLS: u16 = 80;
-const INITIAL_ROWS: u16 = 24;
+/// Fallback PTY size, used only before the first frame has measured the
+/// window. After that, new sessions open at the size the terminal is actually
+/// being drawn at.
+///
+/// This matters more than it looks: IRIS truncates output at the device right
+/// margin rather than wrapping it, so a session opened at 80 columns loses
+/// everything past column 80 until it is resized. Opening at the real size
+/// means nothing is cut in the first place.
+const FALLBACK_COLS: u16 = 80;
+const FALLBACK_ROWS: u16 = 24;
 
 /// Rotate a transcript once it passes this size.
 const LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// An in-flight structured query against the session.
+///
+/// The output still scrolls through the terminal — nothing is hidden from the
+/// user — but a copy is accumulated here so it can be parsed into a grid.
+pub struct Capture {
+    pub buffer: String,
+    pub started: std::time::Instant,
+    /// Substrings that mean the walk finished, one way or the other.
+    pub terminators: Vec<String>,
+}
+
+impl Capture {
+    pub fn new(terminators: Vec<String>) -> Self {
+        Capture {
+            buffer: String::new(),
+            started: std::time::Instant::now(),
+            terminators,
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.terminators.iter().any(|t| self.buffer.contains(t))
+    }
+
+    /// A query that never terminates must not leave the panel spinning
+    /// forever — a global can be slow, so this is generous.
+    pub fn is_expired(&self) -> bool {
+        self.started.elapsed() > std::time::Duration::from_secs(60)
+    }
+}
+
 /// One open session and everything that hangs off it.
 pub struct Tab {
+    /// Stable for this tab's lifetime and unique across tabs, so the terminal
+    /// widget keeps one identity even as tabs are opened, closed and reordered.
+    pub uid: u64,
     pub profile: Profile,
     pub session: Option<PtySession>,
     pub grid: Grid,
@@ -33,6 +74,8 @@ pub struct Tab {
     pub view: ViewState,
     pub autologon: Autologon,
     pub log: Option<SessionLog>,
+    /// Set while a structured query is running.
+    pub capture: Option<Capture>,
     /// User-set name; falls back to the OSC title, then the profile name.
     pub custom_title: Option<String>,
     /// Set when the child exits, so the tab explains itself instead of freezing.
@@ -40,21 +83,23 @@ pub struct Tab {
     pub error: Option<String>,
 }
 
+/// Source of [`Tab::uid`]. Never reused, so a closed tab's id cannot collide
+/// with a later one and resurrect its focus or selection state.
+static NEXT_TAB_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Tab {
-    pub fn new(profile: Profile, settings: &Settings) -> Self {
+    pub fn new(profile: Profile, settings: &Settings, cols: u16, rows: u16) -> Self {
         let log = open_log(&profile, settings);
         let mut tab = Tab {
+            uid: NEXT_TAB_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             autologon: Autologon::new(&profile),
-            grid: Grid::new(
-                INITIAL_COLS as usize,
-                INITIAL_ROWS as usize,
-                settings.scrollback_limit,
-            ),
+            grid: Grid::new(cols as usize, rows as usize, settings.scrollback_limit),
             profile,
             session: None,
             parser: vte::Parser::new(),
             view: ViewState::default(),
             log,
+            capture: None,
             custom_title: None,
             ended: false,
             error: None,
@@ -145,6 +190,12 @@ impl Tab {
                 let _ = session.write(&self.profile.encoding.encode(&to_send));
             }
 
+            // Feed any in-flight structured query. This runs before the
+            // password check so a capture never picks up a credential prompt.
+            if let Some(capture) = self.capture.as_mut() {
+                capture.buffer.push_str(&String::from_utf8_lossy(&decoded));
+            }
+
             let still_on_password = self.autologon.state() == AutoState::WaitPassword;
             let lines = self.grid.all_text();
             let settled = self.grid.scrollback.len();
@@ -220,6 +271,12 @@ pub struct App {
     pub macro_groups: Vec<MacroGroup>,
     plugins: PluginHost,
     panels: PanelState,
+    /// The tab whose terminal last took keyboard focus, so a tab switch can
+    /// hand focus over exactly once instead of fighting dialogs every frame.
+    focused_tab: Option<u64>,
+    /// Size the terminal was last drawn at. New sessions open at this size so
+    /// their output is never truncated at a stale width.
+    terminal_size: (u16, u16),
     show_new_tab: bool,
     new_tab_profile: Profile,
     status: Option<String>,
@@ -234,8 +291,8 @@ impl App {
         // Housekeeping that would otherwise never happen.
         let _ = logging::prune(&settings.log_dir, settings.log_retention_days);
 
-        let instances = launcher()
-            .discover()
+        let l = launcher();
+        let instances = crate::pty::launcher::instances(l.as_ref())
             .into_iter()
             .map(|i| i.name)
             .collect::<Vec<_>>();
@@ -254,7 +311,7 @@ impl App {
                     instance: instances.first().cloned().unwrap_or_default(),
                     ..Profile::default()
                 }),
-            macro_groups: load_macros(),
+            macro_groups: load_macros(&settings).groups,
             settings,
             themes,
             tabs: Vec::new(),
@@ -262,6 +319,8 @@ impl App {
             instances,
             plugins,
             panels: PanelState::default(),
+            focused_tab: None,
+            terminal_size: (FALLBACK_COLS, FALLBACK_ROWS),
             show_new_tab: false,
             status: None,
         };
@@ -287,7 +346,9 @@ impl App {
     }
 
     pub fn open_tab(&mut self, profile: Profile) {
-        self.tabs.push(Tab::new(profile, &self.settings));
+        let (cols, rows) = self.terminal_size;
+        self.tabs
+            .push(Tab::new(profile, &self.settings, cols, rows));
         self.active = self.tabs.len() - 1;
     }
 
@@ -380,6 +441,7 @@ impl App {
             }
             ui.separator();
             ui.toggle_value(&mut self.panels.show_macros, "Macros");
+            ui.toggle_value(&mut self.panels.show_globals, "Globals");
             if ui.button("Export").clicked() {
                 self.panels.show_export = true;
             }
@@ -455,10 +517,86 @@ impl App {
                 Err(e) => self.set_status(format!("Could not save settings: {e:#}")),
             },
             UiRequest::ReloadMacros => {
-                self.macro_groups = load_macros();
+                let report = load_macros(&self.settings);
+                self.macro_groups = report.groups;
                 let count: usize = self.macro_groups.iter().map(|g| g.macros.len()).sum();
-                self.set_status(format!("Reloaded {count} macros."));
+                if report.problems.is_empty() {
+                    self.set_status(format!("Reloaded {count} macros."));
+                } else {
+                    self.set_status(format!(
+                        "Reloaded {count} macros. {}",
+                        report.problems.join(" ")
+                    ));
+                }
             }
+            UiRequest::RunGlobalQuery => self.run_global_query(),
+            UiRequest::CopyGlobalPage => {
+                let text = panels::page_as_text(&self.panels.globals);
+                ctx.copy_text(text);
+                self.set_status("Copied the visible rows.");
+            }
+            UiRequest::SavePersonalMacros => {
+                let path = config::personal_macros_path();
+                let xml = macros::to_xml(&self.macro_groups);
+                match std::fs::write(&path, xml) {
+                    Ok(()) => {
+                        self.set_status(format!("Saved personal macros to {}", path.display()))
+                    }
+                    Err(e) => self.set_status(format!("Could not save macros: {e:#}")),
+                }
+            }
+        }
+    }
+
+    /// Sends the global-browser query and starts capturing its output.
+    fn run_global_query(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            self.panels.globals.message = Some("No active session.".into());
+            return;
+        };
+        if tab.session.is_none() {
+            self.panels.globals.message = Some("That session has ended.".into());
+            return;
+        }
+        if tab.capture.is_some() {
+            self.panels.globals.message = Some("A query is already running.".into());
+            return;
+        }
+
+        let script = global_browser::build_script(&self.panels.globals.query);
+        // Both terminators, so an IRIS error ends the wait as promptly as a
+        // successful walk does.
+        tab.capture = Some(Capture::new(vec!["@E@".into(), "@X@".into()]));
+        tab.send_lines(&[script]);
+
+        self.panels.globals.running = true;
+        self.panels.globals.message = None;
+        self.panels.globals.page = global_browser::Page::default();
+        self.panels.globals.page_index = 0;
+    }
+
+    /// Turns a finished capture into a page. Called once per frame.
+    fn collect_global_query(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(capture) = tab.capture.as_ref() else {
+            return;
+        };
+
+        if capture.is_done() {
+            let text = std::mem::take(&mut tab.capture).unwrap().buffer;
+            let page = global_browser::parse(&text, self.panels.globals.query.limit);
+            let count = page.nodes.len();
+            self.panels.globals.page = page;
+            self.panels.globals.running = false;
+            self.panels.globals.page_index = 0;
+            self.panels.globals.message = Some(format!("{count} nodes."));
+        } else if capture.is_expired() {
+            tab.capture = None;
+            self.panels.globals.running = false;
+            self.panels.globals.message =
+                Some("Timed out waiting for IRIS. The session is still usable.".into());
         }
     }
 
@@ -572,19 +710,16 @@ impl App {
     }
 }
 
-fn load_macros() -> Vec<MacroGroup> {
-    let path = config::macros_path();
-    if !path.exists() {
+/// Loads the organisation file (if configured) and the personal one, and
+/// reports anything that went wrong so a missing share is visible rather than
+/// silently halving the macro list.
+fn load_macros(settings: &Settings) -> macros::LoadReport {
+    let personal = config::personal_macros_path();
+    if !personal.exists() {
         // Ship the sample on first run so the format is self-documenting.
-        let _ = std::fs::write(&path, macros::SAMPLE);
+        let _ = std::fs::write(&personal, macros::SAMPLE);
     }
-    match macros::load(&path) {
-        Ok(groups) => groups,
-        Err(e) => {
-            log::error!("could not load macros: {e:#}");
-            Vec::new()
-        }
-    }
+    macros::load_all(settings.org_macros(), &personal)
 }
 
 impl eframe::App for App {
@@ -607,6 +742,7 @@ impl eframe::App for App {
             }
         }
 
+        self.collect_global_query();
         self.handle_shortcuts(ctx);
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui));
@@ -628,12 +764,25 @@ impl eframe::App for App {
                 .default_width(280.0)
                 .show(ctx, |ui| {
                     if let Some(request) =
-                        panels::macros_panel(ui, &self.macro_groups, &mut self.panels)
+                        panels::macros_panel(ui, &mut self.macro_groups, &mut self.panels)
                     {
                         requests.push(request);
                     }
                     ui.separator();
                     if let Some(request) = panels::natives_panel(ui, &mut self.panels) {
+                        requests.push(request);
+                    }
+                });
+        }
+
+        if self.panels.show_globals {
+            egui::TopBottomPanel::bottom("globals")
+                .resizable(true)
+                .default_height(280.0)
+                .show(ctx, |ui| {
+                    if let Some(request) =
+                        panels::global_browser_panel(ui, &mut self.panels.globals, &theme)
+                    {
                         requests.push(request);
                     }
                 });
@@ -676,12 +825,59 @@ impl eframe::App for App {
                     .map(|s| !s.is_empty())
                     .unwrap_or(false);
 
+                let uid = self.tabs[active].uid;
+                let take_focus = self.focused_tab != Some(uid);
+                self.focused_tab = Some(uid);
+
                 let result = {
                     let tab = &mut self.tabs[active];
-                    terminal_view::show(ui, &tab.grid, &mut tab.view, &theme, font_size)
+                    terminal_view::show(
+                        ui,
+                        &tab.grid,
+                        &mut tab.view,
+                        &theme,
+                        font_size,
+                        uid,
+                        take_focus,
+                    )
                 };
 
-                self.tabs[active].resize(result.cols, result.rows);
+                // Every tab, not just the visible one: a background session
+                // left at the old width would keep truncating its output at
+                // that width until it was next looked at.
+                self.terminal_size = (result.cols as u16, result.rows as u16);
+                for tab in &mut self.tabs {
+                    tab.resize(result.cols, result.rows);
+                }
+
+                // Right-click menu actions reuse the same paths as the
+                // keyboard shortcuts and the Export dialog.
+                if let Some(action) = result.context_action {
+                    use terminal_view::ContextAction;
+                    match action {
+                        ContextAction::CopySelection => {
+                            let tab = &self.tabs[active];
+                            if let Some(text) = tab.view.selected_text(&tab.grid) {
+                                ctx.copy_text(text);
+                            }
+                        }
+                        ContextAction::Paste => {
+                            // The clipboard is only readable through egui's
+                            // paste event, so ask for one rather than reaching
+                            // for the OS clipboard behind egui's back.
+                            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                        }
+                        ContextAction::SelectAll => {
+                            let tab = &mut self.tabs[active];
+                            let grid = &tab.grid;
+                            tab.view.select_all(grid);
+                        }
+                        ContextAction::ClearSelection => {
+                            self.tabs[active].view.clear_selection();
+                        }
+                        ContextAction::ExportScreen => self.panels.show_export = true,
+                    }
+                }
 
                 // Only the focused terminal consumes keystrokes.
                 if result.response.clicked() {
@@ -759,5 +955,9 @@ impl eframe::App for App {
 
 /// Convenience for callers that want the discovered instances without an app.
 pub fn discover_instances() -> Vec<String> {
-    launcher().discover().into_iter().map(|i| i.name).collect()
+    let l = launcher();
+    crate::pty::launcher::instances(l.as_ref())
+        .into_iter()
+        .map(|i| i.name)
+        .collect()
 }

@@ -169,6 +169,24 @@ pub fn builtin_files() -> Vec<ThemeFile> {
             font_size: 14.0,
             dark: true,
         },
+        // Ported from the author's VS Code theme, tokyo-terminal-codium:
+        // terminal.* colours where it defines them, editor.* for the cursor.
+        ThemeFile {
+            name: "Tokyo".into(),
+            background: "#2a2436".into(),
+            foreground: "#34e2e2".into(),
+            cursor: "#34e2e2".into(),
+            // #34e2e255 composited over the background.
+            selection: "#2d636f".into(),
+            ansi: ansi([
+                "#060507", "#fc5698", "#7fff00", "#fe8019", "#3465a4", "#2a2436", "#116d61",
+                "#aceeee", "#999988", "#ff3b3b", "#a3ff8c", "#ffe61c", "#0285f9", "#8b5cf6",
+                "#34e2e2", "#eceff4",
+            ]),
+            font_family: default_font_family(),
+            font_size: 14.0,
+            dark: true,
+        },
         ThemeFile {
             name: "Light".into(),
             background: "#fdfdfd".into(),

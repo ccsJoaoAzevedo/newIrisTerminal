@@ -18,9 +18,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Encoding {
-    /// Pass bytes through untouched and let `vte` decode them. What current
-    /// IRIS builds emit, and the default.
-    #[default]
+    /// Pass bytes through untouched and let `vte` decode them. Correct for an
+    /// instance whose output translation is configured properly.
     Utf8,
     /// Western European DOS codepage, as emitted by older Caché/IRIS instances
     /// on Windows in Latin-script locales.
@@ -29,11 +28,26 @@ pub enum Encoding {
     Cp1252,
     /// ISO 8859-1.
     Latin1,
+    /// Repairs text that IRIS encoded twice.
+    ///
+    /// Some instances translate their output to UTF-8 and then run the result
+    /// through a CP850 -> UTF-8 translation a second time. Each byte of the
+    /// first encoding is reinterpreted as a CP850 glyph, so `Nó` (`c3 b3`)
+    /// arrives as the box-drawing characters `├│`. Undoing it means mapping
+    /// each character back to its CP850 byte and decoding those bytes as
+    /// UTF-8 — which is exactly what the local instance needs.
+    ///
+    /// This is the default: the guards in `repair_double_encoding` make it
+    /// a no-op on a correctly-configured instance, while fixing a mangled
+    /// one.
+    #[default]
+    Cp850Doubled,
 }
 
 impl Encoding {
-    pub const ALL: [Encoding; 4] = [
+    pub const ALL: [Encoding; 5] = [
         Encoding::Utf8,
+        Encoding::Cp850Doubled,
         Encoding::Cp850,
         Encoding::Cp1252,
         Encoding::Latin1,
@@ -45,12 +59,13 @@ impl Encoding {
             Encoding::Cp850 => "CP850 (DOS Western)",
             Encoding::Cp1252 => "Windows-1252",
             Encoding::Latin1 => "ISO 8859-1",
+            Encoding::Cp850Doubled => "UTF-8 double-encoded via CP850 (repair)",
         }
     }
 
-    /// Whether this encoding needs transcoding at all.
+    /// Whether this encoding is a plain single-byte codepage.
     fn is_single_byte(self) -> bool {
-        !matches!(self, Encoding::Utf8)
+        matches!(self, Encoding::Cp850 | Encoding::Cp1252 | Encoding::Latin1)
     }
 
     /// The character a high byte (0x80..0xFF) stands for.
@@ -58,7 +73,7 @@ impl Encoding {
         match self {
             // ISO 8859-1 maps its high half straight onto U+0080..U+00FF, so
             // it needs no table.
-            Encoding::Latin1 | Encoding::Utf8 => char::from(byte),
+            Encoding::Latin1 | Encoding::Utf8 | Encoding::Cp850Doubled => char::from(byte),
             Encoding::Cp850 => CP850_HIGH[(byte - 0x80) as usize],
             Encoding::Cp1252 => CP1252_HIGH[(byte - 0x80) as usize],
         }
@@ -79,7 +94,7 @@ impl Encoding {
                 .iter()
                 .position(|c| *c == ch)
                 .map(|i| 0x80 + i as u8),
-            Encoding::Utf8 => None,
+            Encoding::Utf8 | Encoding::Cp850Doubled => None,
         }
     }
 
@@ -89,9 +104,15 @@ impl Encoding {
     /// can never split a character — the caller may pass whatever the PTY read
     /// returned without buffering.
     pub fn decode(self, bytes: &[u8]) -> Vec<u8> {
-        // Fast path: UTF-8 needs nothing, and pure ASCII is identical in every
-        // encoding here — together the overwhelming majority of output.
-        if !self.is_single_byte() || bytes.iter().all(|b| *b < 0x80) {
+        // Pure ASCII is identical in every encoding here, and is the
+        // overwhelming majority of output.
+        if bytes.iter().all(|b| *b < 0x80) {
+            return bytes.to_vec();
+        }
+        if self == Encoding::Cp850Doubled {
+            return repair_double_encoding(bytes);
+        }
+        if !self.is_single_byte() {
             return bytes.to_vec();
         }
 
@@ -112,6 +133,8 @@ impl Encoding {
     /// A character with no representation in the target codepage becomes `?`,
     /// matching what a real terminal does rather than dropping it silently.
     pub fn encode(self, text: &str) -> Vec<u8> {
+        // Input is never double-encoded: we type what IRIS should receive, and
+        // the mangling happens on its output path only.
         if !self.is_single_byte() {
             return text.as_bytes().to_vec();
         }
@@ -126,6 +149,81 @@ impl Encoding {
         }
         out
     }
+}
+
+/// Undoes one extra CP850 -> UTF-8 translation layer.
+///
+/// Some instances translate output to UTF-8 and then run the result through a
+/// CP850 -> UTF-8 translation a second time, so `Nó` (`c3 b3`) arrives as the
+/// box-drawing pair `├│`. Repairing it means mapping characters back to their
+/// CP850 bytes and reading those as UTF-8.
+///
+/// Applied blindly this would wreck genuine box-drawing output, which ERP
+/// full-screen routines do use. Three rules keep it safe:
+///
+/// * ASCII is never touched, so escape sequences are untouched.
+/// * Each run of non-ASCII characters is converted only if its bytes form
+///   **valid UTF-8**. A real table border such as `├───┤` maps to
+///   `c3 c4 c4 c4 b4`, which is not valid UTF-8, so it is left alone.
+/// * The decoded result must be ordinary Latin text (Latin-1 Supplement or
+///   Latin Extended-A). Anything else is not what this mangling produces.
+///
+/// Runs that fail any rule are emitted unchanged, so correctly-encoded UTF-8
+/// passes through untouched and the mode is safe to leave switched on.
+fn repair_double_encoding(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut run: Vec<char> = Vec::new();
+
+    for ch in text.chars() {
+        if (ch as u32) < 0x80 {
+            flush_run(&mut run, &mut out);
+            out.push(ch as u8);
+        } else {
+            run.push(ch);
+        }
+    }
+    flush_run(&mut run, &mut out);
+    out
+}
+
+/// Converts one run of non-ASCII characters if it looks like double-encoded
+/// Latin text, otherwise emits it unchanged.
+fn flush_run(run: &mut Vec<char>, out: &mut Vec<u8>) {
+    if run.is_empty() {
+        return;
+    }
+
+    let mapped: Option<Vec<u8>> = run
+        .iter()
+        .map(|ch| {
+            CP850_HIGH
+                .iter()
+                .position(|c| c == ch)
+                .map(|i| 0x80 + i as u8)
+        })
+        .collect();
+
+    let repaired = mapped
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|text| {
+            // Only accept a result that is plausible Latin prose.
+            text.chars().all(|c| {
+                let code = c as u32;
+                (0xa0..=0x24f).contains(&code)
+            })
+        });
+
+    match repaired {
+        Some(text) => out.extend_from_slice(text.as_bytes()),
+        None => {
+            let mut buf = [0u8; 4];
+            for ch in run.iter() {
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    run.clear();
 }
 
 /// CP850 (DOS Latin-1), bytes 0x80..0xFF.
@@ -205,6 +303,64 @@ mod tests {
     fn unrepresentable_characters_become_question_marks() {
         // A CJK character has no CP850 slot.
         assert_eq!(Encoding::Cp850.encode("a漢b"), b"a?b".to_vec());
+    }
+
+    /// The exact bytes the local IRIS 2025.1 instance sends for its login
+    /// banner: `Nó` arrives as `├│` and `ção` as `├º├úo`, because the text was
+    /// encoded to UTF-8 and then run through CP850 -> UTF-8 a second time.
+    #[test]
+    fn repairs_the_double_encoded_banner_this_instance_sends() {
+        let raw = "N├│: CCDESNOT063, Configura├º├úo: CONSISETM".as_bytes();
+        let fixed = String::from_utf8_lossy(&Encoding::Cp850Doubled.decode(raw)).into_owned();
+        assert_eq!(fixed, "Nó: CCDESNOT063, Configuração: CONSISETM");
+    }
+
+    /// Ordinary, correctly-encoded UTF-8 must survive the repair pass — the
+    /// mode has to be safe to leave switched on.
+    #[test]
+    fn repair_leaves_text_it_cannot_explain_alone() {
+        let text = "日本語 and plain ASCII";
+        let out =
+            String::from_utf8_lossy(&Encoding::Cp850Doubled.decode(text.as_bytes())).into_owned();
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn repair_never_touches_ascii_or_escape_sequences() {
+        let raw = b"[2J[1;1HUSER>";
+        assert_eq!(Encoding::Cp850Doubled.decode(raw), raw.to_vec());
+    }
+
+    /// The whole reason the repair is run-based and guarded: an ERP screen
+    /// that genuinely draws a table must not be turned into mojibake.
+    #[test]
+    fn repair_leaves_genuine_box_drawing_alone() {
+        for border in ["├───┤", "┌──────┐", "│ x │", "╔═══╗"]
+        {
+            let out = String::from_utf8_lossy(&Encoding::Cp850Doubled.decode(border.as_bytes()))
+                .into_owned();
+            assert_eq!(out, border, "corrupted genuine box drawing: {border}");
+        }
+    }
+
+    /// Correctly-encoded accented text must survive untouched, so the mode is
+    /// safe to leave on for an instance that does not need it.
+    #[test]
+    fn repair_leaves_correct_portuguese_alone() {
+        for text in ["Instância", "não", "Configuração", "ó"] {
+            let out = String::from_utf8_lossy(&Encoding::Cp850Doubled.decode(text.as_bytes()))
+                .into_owned();
+            assert_eq!(out, text, "corrupted already-correct text: {text}");
+        }
+    }
+
+    /// Typing is unaffected: only IRIS's output path is mangled.
+    #[test]
+    fn repair_mode_sends_input_as_plain_utf8() {
+        assert_eq!(
+            Encoding::Cp850Doubled.encode("Instância"),
+            "Instância".as_bytes().to_vec()
+        );
     }
 
     #[test]

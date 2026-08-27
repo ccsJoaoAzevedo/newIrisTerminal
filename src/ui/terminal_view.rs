@@ -97,6 +97,16 @@ impl ViewState {
     pub fn scroll_to_bottom(&mut self) {
         self.anchor = ScrollAnchor::Bottom;
     }
+
+    /// Selects every line, scrollback included.
+    pub fn select_all(&mut self, grid: &Grid) {
+        let last = grid.total_lines().saturating_sub(1);
+        let width = grid.line(last).map(|r| r.cells.len()).unwrap_or(grid.cols);
+        self.selection = Some(Selection {
+            start: (0, 0),
+            end: (last, width),
+        });
+    }
 }
 
 /// Size of one character cell for the given font.
@@ -121,8 +131,20 @@ pub fn terminal_font(theme: &Theme, font_size: f32) -> FontId {
     FontId::new(font_size, family)
 }
 
+/// What the right-click menu asked for, if anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextAction {
+    CopySelection,
+    Paste,
+    SelectAll,
+    ClearSelection,
+    ExportScreen,
+}
+
 pub struct RenderResult {
     pub response: Response,
+    /// Set when the user picked something from the right-click menu.
+    pub context_action: Option<ContextAction>,
     /// Grid dimensions the available space implies. The caller resizes the PTY
     /// when these differ from the current size.
     pub cols: usize,
@@ -130,12 +152,25 @@ pub struct RenderResult {
 }
 
 /// Draws the grid into the remaining space of `ui`.
+/// Draws the grid.
+///
+/// `tab_uid` must be stable for the lifetime of a tab and unique across tabs.
+/// The widget id is derived from it rather than from egui's automatic
+/// layout-position id, because that id shifts whenever the rows above the
+/// terminal change — switching tabs, or an autologon banner appearing — which
+/// silently moved keyboard focus to a widget that no longer existed and left
+/// the terminal unable to receive keys at all.
+///
+/// `take_focus` is set by the caller when the active tab changed, so focus
+/// follows the tab the user is looking at.
 pub fn show(
     ui: &mut Ui,
     grid: &Grid,
     state: &mut ViewState,
     theme: &Theme,
     font_size: f32,
+    tab_uid: u64,
+    take_focus: bool,
 ) -> RenderResult {
     let font = terminal_font(theme, font_size);
     let cell = cell_size(ui, &font);
@@ -144,10 +179,12 @@ pub fn show(
     let cols = ((available.x / cell.x).floor() as usize).max(1);
     let rows = ((available.y / cell.y).floor() as usize).max(1);
 
-    let (rect, response) = ui.allocate_exact_size(
+    let id = egui::Id::new(("nit-terminal", tab_uid));
+    let (rect, _) = ui.allocate_exact_size(
         Vec2::new(cols as f32 * cell.x, rows as f32 * cell.y),
-        Sense::click_and_drag(),
+        Sense::hover(),
     );
+    let response = ui.interact(rect, id, Sense::click_and_drag());
 
     // A terminal needs every key, but egui reserves arrows, Tab and Escape for
     // moving focus between widgets and strips them from the event stream
@@ -165,10 +202,11 @@ pub fn show(
         )
     });
 
-    // Without this the terminal is dead until clicked, and any click that
-    // lands on the chrome silently steals typing away again. Only claim focus
-    // when nothing else wants it, so dialogs and text fields keep theirs.
-    if ui.memory(|m| m.focused().is_none()) {
+    // Without this the terminal is dead until clicked, and any click on the
+    // chrome (a tab button, say) silently steals typing away again. Claim
+    // focus when nothing else wants it, or when the caller says the active tab
+    // just changed — but never off a dialog or text field that is in use.
+    if take_focus || ui.memory(|m| m.focused().is_none()) {
         response.request_focus();
     }
 
@@ -243,8 +281,45 @@ pub fn show(
         );
     }
 
+    // Right-click menu. Copy is disabled without a selection so the menu
+    // states plainly what is available, rather than silently doing nothing.
+    let has_selection = state.selection.map(|s| !s.is_empty()).unwrap_or(false);
+    let mut context_action = None;
+
+    response.context_menu(|ui| {
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Copy"))
+            .clicked()
+        {
+            context_action = Some(ContextAction::CopySelection);
+            ui.close_menu();
+        }
+        if ui.button("Paste").clicked() {
+            context_action = Some(ContextAction::Paste);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("Select all").clicked() {
+            context_action = Some(ContextAction::SelectAll);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Clear selection"))
+            .clicked()
+        {
+            context_action = Some(ContextAction::ClearSelection);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("Export screen...").clicked() {
+            context_action = Some(ContextAction::ExportScreen);
+            ui.close_menu();
+        }
+    });
+
     RenderResult {
         response,
+        context_action,
         cols,
         rows,
     }

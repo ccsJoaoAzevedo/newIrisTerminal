@@ -38,7 +38,8 @@ pub fn settings_path() -> PathBuf {
     config_dir().join("settings.toml")
 }
 
-pub fn macros_path() -> PathBuf {
+/// The user's own macros. Editable from the app.
+pub fn personal_macros_path() -> PathBuf {
     config_dir().join("macros.xml")
 }
 
@@ -53,6 +54,12 @@ pub struct Settings {
     pub default_log_mode: LogMode,
     /// Delete logs older than this. 0 disables cleanup.
     pub log_retention_days: u32,
+    /// Shared macro file supplied by the organisation. A UNC share, a mapped
+    /// drive, or a local copy — anything readable. Empty means "none".
+    ///
+    /// Never written to: it is shared, so the app treats it as read-only and
+    /// keeps personal edits in [`personal_macros_path`].
+    pub org_macros_path: PathBuf,
     pub profiles: Vec<Profile>,
     /// Profile opened by Ctrl+T and at startup. Empty means "ask".
     pub default_profile: String,
@@ -71,6 +78,7 @@ impl Default for Settings {
             log_dir: default_log_dir(),
             default_log_mode: LogMode::Off,
             log_retention_days: 30,
+            org_macros_path: PathBuf::new(),
             profiles: Vec::new(),
             default_profile: String::new(),
             open_on_start: true,
@@ -116,6 +124,11 @@ impl Settings {
     pub fn startup_profile(&self) -> Option<&Profile> {
         self.profile(&self.default_profile)
             .or_else(|| self.profiles.first())
+    }
+
+    /// The organisation macro file, if one is configured.
+    pub fn org_macros(&self) -> Option<&std::path::Path> {
+        (!self.org_macros_path.as_os_str().is_empty()).then_some(self.org_macros_path.as_path())
     }
 
     /// Effective log mode for a profile, applying the global default.

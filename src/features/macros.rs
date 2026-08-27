@@ -19,8 +19,36 @@ pub struct Param {
     pub default: String,
 }
 
+/// Where a macro came from. Organisation macros are shared and read-only in
+/// the app; personal ones are editable. Keeping this on the macro itself means
+/// the UI never has to guess which file a given entry can be written back to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Origin {
+    /// Shipped by the organisation from a shared file. Never modified here.
+    Organization,
+    /// The user's own file, editable in the app.
+    #[default]
+    Personal,
+}
+
+impl Origin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Origin::Organization => "Organization",
+            Origin::Personal => "Personal",
+        }
+    }
+
+    pub fn is_editable(self) -> bool {
+        matches!(self, Origin::Personal)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Macro {
+    /// Set by the loader, not by the XML — a shared file cannot promote its own
+    /// macros to editable.
+    pub origin: Origin,
     pub name: String,
     pub description: String,
     /// Optional accelerator, e.g. `Ctrl+Shift+G`. Purely descriptive here;
@@ -36,6 +64,7 @@ pub struct Macro {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MacroGroup {
     pub name: String,
+    pub origin: Origin,
     pub macros: Vec<Macro>,
 }
 
@@ -116,11 +145,13 @@ pub fn parse(xml: &str) -> Result<Vec<MacroGroup>> {
                     "group" => {
                         current_group = Some(MacroGroup {
                             name: attr(&e, "name").unwrap_or_default(),
+                            origin: Origin::default(),
                             macros: Vec::new(),
                         });
                     }
                     "macro" => {
                         current_macro = Some(Macro {
+                            origin: Origin::default(),
                             name: attr(&e, "name").unwrap_or_default(),
                             description: attr(&e, "description").unwrap_or_default(),
                             key: attr(&e, "key").filter(|k| !k.is_empty()),
@@ -201,9 +232,21 @@ pub fn parse(xml: &str) -> Result<Vec<MacroGroup>> {
     Ok(groups)
 }
 
+/// Reads one attribute, resolving XML entities.
+///
+/// The unescaping matters for round-tripping: without it a description
+/// containing `&` comes back as `&amp;` and gains another `amp;` every time
+/// the personal file is saved.
 fn attr(e: &quick_xml::events::BytesStart, key: &str) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
-        (a.key.as_ref() == key.as_bytes()).then(|| String::from_utf8_lossy(&a.value).into_owned())
+        if a.key.as_ref() != key.as_bytes() {
+            return None;
+        }
+        Some(
+            a.unescape_value()
+                .map(|v| v.into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned()),
+        )
     })
 }
 
@@ -213,10 +256,157 @@ pub fn load(path: &Path) -> Result<Vec<MacroGroup>> {
     parse(&text)
 }
 
-/// Written on first run so the format is discoverable without documentation.
+/// Loads one file and stamps every macro in it with `origin`.
+pub fn load_with_origin(path: &Path, origin: Origin) -> Result<Vec<MacroGroup>> {
+    let mut groups = load(path)?;
+    for group in &mut groups {
+        group.origin = origin;
+        for m in &mut group.macros {
+            m.origin = origin;
+        }
+    }
+    Ok(groups)
+}
+
+/// What a load attempt produced, so the UI can explain a missing or broken
+/// shared file instead of silently showing fewer macros.
+#[derive(Clone, Debug, Default)]
+pub struct LoadReport {
+    pub groups: Vec<MacroGroup>,
+    /// Problems worth showing the user, one per source.
+    pub problems: Vec<String>,
+}
+
+/// Loads the organisation file (if configured) and the personal file, and
+/// merges them.
+///
+/// Organisation macros come first and keep their own groups. A personal group
+/// whose name matches an organisation group is merged into it, so the panel
+/// does not show "Debug" twice; within a merged group the personal entries
+/// follow the shared ones.
+///
+/// A missing organisation file is not an error — colleagues who are off the
+/// network still get their personal macros.
+pub fn load_all(org: Option<&Path>, personal: &Path) -> LoadReport {
+    let mut report = LoadReport::default();
+
+    if let Some(org_path) = org {
+        if org_path.as_os_str().is_empty() {
+            // Not configured; nothing to say.
+        } else if !org_path.exists() {
+            report.problems.push(format!(
+                "Organization macros not found at {} — using personal macros only.",
+                org_path.display()
+            ));
+        } else {
+            match load_with_origin(org_path, Origin::Organization) {
+                Ok(groups) => report.groups = groups,
+                Err(e) => report
+                    .problems
+                    .push(format!("Organization macros could not be read: {e:#}")),
+            }
+        }
+    }
+
+    match load_with_origin(personal, Origin::Personal) {
+        Ok(groups) => merge(&mut report.groups, groups),
+        Err(e) => report
+            .problems
+            .push(format!("Personal macros could not be read: {e:#}")),
+    }
+
+    report
+}
+
+/// Folds `extra` into `into`, combining groups that share a name.
+fn merge(into: &mut Vec<MacroGroup>, extra: Vec<MacroGroup>) {
+    for group in extra {
+        match into.iter_mut().find(|g| g.name == group.name) {
+            Some(existing) => existing.macros.extend(group.macros),
+            None => into.push(group),
+        }
+    }
+}
+
+/// Serialises personal macros back to XML.
+///
+/// Only personal macros are written: the organisation file is shared and must
+/// never be rewritten from here, and a macro that came from it would silently
+/// become a local copy if it were.
+pub fn to_xml(groups: &[MacroGroup]) -> String {
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<macros>\n");
+
+    for group in groups {
+        let personal: Vec<&Macro> = group
+            .macros
+            .iter()
+            .filter(|m| m.origin.is_editable())
+            .collect();
+        if personal.is_empty() {
+            continue;
+        }
+
+        out.push_str(&format!("  <group name=\"{}\">\n", escape(&group.name)));
+        for m in personal {
+            out.push_str(&format!("    <macro name=\"{}\"", escape(&m.name)));
+            if !m.description.is_empty() {
+                out.push_str(&format!(" description=\"{}\"", escape(&m.description)));
+            }
+            if let Some(key) = &m.key {
+                out.push_str(&format!(" key=\"{}\"", escape(key)));
+            }
+            if m.confirm {
+                out.push_str(" confirm=\"true\"");
+            }
+            out.push_str(">\n");
+
+            for p in &m.params {
+                out.push_str(&format!("      <param name=\"{}\"", escape(&p.name)));
+                if !p.prompt.is_empty() && p.prompt != p.name {
+                    out.push_str(&format!(" prompt=\"{}\"", escape(&p.prompt)));
+                }
+                if !p.default.is_empty() {
+                    out.push_str(&format!(" default=\"{}\"", escape(&p.default)));
+                }
+                out.push_str("/>\n");
+            }
+
+            out.push_str("      <body>");
+            if m.body.len() == 1 {
+                out.push_str(&escape(&m.body[0]));
+            } else {
+                out.push('\n');
+                for line in &m.body {
+                    out.push_str(&format!("        {}\n", escape(line)));
+                }
+                out.push_str("      ");
+            }
+            out.push_str("</body>\n    </macro>\n");
+        }
+        out.push_str("  </group>\n");
+    }
+
+    out.push_str("</macros>\n");
+    out
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Written as the personal macro file on first run, so the format is
+/// self-documenting. The organisation file uses the same schema but is never
+/// created by the app — it is provided and maintained centrally.
 pub const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <!--
-  Macros for newIrisTerminal.
+  Personal macros for newIrisTerminal.
+
+  This file is yours: the app can edit it. Macros supplied by the
+  organisation live in a separate file, configured in Settings, and are
+  shown read-only alongside these.
 
   {{name}} placeholders are filled in from <param> before sending.
   confirm="true" asks for a yes/no before anything is sent - use it for
@@ -228,14 +418,8 @@ pub const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
       <param name="global" prompt="Global name (without ^)" default="CSW1"/>
       <body>ZWRITE ^{{global}}</body>
     </macro>
-    <macro name="Global browser" description="Open ^%G">
-      <body>Do ^%G</body>
-    </macro>
     <macro name="Current namespace" description="Show where we are">
       <body>Write $NAMESPACE,!</body>
-    </macro>
-    <macro name="Routine list" description="Open ^%RD">
-      <body>Do ^%RD</body>
     </macro>
   </group>
 
@@ -404,6 +588,155 @@ mod tests {
         assert!(
             sendable.is_empty(),
             "truncated macro became sendable: {sendable:?}"
+        );
+    }
+
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nit-macros-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const ORG_XML: &str = r#"<macros>
+  <group name="Shared"><macro name="Org one"><body>Write 1</body></macro></group>
+  <group name="Debug"><macro name="Org debug"><body>Write 2</body></macro></group>
+</macros>"#;
+
+    const PERSONAL_XML: &str = r#"<macros>
+  <group name="Mine"><macro name="Personal one"><body>Write 3</body></macro></group>
+  <group name="Debug"><macro name="Personal debug"><body>Write 4</body></macro></group>
+</macros>"#;
+
+    #[test]
+    fn org_and_personal_files_merge_by_group_name() {
+        let dir = tempdir("merge");
+        let org = dir.join("org.xml");
+        let personal = dir.join("personal.xml");
+        std::fs::write(&org, ORG_XML).unwrap();
+        std::fs::write(&personal, PERSONAL_XML).unwrap();
+
+        let report = load_all(Some(&org), &personal);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+
+        let names: Vec<&str> = report.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Shared", "Debug", "Mine"],
+            "groups should merge, not duplicate"
+        );
+
+        let debug = report.groups.iter().find(|g| g.name == "Debug").unwrap();
+        assert_eq!(debug.macros.len(), 2, "both Debug groups should combine");
+        assert_eq!(debug.macros[0].origin, Origin::Organization);
+        assert_eq!(debug.macros[1].origin, Origin::Personal);
+    }
+
+    /// Being off the network must not cost the user their own macros.
+    #[test]
+    fn a_missing_org_file_still_loads_personal_macros() {
+        let dir = tempdir("missing-org");
+        let personal = dir.join("personal.xml");
+        std::fs::write(&personal, PERSONAL_XML).unwrap();
+
+        let report = load_all(Some(&dir.join("nope.xml")), &personal);
+        assert_eq!(report.groups.len(), 2);
+        assert_eq!(report.problems.len(), 1);
+        assert!(report.problems[0].contains("not found"));
+    }
+
+    #[test]
+    fn org_macros_are_not_editable_and_personal_ones_are() {
+        let dir = tempdir("editable");
+        let org = dir.join("org.xml");
+        let personal = dir.join("personal.xml");
+        std::fs::write(&org, ORG_XML).unwrap();
+        std::fs::write(&personal, PERSONAL_XML).unwrap();
+
+        let report = load_all(Some(&org), &personal);
+        for group in &report.groups {
+            for m in &group.macros {
+                assert_eq!(
+                    m.origin.is_editable(),
+                    m.name.starts_with("Personal"),
+                    "{} has the wrong editability",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Writing back must never absorb organisation macros into the personal
+    /// file, or a shared macro would silently fork into a local copy.
+    #[test]
+    fn serialising_writes_only_personal_macros() {
+        let dir = tempdir("write");
+        let org = dir.join("org.xml");
+        let personal = dir.join("personal.xml");
+        std::fs::write(&org, ORG_XML).unwrap();
+        std::fs::write(&personal, PERSONAL_XML).unwrap();
+
+        let report = load_all(Some(&org), &personal);
+        let xml = to_xml(&report.groups);
+
+        assert!(xml.contains("Personal one"));
+        assert!(xml.contains("Personal debug"));
+        assert!(
+            !xml.contains("Org one"),
+            "organisation macro leaked into the personal file"
+        );
+        assert!(
+            !xml.contains("Org debug"),
+            "organisation macro leaked into the personal file"
+        );
+    }
+
+    #[test]
+    fn personal_macros_round_trip_through_xml() {
+        let original = vec![MacroGroup {
+            name: "Mine".into(),
+            origin: Origin::Personal,
+            macros: vec![Macro {
+                origin: Origin::Personal,
+                name: "Show".into(),
+                description: "A & B <test>".into(),
+                key: Some("Ctrl+G".into()),
+                confirm: true,
+                params: vec![Param {
+                    name: "g".into(),
+                    prompt: "Global".into(),
+                    default: "CSW1".into(),
+                }],
+                body: vec!["ZWRITE ^{{g}}".into()],
+            }],
+        }];
+
+        let reparsed = parse(&to_xml(&original)).expect("round trip");
+        let m = &reparsed[0].macros[0];
+        assert_eq!(m.name, "Show");
+        assert_eq!(m.description, "A & B <test>");
+        assert_eq!(m.key.as_deref(), Some("Ctrl+G"));
+        assert!(m.confirm);
+        assert_eq!(m.params[0].default, "CSW1");
+        assert_eq!(m.body, vec!["ZWRITE ^{{g}}".to_string()]);
+    }
+
+    #[test]
+    fn multi_line_bodies_round_trip() {
+        let groups = vec![MacroGroup {
+            name: "G".into(),
+            origin: Origin::Personal,
+            macros: vec![Macro {
+                origin: Origin::Personal,
+                name: "Two".into(),
+                body: vec!["Set x = 1".into(), "Write x,!".into()],
+                ..Macro::default()
+            }],
+        }];
+        let back = parse(&to_xml(&groups)).unwrap();
+        assert_eq!(
+            back[0].macros[0].body,
+            vec!["Set x = 1".to_string(), "Write x,!".to_string()]
         );
     }
 

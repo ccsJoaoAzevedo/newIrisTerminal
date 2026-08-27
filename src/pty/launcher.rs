@@ -36,6 +36,39 @@ pub struct LaunchSpec {
     pub binary_override: Option<PathBuf>,
 }
 
+/// Discovery shells out to `iris list` and scans the install directories,
+/// which costs about 100 ms. `command()` needs it too, so without a cache
+/// every new session paid that price again on the UI thread. Instances do not
+/// appear and disappear while the app is open, so caching for the process
+/// lifetime is safe; [`refresh_instances`] exists for when it is not.
+static INSTANCE_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Vec<Instance>>>> =
+    std::sync::OnceLock::new();
+
+fn cache() -> &'static std::sync::Mutex<Option<Vec<Instance>>> {
+    INSTANCE_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Discovered instances, computed once and reused.
+pub fn instances(launcher: &dyn IrisLauncher) -> Vec<Instance> {
+    if let Ok(guard) = cache().lock() {
+        if let Some(found) = guard.as_ref() {
+            return found.clone();
+        }
+    }
+    let found = launcher.discover();
+    if let Ok(mut guard) = cache().lock() {
+        *guard = Some(found.clone());
+    }
+    found
+}
+
+/// Drops the cache so the next lookup rediscovers.
+pub fn refresh_instances() {
+    if let Ok(mut guard) = cache().lock() {
+        *guard = None;
+    }
+}
+
 pub trait IrisLauncher {
     /// Instances this machine knows about. Never fails hard — an empty list
     /// just means the user must type the instance name themselves.
@@ -176,8 +209,7 @@ mod windows {
         fn command(&self, spec: &LaunchSpec) -> Result<CommandBuilder> {
             // Prefer the bin directory of the instance we were asked for, so a
             // machine with several installs uses the matching binary.
-            let mut dirs: Vec<PathBuf> = self
-                .discover()
+            let mut dirs: Vec<PathBuf> = instances(self)
                 .into_iter()
                 .filter(|i| i.name.eq_ignore_ascii_case(&spec.instance))
                 .filter_map(|i| i.bin_dir)
