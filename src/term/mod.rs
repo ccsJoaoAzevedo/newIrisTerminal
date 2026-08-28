@@ -3,6 +3,7 @@ pub mod encoding;
 pub mod grid;
 pub mod palette;
 pub mod parser;
+pub mod syntax;
 
 pub use cell::Attrs;
 pub use encoding::Encoding;

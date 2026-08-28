@@ -77,11 +77,7 @@ pub fn to_html(grid: &Grid, range: Range, theme: &Theme) -> String {
     out.push_str("</style></head><body><pre>");
 
     for row in rows(grid, range) {
-        let end = row
-            .cells
-            .iter()
-            .rposition(|c| !c.is_blank())
-            .map_or(0, |i| i + 1);
+        let end = row.used_width();
 
         let mut col = 0;
         while col < end {

@@ -114,6 +114,8 @@ impl Perform for Performer<'_> {
             'u' => self.grid.restore_cursor(),
             'h' if private => self.set_dec_mode(params, true),
             'l' if private => self.set_dec_mode(params, false),
+            'h' => self.set_ansi_mode(params, true),
+            'l' => self.set_ansi_mode(params, false),
             'n' => {
                 // DSR. 5 = "are you ok", 6 = report cursor position. IRIS uses
                 // 6 to discover where it is after an ambiguous repaint, so a
@@ -177,6 +179,21 @@ impl Performer<'_> {
     /// DEC private mode set/reset. Only the modes that change what we draw are
     /// honoured; the rest (bracketed paste, mouse reporting) are accepted
     /// silently so the remote side does not retry.
+    /// SM/RM without the `?` intermediate: the ANSI modes.
+    ///
+    /// Only IRM (4) is of any interest, and only as a display hint - see
+    /// [`crate::term::Grid::insert_mode`]. The insert *behaviour* is
+    /// deliberately not implemented: IRIS does not use IRM to edit, so shifting
+    /// characters on its behalf would only ever corrupt a line.
+    fn set_ansi_mode(&mut self, params: &Params, enable: bool) {
+        for p in params.iter() {
+            if p.first().copied() == Some(4) {
+                self.grid.insert_mode = enable;
+                self.grid.touch();
+            }
+        }
+    }
+
     fn set_dec_mode(&mut self, params: &Params, enable: bool) {
         for p in params.iter() {
             // DECTCEM (25) is the only private mode that changes what we draw.
@@ -383,6 +400,25 @@ mod tests {
         let mut parser = vte::Parser::new();
         let replies = advance(&mut parser, &mut grid, b"\x1b[3;7H\x1b[6n");
         assert_eq!(replies, b"\x1b[3;7R");
+    }
+
+    /// IRM is the standard way a host announces insert mode. It is tracked even
+    /// though the insert *behaviour* is not implemented, because it is the
+    /// authoritative answer when it does arrive.
+    #[test]
+    fn irm_sets_and_clears_insert_mode() {
+        let grid = run(10, 2, b"\x1b[4h");
+        assert!(grid.insert_mode);
+        let grid = run(10, 2, b"\x1b[4h\x1b[4l");
+        assert!(!grid.insert_mode);
+    }
+
+    /// `ESC [ ? 4 h` is DECSCLM, a different mode entirely, and must not be
+    /// mistaken for IRM.
+    #[test]
+    fn the_private_form_of_mode_four_is_not_irm() {
+        let grid = run(10, 2, b"\x1b[?4h");
+        assert!(!grid.insert_mode);
     }
 
     #[test]

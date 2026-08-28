@@ -13,11 +13,20 @@ pub mod ui;
 
 /// Starts the GUI. The binary is nothing more than a call to this.
 pub fn run() -> eframe::Result<()> {
+    // Read early, because whether the window has a system frame is fixed when
+    // it is created. `App::new` loads the settings again; the file is small and
+    // the alternative is threading it through `run_native`'s callback.
+    let decorated = config::Settings::load().native_decorations;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 640.0])
             .with_min_inner_size([400.0, 240.0])
-            .with_title("newIrisTerminal"),
+            // The title still matters with the frame off: it is what the
+            // taskbar and the window switcher show.
+            .with_title("newIrisTerminal")
+            .with_decorations(decorated)
+            .with_resizable(true),
         ..Default::default()
     };
 

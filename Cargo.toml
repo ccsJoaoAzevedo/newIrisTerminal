@@ -21,6 +21,9 @@ toml = "0.8"
 quick-xml = "0.36"
 keyring = "2"
 dirs = "5"
+# System font discovery for the terminal font picker. Pure Rust, so it adds no
+# C toolchain requirement on any platform we build for.
+fontdb = "0.24"
 crossbeam-channel = "0.5"
 anyhow = "1"
 chrono = "0.4"

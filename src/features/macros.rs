@@ -51,11 +51,18 @@ pub struct Macro {
     pub origin: Origin,
     pub name: String,
     pub description: String,
-    /// Optional accelerator, e.g. `Ctrl+Shift+G`. Purely descriptive here;
-    /// binding is the UI's job.
+    /// Optional accelerator, e.g. `Ctrl+Shift+G`. Parsed and bound by
+    /// [`crate::ui::shortcut`]; an unparseable value simply never fires.
     pub key: Option<String>,
     /// Require an explicit yes before sending. Set this on anything that writes.
     pub confirm: bool,
+    /// Keep the body out of the UI, for a macro whose commands carry a password
+    /// or another secret.
+    ///
+    /// Only the display is affected. IRIS still echoes what it is sent, so the
+    /// text can reach the screen and the transcript by that route - this hides
+    /// it from the places the app itself would put it.
+    pub hide_command: bool,
     pub params: Vec<Param>,
     /// Body lines, already split. Sent one line at a time.
     pub body: Vec<String>,
@@ -107,9 +114,15 @@ impl Macro {
 ///       <param name="global" prompt="Global name" default="%CSW1"/>
 ///       <body>ZWRITE ^{{global}}</body>
 ///     </macro>
+///     <macro name="Connect" hide_command="true">
+///       <body>Do LOGIN^APP("svc","secret")</body>
+///     </macro>
 ///   </group>
 /// </macros>
 /// ```
+///
+/// `confirm` and `hide_command` are false unless spelled `true`, `1` or `yes`,
+/// so a file written before either existed keeps its meaning.
 ///
 /// Macros outside any `<group>` land in an unnamed group, so a flat file works
 /// without ceremony.
@@ -160,6 +173,9 @@ pub fn parse(xml: &str) -> Result<Vec<MacroGroup>> {
                             // default stays false so ordinary read-only macros
                             // are one click.
                             confirm: attr(&e, "confirm")
+                                .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+                                .unwrap_or(false),
+                            hide_command: attr(&e, "hide_command")
                                 .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
                                 .unwrap_or(false),
                             params: Vec::new(),
@@ -358,6 +374,11 @@ pub fn to_xml(groups: &[MacroGroup]) -> String {
             if m.confirm {
                 out.push_str(" confirm=\"true\"");
             }
+            // Written only when set, so a file that has never used either
+            // attribute comes back out byte for byte as it went in.
+            if m.hide_command {
+                out.push_str(" hide_command=\"true\"");
+            }
             out.push_str(">\n");
 
             for p in &m.params {
@@ -411,6 +432,13 @@ pub const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   {{name}} placeholders are filled in from <param> before sending.
   confirm="true" asks for a yes/no before anything is sent - use it for
   anything that writes, since RDB* databases are shared with the team.
+
+  hide_command="true" keeps the body out of the macro panel, for a command
+  that carries a password. Note that IRIS still echoes what it is sent, so
+  the text can reach the screen and the transcript by that route.
+
+  key="Ctrl+Shift+G" binds a shortcut. It needs a modifier, and it only
+  fires while the terminal has focus.
 -->
 <macros>
   <group name="Inspect">
@@ -424,7 +452,7 @@ pub const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   </group>
 
   <group name="Navigate">
-    <macro name="Switch namespace">
+    <macro name="Switch namespace" key="Ctrl+Shift+N">
       <param name="ns" prompt="Namespace" default="USER"/>
       <body>ZN "{{ns}}"</body>
     </macro>
@@ -702,6 +730,7 @@ mod tests {
                 description: "A & B <test>".into(),
                 key: Some("Ctrl+G".into()),
                 confirm: true,
+                hide_command: true,
                 params: vec![Param {
                     name: "g".into(),
                     prompt: "Global".into(),
@@ -711,14 +740,37 @@ mod tests {
             }],
         }];
 
-        let reparsed = parse(&to_xml(&original)).expect("round trip");
+        let xml = to_xml(&original);
+        assert!(
+            xml.contains(r#"hide_command="true""#),
+            "hide_command was not written: {xml}"
+        );
+
+        let reparsed = parse(&xml).expect("round trip");
         let m = &reparsed[0].macros[0];
         assert_eq!(m.name, "Show");
         assert_eq!(m.description, "A & B <test>");
         assert_eq!(m.key.as_deref(), Some("Ctrl+G"));
         assert!(m.confirm);
+        assert!(m.hide_command);
         assert_eq!(m.params[0].default, "CSW1");
         assert_eq!(m.body, vec!["ZWRITE ^{{g}}".to_string()]);
+    }
+
+    #[test]
+    fn a_macro_without_the_attribute_is_not_hidden() {
+        let groups =
+            parse(r#"<macros><macro name="Plain"><body>Write 1,!</body></macro></macros>"#)
+                .expect("parse");
+        assert!(!groups[0].macros[0].hide_command);
+
+        let mut personal = groups;
+        personal[0].origin = Origin::Personal;
+        personal[0].macros[0].origin = Origin::Personal;
+        assert!(
+            !to_xml(&personal).contains("hide_command"),
+            "an unset attribute must not be written back"
+        );
     }
 
     #[test]
@@ -745,6 +797,18 @@ mod tests {
     #[test]
     fn the_bundled_sample_parses() {
         let groups = parse(SAMPLE).expect("sample must parse");
+        let all: Vec<&Macro> = groups.iter().flat_map(|g| g.macros.iter()).collect();
+        // Every shortcut the sample advertises has to be one the binder
+        // understands, or the file teaches something that does not work.
+        for m in &all {
+            if let Some(key) = m.key.as_deref() {
+                assert!(
+                    crate::ui::shortcut::parse(key).is_some(),
+                    "sample macro {:?} has an unbindable shortcut {key:?}",
+                    m.name
+                );
+            }
+        }
         assert!(!groups.is_empty());
         let kill = groups
             .iter()

@@ -100,6 +100,10 @@ pub struct InputAction {
     pub text: String,
     pub copy: bool,
     pub paste: Option<String>,
+    /// The Insert key was pressed. The bytes still go to IRIS; this only lets
+    /// the caller keep its own idea of the mode in step, because IRIS never
+    /// reports it back.
+    pub toggle_insert: bool,
 }
 
 impl InputAction {
@@ -114,6 +118,7 @@ pub fn translate(events: &[Event], has_selection: bool) -> InputAction {
         text: String::new(),
         copy: false,
         paste: None,
+        toggle_insert: false,
     };
 
     for event in events {
@@ -129,6 +134,9 @@ pub fn translate(events: &[Event], has_selection: bool) -> InputAction {
                 modifiers,
                 ..
             } => {
+                if *key == Key::Insert {
+                    action.toggle_insert = true;
+                }
                 if let Some(bytes) = key_bytes(*key, modifiers) {
                     action.bytes.extend_from_slice(&bytes);
                 }
@@ -201,6 +209,38 @@ mod tests {
         assert_eq!(key_bytes(Key::C, &ctrl), Some(vec![0x03]));
         assert_eq!(key_bytes(Key::A, &ctrl), Some(vec![0x01]));
         assert_eq!(key_bytes(Key::Z, &ctrl), Some(vec![0x1a]));
+    }
+
+    /// IRIS never reports its insert/replace state, so the keystroke has to be
+    /// reported alongside the bytes rather than instead of them.
+    #[test]
+    fn the_insert_key_is_reported_and_still_sent() {
+        let event = Event::Key {
+            key: Key::Insert,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let action = translate(std::slice::from_ref(&event), false);
+        assert!(action.toggle_insert, "the key press was not reported");
+        assert_eq!(
+            action.bytes,
+            b"\x1b[2~".to_vec(),
+            "the key must still reach IRIS"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_key_does_not_touch_the_insert_state() {
+        let event = Event::Key {
+            key: Key::Home,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        assert!(!translate(std::slice::from_ref(&event), false).toggle_insert);
     }
 
     #[test]

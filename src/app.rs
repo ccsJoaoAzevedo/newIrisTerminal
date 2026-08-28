@@ -1,7 +1,7 @@
 //! The application shell: owns the tabs, drains their PTYs each frame, and
 //! draws the chrome around the terminal view.
 
-use egui::{Context, Key};
+use egui::{Context, Key, Modifiers};
 
 use crate::config::{self, ensure_config_tree, load_themes, LogMode, Profile, Settings, Theme};
 use crate::features::autologon::{Autologon, State as AutoState};
@@ -13,9 +13,10 @@ use crate::plugins::PluginHost;
 use crate::pty::launcher::launcher;
 use crate::pty::PtySession;
 use crate::term::Grid;
-use crate::ui::input;
+use crate::ui::chrome::{self, WindowAction};
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
-use crate::ui::terminal_view::{self, ViewState};
+use crate::ui::terminal_view::{self, RenderOpts, ViewState};
+use crate::ui::{fonts, input, shortcut};
 
 /// Fallback PTY size, used only before the first frame has measured the
 /// window. After that, new sessions open at the size the terminal is actually
@@ -27,6 +28,44 @@ use crate::ui::terminal_view::{self, ViewState};
 /// means nothing is cut in the first place.
 const FALLBACK_COLS: u16 = 80;
 const FALLBACK_ROWS: u16 = 24;
+
+/// Takes one key press out of this frame's events, matching the modifiers
+/// exactly, and reports whether it was there.
+///
+/// Consuming matters: without it a chord is handled here *and* translated into
+/// a control code for IRIS, so Ctrl+T opened a tab and typed `0x14` into the
+/// session. egui's own `consume_key` is not usable for this because it matches
+/// leniently - `Ctrl+Shift+T` satisfies a pattern of `Ctrl` - which would let
+/// an app shortcut swallow a macro bound to the same key plus Shift.
+fn consume_exact(ctx: &Context, modifiers: Modifiers, key: Key) -> bool {
+    ctx.input_mut(|i| {
+        let mut hit = false;
+        i.events.retain(|event| {
+            let is_match = matches!(
+                event,
+                egui::Event::Key {
+                    key: event_key,
+                    modifiers: event_modifiers,
+                    pressed: true,
+                    ..
+                } if *event_key == key && event_modifiers.matches_exact(modifiers)
+            );
+            hit |= is_match;
+            !is_match
+        });
+        hit
+    })
+}
+
+/// A tab name being edited.
+struct Renaming {
+    tab: usize,
+    draft: String,
+    /// Cleared after the field has been given focus once. Without this the
+    /// terminal claims the keyboard back - it grabs focus whenever nothing else
+    /// holds it - and the new name would be typed into IRIS.
+    focus: bool,
+}
 
 /// Rotate a transcript once it passes this size.
 const LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
@@ -146,10 +185,13 @@ impl Tab {
             // useless as a tab name.
             .or_else(|| self.grid.title.clone().filter(|t| !t.contains(".exe")))
             .unwrap_or_else(|| {
-                if self.profile.name.is_empty() {
-                    self.profile.instance.clone()
-                } else {
+                // The instance first: it is what tells two tabs apart, whereas
+                // the profile name is often left at its default and the same on
+                // every tab.
+                if self.profile.instance.is_empty() {
                     self.profile.name.clone()
+                } else {
+                    self.profile.instance.clone()
                 }
             })
     }
@@ -277,9 +319,29 @@ pub struct App {
     /// Size the terminal was last drawn at. New sessions open at this size so
     /// their output is never truncated at a stale width.
     terminal_size: (u16, u16),
+    /// Size of the window in character cells, as last drawn. Distinct from
+    /// `terminal_size`, which is the wider grid IRIS is told about; this is the
+    /// geometry the user is actually looking at and the one worth reporting.
+    view_size: (usize, usize),
     show_new_tab: bool,
     new_tab_profile: Profile,
     status: Option<String>,
+    /// Font family egui has actually been given, which is not always the one
+    /// in `settings`: a family that is no longer installed has to degrade to
+    /// the bundled monospace, because naming an unregistered family panics
+    /// inside egui's glyph measurement.
+    font_family: String,
+    /// Family last handed to [`fonts::install`], successfully or not. Settings
+    /// changes arrive every frame while a slider is dragged, and reinstalling
+    /// rebuilds the glyph atlas, so the work is skipped unless the name moved.
+    font_request: String,
+    /// Tab whose name is being edited, if any.
+    renaming: Option<Renaming>,
+    /// Set when a close was intercepted to ask about live sessions.
+    confirm_close: bool,
+    /// Set once the user has said to close anyway, so the confirmation cannot
+    /// cancel the very close it just approved.
+    close_confirmed: bool,
 }
 
 impl App {
@@ -321,11 +383,18 @@ impl App {
             panels: PanelState::default(),
             focused_tab: None,
             terminal_size: (FALLBACK_COLS, FALLBACK_ROWS),
+            view_size: (FALLBACK_COLS as usize, FALLBACK_ROWS as usize),
             show_new_tab: false,
             status: None,
+            font_family: String::new(),
+            font_request: String::new(),
+            renaming: None,
+            confirm_close: false,
+            close_confirmed: false,
         };
 
-        cc.egui_ctx.set_visuals(app.theme().visuals());
+        App::apply_style(&cc.egui_ctx, &app.theme(), &app.settings);
+        app.apply_font(&cc.egui_ctx);
 
         if app.settings.open_on_start {
             if let Some(profile) = app.settings.startup_profile().cloned() {
@@ -335,6 +404,62 @@ impl App {
             }
         }
         app
+    }
+
+    /// Applies theme colours *and* the style bits that are not part of
+    /// `Visuals`. `set_visuals` replaces only the colours, so the scrollbar
+    /// spacing has to be set separately or the switch would do nothing.
+    fn apply_style(ctx: &Context, theme: &Theme, settings: &Settings) {
+        ctx.set_visuals(theme.visuals());
+        ctx.style_mut(|style| {
+            // Floating bars are egui's default and are the reason the
+            // scrollbars read as absent: they stay a hairline until hovered.
+            style.spacing.scroll.floating = !settings.show_scrollbars;
+            if settings.show_scrollbars {
+                style.spacing.scroll.bar_width = 10.0;
+            }
+        });
+    }
+
+    /// Hands the configured font to egui and records what it actually got.
+    ///
+    /// The setting wins over the theme's suggestion; the theme's own
+    /// `font_family` is the default for anyone who has not chosen one. A name
+    /// that will not load leaves the bundled monospace in place and says so,
+    /// rather than being passed on to panic later.
+    fn apply_font(&mut self, ctx: &Context) {
+        let wanted = if self.settings.font_family.is_empty() {
+            self.theme().font_family
+        } else {
+            self.settings.font_family.clone()
+        };
+
+        if wanted == self.font_request {
+            return;
+        }
+        self.font_request = wanted.clone();
+
+        if fonts::install(ctx, &wanted) {
+            self.font_family = wanted;
+        } else {
+            self.font_family = String::new();
+            self.set_status(format!(
+                "Font {wanted:?} is not installed; using the built-in monospace."
+            ));
+        }
+    }
+
+    /// How the terminal should be drawn, from the current settings.
+    fn render_opts(&self) -> RenderOpts {
+        RenderOpts {
+            font_size: self.settings.font_size,
+            font_family: self.font_family.clone(),
+            cursor_style: self.settings.cursor_style,
+            cursor_blink: self.settings.cursor_blink,
+            scrollbar: self.settings.show_scrollbars,
+            syntax: self.settings.terminal_syntax_highlight,
+            wrap: self.settings.wrap_lines,
+        }
     }
 
     pub fn theme(&self) -> Theme {
@@ -375,37 +500,46 @@ impl App {
         self.status = Some(text.into());
     }
 
+    /// Whether the active terminal currently owns the keyboard.
+    ///
+    /// Macro shortcuts are gated on this. `Ctrl+Shift+G` is a shortcut when
+    /// the terminal has focus and an ordinary editing gesture when the cursor
+    /// is in a text field, and only the widget with focus can say which.
+    fn terminal_has_focus(&self, ctx: &Context) -> bool {
+        let Some(tab) = self.active_tab() else {
+            return false;
+        };
+        let id = egui::Id::new(("nit-terminal", tab.uid));
+        ctx.memory(|m| m.focused() == Some(id))
+    }
+
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        let (new_tab, close_tab, next_tab, jump, zoom_in, zoom_out) = ctx.input(|i| {
-            let cmd = |key| i.modifiers.command && i.key_pressed(key);
-            let mut jump = None;
-            for (n, key) in [
-                Key::Num1,
-                Key::Num2,
-                Key::Num3,
-                Key::Num4,
-                Key::Num5,
-                Key::Num6,
-                Key::Num7,
-                Key::Num8,
-                Key::Num9,
-            ]
-            .iter()
-            .enumerate()
-            {
-                if i.modifiers.command && i.key_pressed(*key) {
-                    jump = Some(n);
-                }
+        let cmd = Modifiers::COMMAND;
+        let new_tab = consume_exact(ctx, cmd, Key::T);
+        let close_tab = consume_exact(ctx, cmd, Key::W);
+        let next_tab = consume_exact(ctx, cmd, Key::Tab);
+        let zoom_in = consume_exact(ctx, cmd, Key::Plus) | consume_exact(ctx, cmd, Key::Equals);
+        let zoom_out = consume_exact(ctx, cmd, Key::Minus);
+
+        let mut jump = None;
+        for (n, key) in [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ]
+        .iter()
+        .enumerate()
+        {
+            if consume_exact(ctx, cmd, *key) {
+                jump = Some(n);
             }
-            (
-                cmd(Key::T),
-                cmd(Key::W),
-                cmd(Key::Tab),
-                jump,
-                cmd(Key::Plus) || cmd(Key::Equals),
-                cmd(Key::Minus),
-            )
-        });
+        }
 
         if new_tab {
             self.show_new_tab = true;
@@ -428,9 +562,35 @@ impl App {
             self.settings.font_size = (self.settings.font_size + delta).clamp(8.0, 28.0);
             let _ = self.settings.save();
         }
+
+        // Macro shortcuts come after the app's own, which is what the editor's
+        // "the app already uses this" warning promises. A macro whose `key` is
+        // missing or unparseable simply never fires; the text is shared and
+        // hand-edited, so it cannot be trusted to mean anything.
+        if self.terminal_has_focus(ctx) {
+            let mut fire = None;
+            for group in &self.macro_groups {
+                for m in &group.macros {
+                    let Some((modifiers, key)) = m.key.as_deref().and_then(shortcut::parse) else {
+                        continue;
+                    };
+                    if consume_exact(ctx, modifiers, key) {
+                        fire = Some(m.clone());
+                    }
+                }
+            }
+            // Routed through the ordinary request path, so `confirm` and
+            // parameter prompting apply exactly as they do to a click.
+            if let Some(m) = fire {
+                self.handle_request(ctx, UiRequest::RunMacro(m));
+            }
+        }
     }
 
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+    /// The top row: app controls on the left, and - when the app is drawing its
+    /// own frame - the window buttons and the draggable area on the right.
+    fn menu_bar(&mut self, ui: &mut egui::Ui) -> Option<WindowAction> {
+        let mut action = None;
         ui.horizontal(|ui| {
             if ui
                 .button("+")
@@ -442,24 +602,82 @@ impl App {
             ui.separator();
             ui.toggle_value(&mut self.panels.show_macros, "Macros");
             ui.toggle_value(&mut self.panels.show_globals, "Globals");
-            if ui.button("Export").clicked() {
-                self.panels.show_export = true;
-            }
-            if ui.button("Settings").clicked() {
-                self.panels.show_settings = true;
-            }
+            // Toggles, not plain buttons: clicking the button that opened a
+            // dialog is how everyone expects to close it again, and it shows
+            // which dialogs are open the way Macros/Globals already do.
+            ui.toggle_value(&mut self.panels.show_export, "Export");
+            ui.toggle_value(&mut self.panels.show_settings, "Settings");
             ui.separator();
             if let Some(tab) = self.active_tab() {
-                ui.weak(format!(
-                    "{}  {}x{}",
-                    tab.profile.instance, tab.grid.cols, tab.grid.rows
-                ));
+                let (cols, rows) = self.view_size;
+                ui.weak(format!("{}  {cols}x{rows}", tab.profile.instance));
+            }
+
+            // Last, so the leftover space it claims for dragging is whatever
+            // the items above did not take.
+            if !self.settings.native_decorations {
+                action = chrome::title_bar_controls(ui);
             }
         });
+        action
+    }
+
+    /// Whether closing should stop and ask first.
+    fn should_confirm_close(&self) -> bool {
+        !self.close_confirmed
+            && self.settings.confirm_close_with_live_session
+            && self.tabs.iter().any(|t| t.session.is_some())
+    }
+
+    /// Asks before dropping live sessions.
+    ///
+    /// Honours `confirm_close_with_live_session`, which until now was a setting
+    /// nothing read. It covers both routes in: the app's own close button and
+    /// the window manager's, since with the system frame gone the second is
+    /// often the only one left.
+    fn close_confirm_dialog(&mut self, ctx: &Context) {
+        if !self.confirm_close {
+            return;
+        }
+
+        let live = self.tabs.iter().filter(|t| t.session.is_some()).count();
+        let mut close_anyway = false;
+        let mut cancel = false;
+        let mut open = true;
+
+        egui::Window::new("Close newIrisTerminal?")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(match live {
+                    1 => "1 session is still connected.".to_string(),
+                    n => format!("{n} sessions are still connected."),
+                });
+                ui.small("Closing sends HALT to each of them.");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Close anyway").clicked() {
+                        close_anyway = true;
+                    }
+                    if ui.button("Keep working").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if close_anyway {
+            self.confirm_close = false;
+            self.close_confirmed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cancel || !open {
+            self.confirm_close = false;
+        }
     }
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let mut to_close = None;
+        let mut to_rename = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for index in 0..self.tabs.len() {
@@ -468,9 +686,25 @@ impl App {
                     if self.tabs[index].ended {
                         label.push_str(" (ended)");
                     }
-                    if ui.selectable_label(selected, label).clicked() {
+                    let response = ui
+                        .selectable_label(selected, label)
+                        .on_hover_text("Double-click to rename.");
+                    if response.clicked() {
                         self.active = index;
                     }
+                    if response.double_clicked() {
+                        to_rename = Some(index);
+                    }
+                    response.context_menu(|ui| {
+                        if ui.button("Rename...").clicked() {
+                            to_rename = Some(index);
+                            ui.close_menu();
+                        }
+                        if ui.button("Close").clicked() {
+                            to_close = Some(index);
+                            ui.close_menu();
+                        }
+                    });
                     if ui.small_button("x").clicked() {
                         to_close = Some(index);
                     }
@@ -478,8 +712,78 @@ impl App {
                 }
             });
         });
+
+        if let Some(index) = to_rename {
+            // Seeded with the name on screen, so renaming is an edit rather
+            // than starting from nothing.
+            self.renaming = Some(Renaming {
+                tab: index,
+                draft: self.tabs[index].title(),
+                focus: true,
+            });
+        }
+        // Applied after the loop: closing a tab shifts every index after it.
         if let Some(index) = to_close {
             self.close_tab(index);
+        }
+    }
+
+    /// Names one tab.
+    ///
+    /// A window rather than an editable label in the strip: the terminal claims
+    /// the keyboard whenever nothing else holds it, and a field that has to win
+    /// that fight every frame is a worse trade than one dialog.
+    fn rename_tab_dialog(&mut self, ctx: &Context) {
+        let Some(mut renaming) = self.renaming.take() else {
+            return;
+        };
+        if renaming.tab >= self.tabs.len() {
+            return;
+        }
+
+        let mut open = true;
+        let mut commit = false;
+        let mut clear = false;
+        let mut cancel = false;
+
+        egui::Window::new("Rename tab")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut renaming.draft).desired_width(220.0));
+                if renaming.focus {
+                    response.request_focus();
+                    renaming.focus = false;
+                }
+                if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    commit = true;
+                }
+
+                ui.small("Empty goes back to the automatic name.");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Rename").clicked() {
+                        commit = true;
+                    }
+                    if ui.button("Automatic").clicked() {
+                        clear = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if commit {
+            let name = renaming.draft.trim().to_string();
+            self.tabs[renaming.tab].custom_title = (!name.is_empty()).then_some(name);
+        } else if clear {
+            self.tabs[renaming.tab].custom_title = None;
+        } else if !(cancel || !open) {
+            // Still open, so the draft survives to the next frame.
+            self.renaming = Some(renaming);
         }
     }
 
@@ -512,13 +816,22 @@ impl App {
                 }
             }
 
-            UiRequest::SettingsChanged => match self.settings.save() {
-                Ok(()) => ctx.set_visuals(self.theme().visuals()),
-                Err(e) => self.set_status(format!("Could not save settings: {e:#}")),
-            },
+            UiRequest::SettingsChanged => {
+                // The style is reapplied either way: a failed write still has
+                // to be reflected on screen, or the UI would disagree with the
+                // settings the user just changed.
+                App::apply_style(ctx, &self.theme(), &self.settings);
+                self.apply_font(ctx);
+                if let Err(e) = self.settings.save() {
+                    self.set_status(format!("Could not save settings: {e:#}"));
+                }
+            }
             UiRequest::ReloadMacros => {
                 let report = load_macros(&self.settings);
                 self.macro_groups = report.groups;
+                // Selection and draft are indices into the list that was just
+                // replaced, so they would now address a different macro.
+                self.panels.forget_macro_selection();
                 let count: usize = self.macro_groups.iter().map(|g| g.macros.len()).sum();
                 if report.problems.is_empty() {
                     self.set_status(format!("Reloaded {count} macros."));
@@ -745,8 +1058,29 @@ impl eframe::App for App {
         self.collect_global_query();
         self.handle_shortcuts(ctx);
 
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui));
+        // A close asked for by the window manager - Alt+F4, or the taskbar -
+        // arrives as a flag rather than an event, and has to be caught before
+        // anything else gets a chance to draw over the question.
+        if ctx.input(|i| i.viewport().close_requested()) && self.should_confirm_close() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+
+        let mut window_action = None;
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            window_action = self.menu_bar(ui);
+        });
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| self.tab_strip(ui));
+
+        if let Some(action) = window_action {
+            // Close is the one action that may be refused; the rest are
+            // immediate.
+            if action == WindowAction::Close && self.should_confirm_close() {
+                self.confirm_close = true;
+            } else {
+                chrome::apply(ctx, action);
+            }
+        }
 
         if let Some(status) = self.status.clone() {
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -801,7 +1135,7 @@ impl eframe::App for App {
                 }
 
                 let active = self.active.min(self.tabs.len() - 1);
-                let font_size = self.settings.font_size;
+                let opts = self.render_opts();
 
                 // Autologon status belongs next to the terminal it applies to.
                 if let Some(note) = self.tabs[active].autologon.status_note() {
@@ -836,7 +1170,7 @@ impl eframe::App for App {
                         &tab.grid,
                         &mut tab.view,
                         &theme,
-                        font_size,
+                        &opts,
                         uid,
                         take_focus,
                     )
@@ -846,6 +1180,7 @@ impl eframe::App for App {
                 // left at the old width would keep truncating its output at
                 // that width until it was next looked at.
                 self.terminal_size = (result.cols as u16, result.rows as u16);
+                self.view_size = (result.view_cols, result.view_rows);
                 for tab in &mut self.tabs {
                     tab.resize(result.cols, result.rows);
                 }
@@ -899,6 +1234,13 @@ impl eframe::App for App {
                         let encoded = self.plugins.on_input(&encoded);
                         self.tabs[active].send(&encoded);
                     }
+                    // IRIS never reports its insert/replace state, so the
+                    // keystroke is the only signal there is. Display only - see
+                    // `Grid::insert_mode`.
+                    if action.toggle_insert {
+                        let grid = &mut self.tabs[active].grid;
+                        grid.insert_mode = !grid.insert_mode;
+                    }
                     if !action.is_empty() {
                         // Typing always returns the view to the live output.
                         self.tabs[active].view.scroll_to_bottom();
@@ -912,7 +1254,20 @@ impl eframe::App for App {
             });
 
         self.new_tab_dialog(ctx);
+        self.rename_tab_dialog(ctx);
+        self.close_confirm_dialog(ctx);
 
+        // Last, and in a foreground layer: the panels and the terminal reach
+        // the window edge, and the terminal senses drags of its own.
+        if !self.settings.native_decorations {
+            chrome::resize_grips(ctx);
+        }
+
+        if let Some(request) =
+            panels::macro_editor_dialog(ctx, &mut self.macro_groups, &mut self.panels)
+        {
+            requests.push(request);
+        }
         if let Some(request) = panels::pending_macro_dialog(ctx, &mut self.panels) {
             requests.push(request);
         }
@@ -934,8 +1289,9 @@ impl eframe::App for App {
         }
 
         // A live session can produce output at any moment, so keep animating
-        // while any tab is connected.
-        if self.tabs.iter().any(|t| t.session.is_some()) {
+        // while any tab is connected. A blinking cursor needs the same, because
+        // an idle prompt gives the frame no other reason to be redrawn.
+        if self.settings.cursor_blink || self.tabs.iter().any(|t| t.session.is_some()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }

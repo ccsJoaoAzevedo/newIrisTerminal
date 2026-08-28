@@ -4,10 +4,70 @@
 //! That is cheap enough: a run of cells sharing one background is emitted as a
 //! single rect, and text is batched per colour run rather than per character.
 
-use egui::{Align2, FontFamily, FontId, Pos2, Rect, Response, Sense, Stroke, TextStyle, Ui, Vec2};
+use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 
-use crate::config::Theme;
-use crate::term::{palette, Grid};
+use crate::config::{CursorStyle, Theme};
+use crate::term::cell::{Cell, Color};
+use crate::term::{palette, syntax, Attrs, Grid};
+use crate::ui::wrap;
+
+/// Everything about how the grid should be drawn that is not the grid itself.
+///
+/// A struct rather than more parameters: [`show`] already takes as many as it
+/// can carry, and these all arrive together from `Settings` anyway.
+#[derive(Clone, Debug)]
+pub struct RenderOpts {
+    pub font_size: f32,
+    /// Font family, already known to be registered with egui. Empty means the
+    /// bundled monospace.
+    pub font_family: String,
+    pub cursor_style: CursorStyle,
+    pub cursor_blink: bool,
+    /// Draw a scrollbar for the scrollback.
+    pub scrollbar: bool,
+    /// Colour globals and quoted strings in the output.
+    pub syntax: bool,
+    /// Continue a long line on the next display row instead of clipping it and
+    /// letting the user scroll sideways. See [`TERMINAL_COLS`] for why both
+    /// modes still receive the whole line.
+    pub wrap: bool,
+}
+
+impl Default for RenderOpts {
+    fn default() -> Self {
+        RenderOpts {
+            font_size: 14.0,
+            font_family: String::new(),
+            cursor_style: CursorStyle::default(),
+            cursor_blink: false,
+            scrollbar: true,
+            syntax: true,
+            wrap: true,
+        }
+    }
+}
+
+/// Columns the terminal claims to have, however wide the window is.
+///
+/// IRIS truncates a `Write` at the device right margin rather than wrapping it,
+/// so the tail of a line wider than the terminal is never sent and cannot be
+/// recovered afterwards. The only way to receive it is to report a margin past
+/// where the window ends, which is what this is; the window then shows a view
+/// onto the wider grid, either wrapped or scrolled sideways.
+///
+/// Wide enough for the `zwrite` output that prompted it, and cheap: only the
+/// screen rows are held at full width, since a line trims its trailing blanks
+/// on the way into scrollback. The cost is that anything positioning itself by
+/// column - the `^%G` utility, a full-screen editor - has a wrong idea of the
+/// width.
+pub const TERMINAL_COLS: usize = 512;
+
+/// Width of the scrollback scrollbar, in points.
+const SCROLLBAR_WIDTH: f32 = 10.0;
+
+/// Shortest the thumb is allowed to get, so a long history still leaves
+/// something you can actually grab.
+const MIN_THUMB_HEIGHT: f32 = 24.0;
 
 /// Where the viewport is anchored. Scrolling back pins the view so incoming
 /// output does not yank the user to the bottom mid-read.
@@ -51,6 +111,9 @@ impl Selection {
 #[derive(Default)]
 pub struct ViewState {
     pub anchor: ScrollAnchor,
+    /// First visible column, when lines are clipped rather than wrapped. Held
+    /// per tab so scrolling sideways in one does not move another.
+    pub h_offset: usize,
     pub selection: Option<Selection>,
     dragging: bool,
 }
@@ -110,21 +173,44 @@ impl ViewState {
 }
 
 /// Size of one character cell for the given font.
+///
+/// Rounded up to whole pixels. The cell size defines the lattice that glyphs,
+/// background rects and the cursor are all placed on, and a fractional width
+/// puts each column at a different sub-pixel offset — which is how the cursor
+/// came to sit over the wrong character. Rounding up rather than to nearest
+/// also guarantees a cell is never narrower than the glyph it holds, so
+/// neighbours cannot overlap.
 pub fn cell_size(ui: &Ui, font: &FontId) -> Vec2 {
     ui.fonts(|f| {
         // Monospace, so any character measures the same; 'M' is the classic
         // choice and avoids zero-width surprises.
         let width = f.glyph_width(font, 'M');
         let height = f.row_height(font);
-        Vec2::new(width, height)
+        Vec2::new(width.ceil().max(1.0), height.ceil().max(1.0))
     })
 }
 
-/// The font the terminal draws with. Falls back to egui's bundled monospace
-/// when the theme names a family that is not loaded, so a bad font name in a
-/// theme file cannot make the terminal unreadable.
-pub fn terminal_font(theme: &Theme, font_size: f32) -> FontId {
-    let family = match theme.font_family.as_str() {
+/// X coordinate of a column on the character lattice.
+///
+/// Everything that draws into the grid goes through this. Laying a run out as
+/// one string instead lets the text renderer accumulate its own advances, and
+/// the result drifts away from `col * cell.x` — the cursor and the background
+/// rects are placed from the lattice, so the drift showed up as a cursor half
+/// over its neighbour with the glyph beneath it appearing twice.
+#[inline]
+pub fn glyph_x(left: f32, col: usize, cell: Vec2) -> f32 {
+    left + col as f32 * cell.x
+}
+
+/// The font the terminal draws with.
+///
+/// The family must already be registered with egui — see
+/// [`crate::ui::fonts::install`], which is what decides whether a name is
+/// usable. Asking for an unknown family panics inside glyph measurement rather
+/// than falling back, so the caller resolves the name first and only a
+/// confirmed one reaches here.
+pub fn terminal_font(family: &str, font_size: f32) -> FontId {
+    let family = match family {
         "" | "monospace" => FontFamily::Monospace,
         other => FontFamily::Name(other.into()),
     };
@@ -145,10 +231,16 @@ pub struct RenderResult {
     pub response: Response,
     /// Set when the user picked something from the right-click menu.
     pub context_action: Option<ContextAction>,
-    /// Grid dimensions the available space implies. The caller resizes the PTY
-    /// when these differ from the current size.
+    /// Grid dimensions the caller should resize the PTY to.
+    ///
+    /// `cols` is the *grid* width - [`TERMINAL_COLS`], not the window - because
+    /// it is what IRIS is told and therefore where IRIS truncates.
     pub cols: usize,
     pub rows: usize,
+    /// Size of the window in character cells, which is what the user sees and
+    /// what the status line reports.
+    pub view_cols: usize,
+    pub view_rows: usize,
 }
 
 /// Draws the grid into the remaining space of `ui`.
@@ -168,22 +260,40 @@ pub fn show(
     grid: &Grid,
     state: &mut ViewState,
     theme: &Theme,
-    font_size: f32,
+    opts: &RenderOpts,
     tab_uid: u64,
     take_focus: bool,
 ) -> RenderResult {
-    let font = terminal_font(theme, font_size);
+    let font = terminal_font(&opts.font_family, opts.font_size);
     let cell = cell_size(ui, &font);
     let available = ui.available_size();
 
-    let cols = ((available.x / cell.x).floor() as usize).max(1);
-    let rows = ((available.y / cell.y).floor() as usize).max(1);
+    // The bar's width comes off before the grid is measured, and is reserved
+    // whether or not there is history yet: taking it away the moment the first
+    // line scrolls off would drop a column and reflow the PTY mid-session.
+    let bar_width = if opts.scrollbar { SCROLLBAR_WIDTH } else { 0.0 };
+    // Clipping is the mode where a line runs off the side, so that is the mode
+    // that reserves room for a horizontal bar. Reserved whether or not anything
+    // currently overflows: letting it come and go would change the row count
+    // and reflow the PTY every time a long line arrived.
+    let h_bar_height = if opts.scrollbar && !opts.wrap {
+        SCROLLBAR_WIDTH
+    } else {
+        0.0
+    };
 
-    let id = egui::Id::new(("nit-terminal", tab_uid));
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(cols as f32 * cell.x, rows as f32 * cell.y),
+    let view_cols = (((available.x - bar_width) / cell.x).floor() as usize).max(1);
+    let rows = (((available.y - h_bar_height) / cell.y).floor() as usize).max(1);
+    let grid_cols = TERMINAL_COLS.max(view_cols);
+
+    let grid_size = Vec2::new(view_cols as f32 * cell.x, rows as f32 * cell.y);
+    let (outer, _) = ui.allocate_exact_size(
+        Vec2::new(grid_size.x + bar_width, grid_size.y + h_bar_height),
         Sense::hover(),
     );
+    let rect = Rect::from_min_size(outer.min, grid_size);
+
+    let id = egui::Id::new(("nit-terminal", tab_uid));
     let response = ui.interact(rect, id, Sense::click_and_drag());
 
     // A terminal needs every key, but egui reserves arrows, Tab and Escape for
@@ -213,72 +323,182 @@ pub fn show(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.background);
 
-    // Which absolute line sits at the top of the viewport.
     let total = grid.total_lines();
-    let max_top = total.saturating_sub(rows);
+    let cursor_line = grid.scrollback.len() + grid.cursor.row;
+
+    // How wide each line counts as, for laying it out. Trailing blanks are
+    // padding, but the cursor needs a row to sit on even when it is past the
+    // end of the text — otherwise the line it is on would be measured as
+    // shorter than the cursor's own column and the cursor would have nowhere
+    // to be drawn.
+    let used = |line: usize| {
+        let width = grid.line(line).map(|r| r.used_width()).unwrap_or(0);
+        if line == cursor_line {
+            width.max(grid.cursor.col + 1)
+        } else {
+            width
+        }
+    };
+
+    let mode = wrap::Mode {
+        view_cols,
+        wrap: opts.wrap,
+        offset: state.h_offset,
+    };
+
+    let max_top = wrap::top_for_bottom(total, rows, mode, used);
     let top_line = match state.anchor {
         ScrollAnchor::Bottom => max_top,
         ScrollAnchor::At(line) => line.min(max_top),
     };
 
-    handle_mouse(ui, &response, state, rect, cell, top_line, grid, max_top);
+    // How far sideways there is to go. The grid keeps this as a high-water
+    // mark; measuring only the lines on screen made the view snap back to the
+    // left as soon as scrolling vertically reached a run of short ones.
+    let content_cols = grid.widest_line();
+    let max_h_offset = content_cols.saturating_sub(view_cols);
+    if opts.wrap {
+        state.h_offset = 0;
+    } else {
+        state.h_offset = state.h_offset.min(max_h_offset);
+    }
+    let mode = wrap::Mode {
+        offset: state.h_offset,
+        ..mode
+    };
+    let segments = wrap::from_top(total, rows, top_line, mode, used);
 
-    for screen_row in 0..rows {
-        let line_index = top_line + screen_row;
-        let Some(row) = grid.line(line_index) else {
+    handle_mouse(
+        ui,
+        &response,
+        state,
+        rect,
+        cell,
+        top_line,
+        grid,
+        max_top,
+        max_h_offset,
+        &segments,
+        mode,
+    );
+
+    // Where the cursor is, in grid coordinates, when it is visible and its cell
+    // is one of the ones on screen.
+    //
+    // Worked out before the rows are painted, because the cell underneath has
+    // to skip its glyph: the cursor draws that character itself in the inverse
+    // colour, and drawing it from both places is what made it look doubled.
+    let cursor_at = if grid.cursor.visible && cursor_phase_on(ui, opts) {
+        wrap::row_of(&segments, mode, cursor_line, grid.cursor.col)
+            .map(|screen_row| (screen_row, cursor_line, grid.cursor.col))
+    } else {
+        None
+    };
+
+    for (screen_row, segment) in segments.iter().enumerate() {
+        let Some(row) = grid.line(segment.line) else {
             continue;
         };
         let y = rect.top() + screen_row as f32 * cell.y;
+        let hide_glyph_at = cursor_at
+            .filter(|(row, _, _)| *row == screen_row && opts.cursor_style == CursorStyle::Block)
+            .map(|(_, _, col)| col);
         paint_row(
             &painter,
             row,
-            line_index,
+            segment.line,
+            segment.start,
+            view_cols,
             y,
             rect.left(),
             cell,
             theme,
             state,
             &font,
+            hide_glyph_at,
+            opts.syntax,
         );
     }
 
-    // Cursor, only when it is actually on screen and the session says visible.
-    if grid.cursor.visible {
-        let cursor_line = grid.scrollback.len() + grid.cursor.row;
-        if cursor_line >= top_line && cursor_line < top_line + rows {
-            let x = rect.left() + grid.cursor.col as f32 * cell.x;
-            let y = rect.top() + (cursor_line - top_line) as f32 * cell.y;
-            let cursor_rect = Rect::from_min_size(Pos2::new(x, y), cell);
-            painter.rect_filled(cursor_rect, 0.0, theme.cursor);
-            // Redraw the character on top so the cursor does not hide it.
-            if let Some(ch) = grid
-                .line(cursor_line)
-                .and_then(|r| r.cells.get(grid.cursor.col))
-                .map(|c| c.ch)
-                .filter(|c| *c != ' ')
-            {
-                painter.text(
-                    cursor_rect.left_top(),
-                    Align2::LEFT_TOP,
-                    ch,
-                    font.clone(),
-                    theme.background,
+    if let Some((screen_row, _, col)) = cursor_at {
+        // Inverted in insert mode, and moved clear of the background if the
+        // inverse would have landed on it.
+        let cursor_colour = palette::cursor(theme, grid.insert_mode);
+        // Column relative to the slice on that row, so a cursor in the wrapped
+        // tail of a line lands under the character it is actually on.
+        let offset = col - segments[screen_row].start;
+        let x = glyph_x(rect.left(), offset, cell);
+        let y = rect.top() + screen_row as f32 * cell.y;
+        let cell_rect = Rect::from_min_size(Pos2::new(x, y), cell);
+
+        match opts.cursor_style {
+            CursorStyle::Block => {
+                painter.rect_filled(cell_rect, 0.0, cursor_colour);
+                // The only draw of this character: `paint_row` left it out, so
+                // it appears once, in the inverse colour, exactly on the
+                // lattice position the block was filled at.
+                if let Some(ch) = grid
+                    .line(cursor_line)
+                    .and_then(|r| r.cells.get(col))
+                    .filter(|c| !c.is_blank())
+                    .map(|c| c.ch)
+                {
+                    painter.text(
+                        cell_rect.left_top(),
+                        Align2::LEFT_TOP,
+                        ch,
+                        font.clone(),
+                        theme.background,
+                    );
+                }
+            }
+            // Bar and underscore leave the character alone, so `paint_row` has
+            // to draw it after all — see `hide_glyph_at` below.
+            CursorStyle::Bar => {
+                let width = (cell.x * 0.15).ceil().max(1.0);
+                painter.rect_filled(
+                    Rect::from_min_size(cell_rect.left_top(), Vec2::new(width, cell.y)),
+                    0.0,
+                    cursor_colour,
+                );
+            }
+            CursorStyle::Underscore => {
+                let height = (cell.y * 0.12).ceil().max(1.0);
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(cell_rect.left(), cell_rect.bottom() - height),
+                        Vec2::new(cell.x, height),
+                    ),
+                    0.0,
+                    cursor_colour,
                 );
             }
         }
     }
 
-    // A scrollback indicator, so it is obvious the view is pinned to history.
-    if !matches!(state.anchor, ScrollAnchor::Bottom) {
-        let label = format!("scrolled back {} lines", max_top - top_line);
-        let pos = Pos2::new(rect.right() - 8.0, rect.top() + 4.0);
-        painter.text(
-            pos,
-            Align2::RIGHT_TOP,
-            label,
-            TextStyle::Small.resolve(ui.style()),
-            theme.ansi[3],
+    if opts.scrollbar {
+        let track = Rect::from_min_max(
+            Pos2::new(rect.right(), rect.top()),
+            Pos2::new(outer.right(), rect.bottom()),
         );
+        scrollbar(ui, track, state, theme, tab_uid, total, rows, max_top);
+
+        if h_bar_height > 0.0 {
+            let track = Rect::from_min_max(
+                Pos2::new(rect.left(), rect.bottom()),
+                Pos2::new(rect.right(), outer.bottom()),
+            );
+            h_scrollbar(
+                ui,
+                track,
+                state,
+                theme,
+                tab_uid,
+                content_cols,
+                view_cols,
+                max_h_offset,
+            );
+        }
     }
 
     // Right-click menu. Copy is disabled without a selection so the menu
@@ -320,9 +540,210 @@ pub fn show(
     RenderResult {
         response,
         context_action,
-        cols,
+        cols: grid_cols,
         rows,
+        view_cols,
+        view_rows: rows,
     }
+}
+
+/// Per-column syntax colour for one row, or an empty vector when the feature is
+/// off.
+///
+/// Computed per row rather than per cell because the scan has to see a whole
+/// line to know whether a `^` is inside quotes.
+fn syntax_overrides(cells: &[Cell], theme: &Theme, enabled: bool) -> Vec<Option<Color32>> {
+    if !enabled {
+        return Vec::new();
+    }
+    let mut out = vec![None; cells.len()];
+    for span in syntax::scan(cells) {
+        let colour = match span.kind {
+            syntax::Kind::Global => theme.syntax_global,
+            syntax::Kind::Str => theme.syntax_string,
+        };
+        for slot in out[span.start..span.end.min(cells.len())].iter_mut() {
+            *slot = Some(colour);
+        }
+    }
+    out
+}
+
+/// Draws the horizontal scrollbar and handles dragging it.
+///
+/// Only present when lines are clipped: that is the mode in which part of a line
+/// is off to the side, and this is how it is reached without resizing the window.
+#[allow(clippy::too_many_arguments)]
+fn h_scrollbar(
+    ui: &Ui,
+    track: Rect,
+    state: &mut ViewState,
+    theme: &Theme,
+    tab_uid: u64,
+    content_cols: usize,
+    view_cols: usize,
+    max_offset: usize,
+) {
+    let painter = ui.painter_at(track);
+    painter.rect_filled(
+        track,
+        0.0,
+        palette::blend(theme.background, theme.foreground, 0.07),
+    );
+
+    if max_offset == 0 {
+        return;
+    }
+
+    let response = ui.interact(
+        track,
+        egui::Id::new(("nit-terminal-h-scrollbar", tab_uid)),
+        Sense::click_and_drag(),
+    );
+
+    let visible = (view_cols as f32 / content_cols.max(1) as f32).clamp(0.0, 1.0);
+    let thumb_width = (track.width() * visible).max(MIN_THUMB_HEIGHT.min(track.width()));
+    let span = (track.width() - thumb_width).max(0.0);
+
+    if let Some(pos) = response.interact_pointer_pos() {
+        let wanted = if span > 0.0 {
+            ((pos.x - track.left() - thumb_width * 0.5) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        state.h_offset = (wanted * max_offset as f32).round() as usize;
+    }
+
+    let progress = state.h_offset.min(max_offset) as f32 / max_offset as f32;
+    let thumb = Rect::from_min_size(
+        Pos2::new(track.left() + span * progress, track.top() + 1.0),
+        Vec2::new(thumb_width, (track.height() - 2.0).max(1.0)),
+    );
+    let colour = if response.hovered() || response.dragged() {
+        palette::blend(theme.selection, theme.foreground, 0.35)
+    } else {
+        palette::blend(theme.selection, theme.foreground, 0.1)
+    };
+    painter.rect_filled(thumb, 2.0, colour);
+}
+
+/// Moves the anchor by whole lines and re-pins to the bottom on arrival.
+///
+/// Line-quantised on purpose: the terminal scrolls by rows, not pixels, so a
+/// fractional offset would only ever be rounded away.
+fn scroll_lines(state: &mut ViewState, from: usize, lines: i64, max_top: usize) {
+    let next = (from as i64 - lines).clamp(0, max_top as i64) as usize;
+    state.anchor = if next >= max_top {
+        ScrollAnchor::Bottom
+    } else {
+        ScrollAnchor::At(next)
+    };
+}
+
+/// Draws the scrollback scrollbar and handles dragging it.
+///
+/// Hand-drawn because the terminal is not an `egui::ScrollArea`: scrolling here
+/// is an anchor into the scrollback, not a pixel offset over a laid-out widget,
+/// so there is no scroll area to borrow a bar from.
+#[allow(clippy::too_many_arguments)]
+fn scrollbar(
+    ui: &Ui,
+    track: Rect,
+    state: &mut ViewState,
+    theme: &Theme,
+    tab_uid: u64,
+    total: usize,
+    rows: usize,
+    max_top: usize,
+) {
+    let painter = ui.painter_at(track);
+    // The track is drawn even with nothing to scroll, so the reserved strip
+    // reads as part of the terminal rather than as a gap beside it.
+    painter.rect_filled(
+        track,
+        0.0,
+        palette::blend(theme.background, theme.foreground, 0.07),
+    );
+
+    if max_top == 0 {
+        return;
+    }
+
+    // Its own id. Sharing the terminal's would give the bar the keyboard focus
+    // the terminal defends with a focus-lock filter, and typing would stop
+    // reaching IRIS.
+    let response = ui.interact(
+        track,
+        egui::Id::new(("nit-terminal-scrollbar", tab_uid)),
+        Sense::click_and_drag(),
+    );
+
+    let visible = (rows as f32 / total as f32).clamp(0.0, 1.0);
+    let thumb_height = (track.height() * visible).max(MIN_THUMB_HEIGHT.min(track.height()));
+    let span = (track.height() - thumb_height).max(0.0);
+
+    if let Some(pos) = response.interact_pointer_pos() {
+        // Centred on the pointer, so grabbing the thumb feels like holding it
+        // rather than snapping it somewhere else first.
+        let wanted = if span > 0.0 {
+            ((pos.y - track.top() - thumb_height * 0.5) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let line = (wanted * max_top as f32).round() as usize;
+        state.anchor = if line >= max_top {
+            ScrollAnchor::Bottom
+        } else {
+            ScrollAnchor::At(line)
+        };
+    }
+
+    // The wheel works over the bar too. The grid has its own handler, but it
+    // only sees the pointer while it is over the grid, and the strip beside it
+    // is exactly where people reach to scroll.
+    let current = match state.anchor {
+        ScrollAnchor::Bottom => max_top,
+        ScrollAnchor::At(line) => line.min(max_top),
+    };
+    if response.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let cell_y = track.height() / rows.max(1) as f32;
+        let lines = (scroll / cell_y.max(1.0)).round() as i64;
+        if lines != 0 {
+            scroll_lines(state, current, lines, max_top);
+        }
+    }
+
+    // Read back from the anchor rather than reusing the caller's `top_line`,
+    // which was worked out before the drag above could move it.
+    let progress = match state.anchor {
+        ScrollAnchor::Bottom => 1.0,
+        ScrollAnchor::At(line) => line.min(max_top) as f32 / max_top as f32,
+    };
+    let thumb = Rect::from_min_size(
+        Pos2::new(track.left() + 1.0, track.top() + span * progress),
+        Vec2::new((track.width() - 2.0).max(1.0), thumb_height),
+    );
+    let colour = if response.hovered() || response.dragged() {
+        palette::blend(theme.selection, theme.foreground, 0.35)
+    } else {
+        palette::blend(theme.selection, theme.foreground, 0.1)
+    };
+    painter.rect_filled(thumb, 2.0, colour);
+}
+
+/// Whether a blinking cursor is in its visible half right now.
+///
+/// Always true when blinking is off. A repaint has to be pending for this to
+/// animate; the caller keeps one scheduled while blink is enabled, since a
+/// terminal sitting at an idle prompt gets no other reason to redraw.
+fn cursor_phase_on(ui: &Ui, opts: &RenderOpts) -> bool {
+    if !opts.cursor_blink {
+        return true;
+    }
+    // ~0.6 s per half, which is roughly where every other terminal sits.
+    let time = ui.input(|i| i.time);
+    (time * 1.6).floor() as i64 % 2 == 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -330,38 +751,59 @@ fn paint_row(
     painter: &egui::Painter,
     row: &crate::term::Row,
     line_index: usize,
+    // First grid column of the slice on this display row, and how many columns
+    // fit. Both are grid coordinates; only the drawing is shifted, so
+    // selection, syntax and the cursor keep working in one coordinate system.
+    from: usize,
+    view_cols: usize,
     y: f32,
     left: f32,
     cell: Vec2,
     theme: &Theme,
     state: &ViewState,
     font: &FontId,
+    // Column whose glyph the cursor will draw itself, if it is on this row.
+    hide_glyph_at: Option<usize>,
+    syntax_enabled: bool,
 ) {
-    let mut col = 0;
-    while col < row.cells.len() {
-        let (fg, bg) = palette::resolve(&row.cells[col], theme);
+    // Scanned over the whole row, not the slice: whether a `^` is inside quotes
+    // depends on text that may be on an earlier display row.
+    let overrides = syntax_overrides(&row.cells, theme, syntax_enabled);
+    let to = (from + view_cols).min(row.cells.len());
+
+    // Everything about how one column looks, in one place, so the run-batching
+    // below compares exactly what it draws.
+    let appearance = |col: usize| -> (Color32, Color32, bool) {
+        let cell = &row.cells[col];
+        let (mut fg, bg) = palette::resolve(cell, theme);
+        if let Some(Some(colour)) = overrides.get(col) {
+            // An override, not a replacement. A cell the remote side coloured
+            // deliberately keeps that colour: the scan is a guess about
+            // arbitrary text, and it must never overrule an SGR sequence.
+            if cell.fg == Color::Default && !cell.attrs.contains(Attrs::REVERSE) {
+                fg = *colour;
+            }
+        }
         let selected = state
             .selection
             .map(|s| s.contains(line_index, col))
             .unwrap_or(false);
+        (fg, bg, selected)
+    };
+
+    let mut col = from;
+    while col < to {
+        let (fg, bg, selected) = appearance(col);
 
         // Extend the run while appearance is unchanged, so a line of plain
-        // text becomes one rect and one text draw instead of `cols` of each.
+        // text becomes one background rect instead of `cols` of them.
         let mut end = col + 1;
-        while end < row.cells.len() {
-            let (next_fg, next_bg) = palette::resolve(&row.cells[end], theme);
-            let next_selected = state
-                .selection
-                .map(|s| s.contains(line_index, end))
-                .unwrap_or(false);
-            if next_fg != fg || next_bg != bg || next_selected != selected {
-                break;
-            }
+        while end < to && appearance(end) == (fg, bg, selected) {
             end += 1;
         }
 
         let run_rect = Rect::from_min_size(
-            Pos2::new(left + col as f32 * cell.x, y),
+            Pos2::new(glyph_x(left, col - from, cell), y),
             Vec2::new((end - col) as f32 * cell.x, cell.y),
         );
 
@@ -370,16 +812,26 @@ fn paint_row(
             painter.rect_filled(run_rect, 0.0, effective_bg);
         }
 
-        let text: String = row.cells[col..end].iter().map(|c| c.ch).collect();
-        if !text.trim().is_empty() {
+        // One draw per glyph, positioned on the lattice. Letting the text
+        // renderer lay out the whole run instead is what let the text drift
+        // away from the columns the cursor and the rects are drawn at. Blank
+        // cells are skipped, so a mostly empty row still costs a handful of
+        // draws rather than one per column.
+        let has_text = row.cells[col..end].iter().any(|c| !c.is_blank());
+        for c in col..end {
+            if row.cells[c].is_blank() || hide_glyph_at == Some(c) {
+                continue;
+            }
             painter.text(
-                run_rect.left_top(),
+                Pos2::new(glyph_x(left, c - from, cell), y),
                 Align2::LEFT_TOP,
-                &text,
+                row.cells[c].ch,
                 font.clone(),
                 fg,
             );
+        }
 
+        if has_text {
             if row.cells[col].attrs.contains(crate::term::Attrs::UNDERLINE) {
                 let uy = run_rect.bottom() - 1.0;
                 painter.line_segment(
@@ -416,28 +868,66 @@ fn handle_mouse(
     top_line: usize,
     grid: &Grid,
     max_top: usize,
+    max_h_offset: usize,
+    segments: &[wrap::Segment],
+    mode: wrap::Mode,
 ) {
     // Wheel scrolling through scrollback.
-    let scroll = ui.input(|i| i.raw_scroll_delta.y);
-    if scroll != 0.0 && response.hovered() {
-        let lines = (scroll / cell.y).round() as i64;
+    let (scroll, h_scroll, shift) = ui.input(|i| {
+        (
+            i.raw_scroll_delta.y,
+            i.raw_scroll_delta.x,
+            i.modifiers.shift,
+        )
+    });
+    if response.hovered() {
+        // Shift plus the wheel is the usual way to scroll sideways on a mouse
+        // that has no tilt, and it must not also scroll vertically.
+        let sideways = if shift && h_scroll == 0.0 {
+            scroll
+        } else {
+            h_scroll
+        };
+        if sideways != 0.0 && max_h_offset > 0 {
+            let columns = (sideways / cell.x).round() as i64;
+            let next = (state.h_offset as i64 - columns).clamp(0, max_h_offset as i64);
+            state.h_offset = next as usize;
+        }
+
+        let vertical = if shift && h_scroll == 0.0 {
+            0.0
+        } else {
+            scroll
+        };
+        let lines = (vertical / cell.y).round() as i64;
         if lines != 0 {
-            let current = top_line as i64;
-            let next = (current - lines).clamp(0, max_top as i64) as usize;
-            state.anchor = if next >= max_top {
-                ScrollAnchor::Bottom
-            } else {
-                ScrollAnchor::At(next)
-            };
+            scroll_lines(state, top_line, lines, max_top);
         }
     }
 
+    // Screen position to grid coordinates, through the display layout: a
+    // display row is not a line any more once a line can wrap over several of
+    // them, so a selection dragged over a wrapped line has to resolve to the
+    // columns it actually covers.
     let pos_to_cell = |pos: Pos2| -> (usize, usize) {
-        let col = (((pos.x - rect.left()) / cell.x).floor().max(0.0) as usize).min(grid.cols);
-        let row = (((pos.y - rect.top()) / cell.y).floor().max(0.0) as usize)
-            .min(grid.rows.saturating_sub(1));
-        (top_line + row, col)
+        let offset =
+            (((pos.x - rect.left()) / cell.x).floor().max(0.0) as usize).min(mode.view_cols);
+        let row = ((pos.y - rect.top()) / cell.y).floor().max(0.0) as usize;
+
+        match segments.get(row.min(segments.len().saturating_sub(1))) {
+            Some(segment) => (segment.line, (segment.start + offset).min(grid.cols)),
+            // Nothing laid out at all, which means an empty grid.
+            None => (top_line, (mode.offset + offset).min(grid.cols)),
+        }
     };
+
+    // A plain click clears the selection. This cannot be folded into the
+    // `drag_stopped` branch below: egui only reports a drag once the pointer has
+    // moved past its threshold, so pressing and releasing without moving never
+    // started one, and the old selection stayed on screen still holding Ctrl+C.
+    if response.clicked() {
+        state.selection = None;
+    }
 
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
@@ -474,6 +964,46 @@ mod tests {
             }
         }
         grid
+    }
+
+    /// The invariant the cursor bug came down to: text, background rects and
+    /// the cursor must all agree on where a column starts, with no drift as
+    /// the column index grows.
+    #[test]
+    fn every_column_sits_on_a_whole_multiple_of_the_cell_width() {
+        let cell = Vec2::new(9.0, 17.0);
+        for col in 0..200 {
+            assert_eq!(glyph_x(4.0, col, cell), 4.0 + col as f32 * 9.0);
+        }
+        // Adjacent columns are exactly one cell apart, however far along.
+        assert_eq!(
+            glyph_x(0.0, 138, cell) - glyph_x(0.0, 137, cell),
+            cell.x,
+            "columns drifted apart"
+        );
+    }
+
+    /// Shared by the wheel and by dragging the scrollbar, so the re-pinning
+    /// rule has to hold for both: reaching the end goes back to following the
+    /// live output rather than freezing on the last line.
+    #[test]
+    fn scrolling_to_the_end_re_pins_to_the_live_output() {
+        let mut state = ViewState::default();
+
+        // A positive wheel delta means "towards the history".
+        scroll_lines(&mut state, 100, 3, 100);
+        assert_eq!(state.anchor, ScrollAnchor::At(97));
+
+        scroll_lines(&mut state, 97, -3, 100);
+        assert_eq!(state.anchor, ScrollAnchor::Bottom, "should follow again");
+
+        // Past the oldest line clamps instead of underflowing.
+        scroll_lines(&mut state, 2, 40, 100);
+        assert_eq!(state.anchor, ScrollAnchor::At(0));
+
+        // Nothing scrolled off at all: the only valid anchor is Bottom.
+        scroll_lines(&mut state, 0, 5, 0);
+        assert_eq!(state.anchor, ScrollAnchor::Bottom);
     }
 
     #[test]

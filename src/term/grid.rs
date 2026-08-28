@@ -35,12 +35,23 @@ impl Row {
     /// The row as text, with trailing blanks trimmed. Used by logging, export,
     /// and clipboard copy — one implementation shared by all three.
     pub fn to_text(&self) -> String {
-        let end = self
-            .cells
+        self.cells[..self.used_width()]
+            .iter()
+            .map(|c| c.ch)
+            .collect()
+    }
+
+    // (see `Row::used_width` below)
+
+    /// Columns up to and including the last non-blank cell.
+    ///
+    /// What the display layout measures a line by: trailing blanks are padding,
+    /// not content, and wrapping on them would leave empty rows.
+    pub fn used_width(&self) -> usize {
+        self.cells
             .iter()
             .rposition(|c| !c.is_blank())
-            .map_or(0, |i| i + 1);
-        self.cells[..end].iter().map(|c| c.ch).collect()
+            .map_or(0, |i| i + 1)
     }
 
     fn resize(&mut self, cols: usize) {
@@ -72,6 +83,25 @@ pub struct Grid {
     pub title: Option<String>,
     /// Saved cursor for DECSC/DECRC.
     saved_cursor: Option<(Cursor, Pen)>,
+    /// Insert rather than replace, as far as we can tell.
+    ///
+    /// Set by IRM (`ESC [ 4 h` / `ESC [ 4 l`) when the remote side reports it,
+    /// and by the Insert key otherwise: IRIS edits a line itself and repaints
+    /// rather than announcing the mode, so the keystroke is the only signal
+    /// there is. Purely a display hint - it drives the cursor colour and
+    /// nothing else, so a flag that has drifted out of step with IRIS cannot
+    /// corrupt what is on screen.
+    pub insert_mode: bool,
+    /// Widest line ever printed, in columns. Drives how far the view may be
+    /// scrolled sideways when lines are clipped rather than wrapped.
+    ///
+    /// A high-water mark rather than a measurement: recomputing it would mean
+    /// scanning the whole scrollback every frame, and deriving it from only the
+    /// lines on screen made the view snap back to the left whenever scrolling
+    /// vertically reached a run of short lines. It can therefore over-estimate
+    /// once a long line has rotated out of the scrollback, which costs nothing
+    /// but a slightly small scrollbar thumb.
+    widest: usize,
     /// Deferred wrap: the cursor sits on the last column and the *next* printed
     /// character must move to the following line first. Without this, writing
     /// exactly `cols` characters would scroll one line too early.
@@ -100,6 +130,8 @@ impl Grid {
             scroll_bottom: rows - 1,
             title: None,
             saved_cursor: None,
+            insert_mode: false,
+            widest: 0,
             pending_wrap: false,
             revision: 0,
         }
@@ -214,6 +246,7 @@ impl Grid {
         let (row, col) = (self.cursor.row, self.cursor.col);
         let cell = Cell::with_pen(ch, &self.pen);
         self.screen[row].cells[col] = cell;
+        self.widest = self.widest.max(col + 1);
 
         if col + 1 >= self.cols {
             self.pending_wrap = true;
@@ -277,10 +310,18 @@ impl Grid {
         self.touch();
     }
 
-    fn push_scrollback(&mut self, row: Row) {
+    fn push_scrollback(&mut self, mut row: Row) {
         if self.scrollback_limit == 0 {
             return;
         }
+        // Trailing blanks are padding, and a line of history is never printed
+        // into again, so they are dropped. It matters once the grid can be much
+        // wider than the window: at 240 columns, ten thousand lines of padding
+        // is tens of megabytes of spaces. Every reader bounds itself by
+        // `cells.len()` or `used_width()`, so a short row is safe; the one place
+        // that needs full width back is a row promoted to the screen by
+        // `resize`, which re-expands it.
+        row.cells.truncate(row.used_width());
         self.scrollback.push_back(row);
         while self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
@@ -297,6 +338,11 @@ impl Grid {
             // DECSTBM homes the cursor.
             self.set_cursor(0, 0);
         }
+    }
+
+    /// Widest line printed so far, in columns. See [`Grid::widest`].
+    pub fn widest_line(&self) -> usize {
+        self.widest
     }
 
     pub fn reset_scroll_region(&mut self) {
@@ -423,6 +469,8 @@ impl Grid {
             *row = Row::new(cols);
         }
         self.pen.reset();
+        self.insert_mode = false;
+        self.widest = 0;
         self.cursor = Cursor {
             row: 0,
             col: 0,
@@ -455,9 +503,10 @@ impl Grid {
             for row in &mut self.screen {
                 row.resize(cols);
             }
-            for row in &mut self.scrollback {
-                row.resize(cols);
-            }
+            // Scrollback is deliberately left alone: history is not reflowed,
+            // padding it back out would undo the trim in `push_scrollback`, and
+            // a narrower window would otherwise truncate lines already
+            // received. Readers clamp to each row's own length.
             self.cols = cols;
         }
 
@@ -480,7 +529,11 @@ impl Grid {
             }
             std::cmp::Ordering::Greater => {
                 for _ in 0..rows - self.rows {
-                    if let Some(row) = self.scrollback.pop_back() {
+                    if let Some(mut row) = self.scrollback.pop_back() {
+                        // Back to full width: unlike scrollback, a screen row
+                        // is indexed directly by `print` and the erase
+                        // operations, which assume `cols` cells are there.
+                        row.resize(cols);
                         self.screen.insert(0, row);
                         self.cursor.row += 1;
                     } else {
@@ -515,5 +568,108 @@ impl Grid {
             .chain(self.screen.iter())
             .map(Row::to_text)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The memory saving that makes a grid wider than the window affordable.
+    #[test]
+    fn a_line_pushed_to_scrollback_loses_its_trailing_blanks() {
+        let mut grid = Grid::new(200, 2, 100);
+        for ch in "hello".chars() {
+            grid.print(ch);
+        }
+        grid.line_feed();
+        grid.line_feed();
+
+        let row = grid.scrollback.front().expect("a line scrolled off");
+        assert_eq!(row.cells.len(), 5, "padding was kept");
+        assert_eq!(row.to_text(), "hello");
+    }
+
+    /// A trimmed row promoted back onto the screen is printed into directly, so
+    /// it has to be full width again or that write is out of bounds.
+    #[test]
+    fn a_row_promoted_out_of_scrollback_is_full_width_again() {
+        let mut grid = Grid::new(200, 2, 100);
+        for ch in "hi".chars() {
+            grid.print(ch);
+        }
+        grid.line_feed();
+        grid.line_feed();
+        assert!(!grid.scrollback.is_empty());
+
+        grid.resize(200, 4);
+        for row in &grid.screen {
+            assert_eq!(row.cells.len(), 200, "a screen row must be full width");
+        }
+
+        // The write that would be out of bounds on a short row.
+        grid.set_cursor(0, 199);
+        grid.print('X');
+        assert_eq!(grid.screen[0].cells[199].ch, 'X');
+    }
+
+    /// Narrowing the window must not throw away text already received: only
+    /// the screen is resized, and readers clamp to each row's own length.
+    #[test]
+    fn narrowing_the_grid_leaves_history_intact() {
+        let mut grid = Grid::new(200, 2, 100);
+        for _ in 0..150 {
+            grid.print('x');
+        }
+        grid.line_feed();
+        grid.line_feed();
+
+        grid.resize(80, 2);
+        assert_eq!(
+            grid.scrollback.front().map(|r| r.to_text().len()),
+            Some(150),
+            "history was truncated by a window resize"
+        );
+    }
+
+    /// What the horizontal scrollbar is sized from. A high-water mark on
+    /// purpose: it must not shrink as the view scrolls onto short lines, or the
+    /// sideways offset would be clamped away under the user.
+    #[test]
+    fn the_widest_line_is_remembered_across_short_ones() {
+        let mut grid = Grid::new(200, 3, 100);
+        assert_eq!(grid.widest_line(), 0);
+
+        for _ in 0..150 {
+            grid.print('x');
+        }
+        assert_eq!(grid.widest_line(), 150);
+
+        // A short line after it must not lower the mark.
+        grid.line_feed();
+        grid.set_cursor(1, 0);
+        grid.print('y');
+        assert_eq!(grid.widest_line(), 150);
+
+        // Nor may scrolling the long line into history.
+        grid.line_feed();
+        grid.line_feed();
+        grid.line_feed();
+        assert_eq!(grid.widest_line(), 150);
+
+        // A full reset is the one point at which it is genuinely gone.
+        grid.reset();
+        assert_eq!(grid.widest_line(), 0);
+    }
+
+    #[test]
+    fn used_width_ignores_trailing_blanks_only() {
+        let mut grid = Grid::new(10, 1, 0);
+        grid.set_cursor(0, 2);
+        grid.print('a');
+        grid.set_cursor(0, 5);
+        grid.print('b');
+        assert_eq!(grid.screen[0].used_width(), 6);
+        assert_eq!(grid.screen[0].to_text(), "  a  b");
     }
 }
