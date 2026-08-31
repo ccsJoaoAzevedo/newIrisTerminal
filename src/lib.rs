@@ -11,6 +11,25 @@ pub mod pty;
 pub mod term;
 pub mod ui;
 
+use eframe::egui;
+use std::sync::Arc;
+
+// Função para processar a imagem do ícone
+fn load_icon() -> egui::IconData {
+    let image = image::load_from_memory(include_bytes!("../assets/icon.ico"))
+        .expect("Falha ao carregar a imagem do ícone")
+        .into_rgba8();
+
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+
+    egui::IconData {
+        rgba,
+        width,
+        height,
+    }
+}
+
 /// Starts the GUI. The binary is nothing more than a call to this.
 pub fn run() -> eframe::Result<()> {
     // Read early, because whether the window has a system frame is fixed when
@@ -26,7 +45,9 @@ pub fn run() -> eframe::Result<()> {
             // taskbar and the window switcher show.
             .with_title("newIrisTerminal")
             .with_decorations(decorated)
-            .with_resizable(true),
+            .with_resizable(true)
+            // Define o ícone da janela e barra de tarefas aqui:
+            .with_icon(Arc::new(load_icon())),
         ..Default::default()
     };
 

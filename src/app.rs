@@ -117,6 +117,9 @@ pub struct Tab {
     pub capture: Option<Capture>,
     /// User-set name; falls back to the OSC title, then the profile name.
     pub custom_title: Option<String>,
+    /// When a clear-screen was asked of IRIS, so a purge that never arrives
+    /// can be called off. See [`Tab::request_clear`].
+    clear_asked: Option<std::time::Instant>,
     /// Set when the child exits, so the tab explains itself instead of freezing.
     pub ended: bool,
     pub error: Option<String>,
@@ -140,6 +143,7 @@ impl Tab {
             log,
             capture: None,
             custom_title: None,
+            clear_asked: None,
             ended: false,
             error: None,
         };
@@ -249,6 +253,16 @@ impl Tab {
             }
         }
 
+        // A clear that never came - the session was sitting in a `read`, say,
+        // and swallowed the command as input. The purge is called off rather
+        // than left armed to surprise the next clear-screen.
+        if let Some(asked) = self.clear_asked {
+            if asked.elapsed() > std::time::Duration::from_secs(2) {
+                self.grid.cancel_purge();
+                self.clear_asked = None;
+            }
+        }
+
         if ended {
             self.ended = true;
             self.session = None;
@@ -268,6 +282,22 @@ impl Tab {
         if let Some(session) = self.session.as_ref() {
             let _ = session.write(&self.profile.encoding.encode(text));
         }
+    }
+
+    /// Asks IRIS to clear the screen, the way typing `W #` would.
+    ///
+    /// The terminal cannot do this on its own: IRIS tracks the cursor itself
+    /// and positions absolutely, so a grid cleared locally leaves the next
+    /// prompt painted back down at the row IRIS still believes it is on. The
+    /// grid is told to drop its history when that clear arrives, so the gesture
+    /// ends with an empty terminal rather than one holding the echoed command.
+    pub fn request_clear(&mut self) {
+        if self.session.is_none() {
+            return;
+        }
+        self.grid.purge_history_on_next_clear();
+        self.clear_asked = Some(std::time::Instant::now());
+        self.send_lines(&["W #".to_string()]);
     }
 
     /// Sends whole lines, each terminated the way Enter would terminate it.
@@ -323,7 +353,9 @@ pub struct App {
     /// `terminal_size`, which is the wider grid IRIS is told about; this is the
     /// geometry the user is actually looking at and the one worth reporting.
     view_size: (usize, usize),
-    show_new_tab: bool,
+    /// Profile a new tab opens with. There is no dialog in front of it: the
+    /// `+` button and Ctrl+T connect straight away, and this is what they
+    /// connect to. Right-clicking `+` picks a different one.
     new_tab_profile: Profile,
     status: Option<String>,
     /// Font family egui has actually been given, which is not always the one
@@ -384,7 +416,6 @@ impl App {
             focused_tab: None,
             terminal_size: (FALLBACK_COLS, FALLBACK_ROWS),
             view_size: (FALLBACK_COLS as usize, FALLBACK_ROWS as usize),
-            show_new_tab: false,
             status: None,
             font_family: String::new(),
             font_request: String::new(),
@@ -396,12 +427,10 @@ impl App {
         App::apply_style(&cc.egui_ctx, &app.theme(), &app.settings);
         app.apply_font(&cc.egui_ctx);
 
+        // Straight into the instance. Anyone with something to change has
+        // Settings; everyone else was only ever going to press Connect.
         if app.settings.open_on_start {
-            if let Some(profile) = app.settings.startup_profile().cloned() {
-                app.open_tab(profile);
-            } else {
-                app.show_new_tab = true;
-            }
+            app.open_new_tab();
         }
         app
     }
@@ -468,6 +497,39 @@ impl App {
             .find(|t| t.name == self.settings.theme)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Clears the active terminal and forgets its history.
+    ///
+    /// The deliberate version of what `W #` only looks like: IRIS's own
+    /// clear-screen now files the screen into the scrollback, and this is the
+    /// gesture for when the history really is meant to go. Also on the
+    /// right-click menu, because a shortcut nobody can see is a shortcut nobody
+    /// uses.
+    ///
+    /// The clear is asked of IRIS rather than done locally, so its idea of the
+    /// cursor is cleared along with the screen. Wiping the grid here instead
+    /// was the bug: IRIS positions the cursor absolutely, so it went on
+    /// painting from the row it had reached and the next prompt appeared back
+    /// down the screen with the cleared rows blank above it. Only a session
+    /// that cannot be asked - one that has ended - is cleared locally.
+    fn clear_active_terminal(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        tab.view.clear_selection();
+        tab.view.scroll_to_bottom();
+        if tab.session.is_some() {
+            tab.request_clear();
+        } else {
+            tab.grid.hard_reset();
+        }
+    }
+
+    /// Connects a new tab to whatever `new_tab_profile` currently names.
+    pub fn open_new_tab(&mut self) {
+        let profile = self.new_tab_profile.clone();
+        self.open_tab(profile);
     }
 
     pub fn open_tab(&mut self, profile: Profile) {
@@ -542,7 +604,7 @@ impl App {
         }
 
         if new_tab {
-            self.show_new_tab = true;
+            self.open_new_tab();
         }
         if close_tab && !self.tabs.is_empty() {
             self.close_tab(self.active);
@@ -563,11 +625,19 @@ impl App {
             let _ = self.settings.save();
         }
 
+        // Ctrl+Delete: reset the terminal and drop the history, the one
+        // gesture that is meant to destroy the transcript. Gated on the
+        // terminal having focus so it stays "delete word" in a text field.
+        let terminal_focus = self.terminal_has_focus(ctx);
+        if terminal_focus && consume_exact(ctx, Modifiers::CTRL, Key::Delete) {
+            self.clear_active_terminal();
+        }
+
         // Macro shortcuts come after the app's own, which is what the editor's
         // "the app already uses this" warning promises. A macro whose `key` is
         // missing or unparseable simply never fires; the text is shared and
         // hand-edited, so it cannot be trusted to mean anything.
-        if self.terminal_has_focus(ctx) {
+        if terminal_focus {
             let mut fire = None;
             for group in &self.macro_groups {
                 for m in &group.macros {
@@ -591,14 +661,53 @@ impl App {
     /// own frame - the window buttons and the draggable area on the right.
     fn menu_bar(&mut self, ui: &mut egui::Ui) -> Option<WindowAction> {
         let mut action = None;
+        // Opening a tab has to happen after the closure: it borrows `self`
+        // mutably, and the bar is already holding it.
+        let mut open = false;
+        let mut pick: Option<Profile> = None;
         ui.horizontal(|ui| {
-            if ui
-                .button("+")
-                .on_hover_text("New session (Ctrl+T)")
-                .clicked()
-            {
-                self.show_new_tab = true;
+            let instance = if self.new_tab_profile.instance.is_empty() {
+                "no instance configured".to_string()
+            } else {
+                self.new_tab_profile.instance.clone()
+            };
+            let new_tab = ui.button("+").on_hover_text(format!(
+                "New session on {instance} (Ctrl+T).\nRight-click to connect somewhere else."
+            ));
+            if new_tab.clicked() {
+                open = true;
             }
+            // The escape hatch that replaces the dialog: everything it used to
+            // offer - the profiles and the instances found on this machine -
+            // one click away instead of in front of every new session.
+            new_tab.context_menu(|ui| {
+                for profile in &self.settings.profiles {
+                    let label = if profile.instance.is_empty() {
+                        profile.name.clone()
+                    } else {
+                        format!("{}  ({})", profile.name, profile.instance)
+                    };
+                    if ui.button(label).clicked() {
+                        pick = Some(profile.clone());
+                        ui.close_menu();
+                    }
+                }
+                if !self.settings.profiles.is_empty() && !self.instances.is_empty() {
+                    ui.separator();
+                }
+                for name in &self.instances {
+                    if ui.button(name).clicked() {
+                        pick = Some(Profile {
+                            instance: name.clone(),
+                            ..self.new_tab_profile.clone()
+                        });
+                        ui.close_menu();
+                    }
+                }
+                if self.settings.profiles.is_empty() && self.instances.is_empty() {
+                    ui.weak("No profiles or instances found.");
+                }
+            });
             ui.separator();
             ui.toggle_value(&mut self.panels.show_macros, "Macros");
             ui.toggle_value(&mut self.panels.show_globals, "Globals");
@@ -619,6 +728,14 @@ impl App {
                 action = chrome::title_bar_controls(ui);
             }
         });
+
+        if let Some(profile) = pick {
+            self.new_tab_profile = profile;
+            open = true;
+        }
+        if open {
+            self.open_new_tab();
+        }
         action
     }
 
@@ -848,6 +965,11 @@ impl App {
                 ctx.copy_text(text);
                 self.set_status("Copied the visible rows.");
             }
+            UiRequest::OpenFolder(path) => {
+                if let Err(e) = config::open_in_file_manager(&path) {
+                    self.set_status(format!("Could not open {}: {e:#}", path.display()));
+                }
+            }
             UiRequest::SavePersonalMacros => {
                 let path = config::personal_macros_path();
                 let xml = macros::to_xml(&self.macro_groups);
@@ -941,84 +1063,6 @@ impl App {
         match export::write_file(&path, &contents) {
             Ok(()) => self.set_status(format!("Exported to {}", path.display())),
             Err(e) => self.set_status(format!("Export failed: {e:#}")),
-        }
-    }
-
-    fn new_tab_dialog(&mut self, ctx: &Context) {
-        if !self.show_new_tab {
-            return;
-        }
-        let mut open = true;
-        let mut launch = false;
-
-        egui::Window::new("New session")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                if !self.settings.profiles.is_empty() {
-                    ui.label("Profile");
-                    egui::ComboBox::from_id_source("profile-picker")
-                        .selected_text(self.new_tab_profile.name.clone())
-                        .show_ui(ui, |ui| {
-                            for profile in &self.settings.profiles {
-                                if ui
-                                    .selectable_label(
-                                        profile.name == self.new_tab_profile.name,
-                                        &profile.name,
-                                    )
-                                    .clicked()
-                                {
-                                    self.new_tab_profile = profile.clone();
-                                }
-                            }
-                        });
-                    ui.separator();
-                }
-
-                ui.label("Instance");
-                if self.instances.is_empty() {
-                    ui.text_edit_singleline(&mut self.new_tab_profile.instance);
-                    ui.small("No IRIS instances discovered - type the name.");
-                } else {
-                    egui::ComboBox::from_id_source("instance-picker")
-                        .selected_text(self.new_tab_profile.instance.clone())
-                        .show_ui(ui, |ui| {
-                            for name in &self.instances {
-                                if ui
-                                    .selectable_label(*name == self.new_tab_profile.instance, name)
-                                    .clicked()
-                                {
-                                    self.new_tab_profile.instance = name.clone();
-                                }
-                            }
-                        });
-                }
-
-                ui.label("Namespace");
-                ui.text_edit_singleline(&mut self.new_tab_profile.namespace);
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let ready = !self.new_tab_profile.instance.is_empty();
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Connect"))
-                        .clicked()
-                    {
-                        launch = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.show_new_tab = false;
-                    }
-                });
-            });
-
-        if launch {
-            self.open_tab(self.new_tab_profile.clone());
-            self.show_new_tab = false;
-        }
-        if !open {
-            self.show_new_tab = false;
         }
     }
 }
@@ -1126,11 +1170,15 @@ impl eframe::App for App {
             .frame(egui::Frame::none().fill(theme.background))
             .show(ctx, |ui| {
                 if self.tabs.is_empty() {
+                    let mut open = false;
                     ui.centered_and_justified(|ui| {
                         if ui.button("Open a session (Ctrl+T)").clicked() {
-                            self.show_new_tab = true;
+                            open = true;
                         }
                     });
+                    if open {
+                        self.open_new_tab();
+                    }
                     return;
                 }
 
@@ -1211,6 +1259,7 @@ impl eframe::App for App {
                             self.tabs[active].view.clear_selection();
                         }
                         ContextAction::ExportScreen => self.panels.show_export = true,
+                        ContextAction::ClearTerminal => self.clear_active_terminal(),
                     }
                 }
 
@@ -1253,7 +1302,6 @@ impl eframe::App for App {
                 }
             });
 
-        self.new_tab_dialog(ctx);
         self.rename_tab_dialog(ctx);
         self.close_confirm_dialog(ctx);
 

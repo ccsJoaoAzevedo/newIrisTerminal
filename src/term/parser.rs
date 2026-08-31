@@ -346,6 +346,120 @@ mod tests {
         assert_eq!(grid.screen[1].to_text(), "");
     }
 
+    /// The regression behind "`W #` loses everything", byte for byte as a live
+    /// IRIS sends it: home, then erase-to-end-of-line and a newline for every
+    /// row, with the new prompt printed straight over one of them. Not an ED
+    /// sequence in sight, so the transcript survives only if the clear is
+    /// recognised while it is being carried out.
+    #[test]
+    fn the_clear_iris_actually_sends_keeps_the_screen_in_the_scrollback() {
+        let mut grid = Grid::new(20, 4, 100);
+        let mut parser = vte::Parser::new();
+        advance(&mut parser, &mut grid, b"one\r\ntwo\r\nthree\r\nUSER>W #");
+        assert_eq!(grid.screen[0].to_text(), "one");
+
+        advance(
+            &mut parser,
+            &mut grid,
+            b"\x1b[?25l\x1b[H\x1b[K\r\nUSER>\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[2;7H\x1b[?25h",
+        );
+
+        let history: Vec<String> = grid.scrollback.iter().map(|r| r.to_text()).collect();
+        assert_eq!(
+            history,
+            vec![
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+                "USER>W #".to_string(),
+            ],
+            "the cleared screen never reached the scrollback"
+        );
+        assert_eq!(grid.screen[0].to_text(), "");
+        assert_eq!(grid.screen[1].to_text(), "USER>");
+    }
+
+    /// Ctrl+Delete asks IRIS for the clear, because only IRIS can reset its own
+    /// idea of where the cursor is - so the clear that comes back must drop the
+    /// history rather than archive it, echoed command and all.
+    #[test]
+    fn a_requested_clear_purges_the_history_instead_of_filing_it() {
+        let mut grid = Grid::new(20, 4, 100);
+        let mut parser = vte::Parser::new();
+        advance(
+            &mut parser,
+            &mut grid,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nUSER>",
+        );
+        assert!(!grid.scrollback.is_empty(), "nothing to purge");
+
+        // What the gesture does: ask IRIS to clear, and arrange for the clear
+        // that comes back to drop the history rather than add to it.
+        grid.purge_history_on_next_clear();
+        // IRIS echoes the command it was sent, then clears the screen.
+        advance(
+            &mut parser,
+            &mut grid,
+            b"W #\x1b[H\x1b[K\r\nUSER>\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[2;7H",
+        );
+
+        assert!(
+            grid.scrollback.is_empty(),
+            "the requested clear left something behind: {:?}",
+            grid.scrollback
+                .iter()
+                .map(|r| r.to_text())
+                .collect::<Vec<_>>()
+        );
+        // And the prompt is back at the top, which is the whole reason the
+        // clear is asked of IRIS rather than done here.
+        assert_eq!(grid.screen[1].to_text(), "USER>");
+        assert_eq!(grid.cursor.row, 1);
+    }
+
+    /// A purge that is armed and never used must not ambush the next ordinary
+    /// clear-screen.
+    #[test]
+    fn a_cancelled_purge_leaves_the_next_clear_alone() {
+        let mut grid = Grid::new(20, 4, 100);
+        let mut parser = vte::Parser::new();
+        advance(&mut parser, &mut grid, b"one\r\ntwo\r\nthree\r\nUSER>W #");
+
+        grid.purge_history_on_next_clear();
+        grid.cancel_purge();
+        advance(
+            &mut parser,
+            &mut grid,
+            b"\x1b[H\x1b[K\r\nUSER>\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[2;7H",
+        );
+
+        assert_eq!(grid.scrollback.len(), 4, "the clear archived nothing");
+    }
+
+    /// The other half of the deal: an app repainting its screen from the top
+    /// must not push a copy of the old one into the history every time.
+    #[test]
+    fn a_repaint_that_jumps_around_files_nothing() {
+        let mut grid = Grid::new(20, 4, 100);
+        let mut parser = vte::Parser::new();
+        advance(&mut parser, &mut grid, b"a\r\nb\r\nc\r\nd");
+        // Home, redraw the top line, then jump back up the screen - which is
+        // what a form does and a clear never does.
+        advance(
+            &mut parser,
+            &mut grid,
+            b"\x1b[H\x1b[KMenu\x1b[4;1H\x1b[Kfooter\x1b[2;1H\x1b[Kbody",
+        );
+        assert!(
+            grid.scrollback.is_empty(),
+            "a repaint was mistaken for a clear: {:?}",
+            grid.scrollback
+                .iter()
+                .map(|r| r.to_text())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn el_mode_1_clears_through_the_cursor_inclusive() {
         let grid = run(10, 2, b"abcdef\x1b[1;4H\x1b[1K");

@@ -42,6 +42,8 @@ pub enum UiRequest {
     RunGlobalQuery,
     /// Copy the visible global-browser rows to the clipboard.
     CopyGlobalPage,
+    /// Show a folder in the platform's file manager.
+    OpenFolder(std::path::PathBuf),
 }
 
 /// State the panels own between frames.
@@ -162,6 +164,7 @@ pub fn macros_panel(
 
     let filter = state.macro_filter.to_lowercase();
     let mut to_select: Option<(usize, usize)> = None;
+    let mut to_run: Option<Macro> = None;
 
     egui::ScrollArea::vertical()
         .max_height(ui.available_height() * 0.5)
@@ -192,6 +195,22 @@ pub fn macros_panel(
                     .show(ui, |ui| {
                         for (mi, m) in matching {
                             ui.horizontal(|ui| {
+                                // Run sits on the row with the name, so firing
+                                // a macro is one press from the list. It still
+                                // goes through the same request path, so a
+                                // macro that asks for parameters or a
+                                // confirmation asks for them here too.
+                                if ui
+                                    .small_button("Run")
+                                    .on_hover_text(if m.confirm {
+                                        "Runs after confirming."
+                                    } else {
+                                        "Sends this macro to the active session."
+                                    })
+                                    .clicked()
+                                {
+                                    to_run = Some(m.clone());
+                                }
                                 let label = if m.confirm {
                                     format!("{}  (confirms)", m.name)
                                 } else {
@@ -236,6 +255,9 @@ pub fn macros_panel(
 
     if let Some(at) = to_select {
         state.selected = Some(at);
+    }
+    if let Some(m) = to_run {
+        request = Some(UiRequest::RunMacro(m));
     }
 
     ui.separator();
@@ -291,26 +313,23 @@ fn macro_details(
         ui.label(&m.description);
     }
 
-    ui.horizontal(|ui| {
-        if ui.button("Run").clicked() {
-            request = Some(UiRequest::RunMacro(m.clone()));
+    // No Run here: it lives next to the name in the list above, where it is
+    // reachable without selecting the macro first.
+    ui.horizontal(|ui| match m.origin {
+        Origin::Personal => {
+            if ui.button("Edit").clicked() {
+                state.open_editor((gi, mi), m.clone());
+            }
+            if ui
+                .button("Delete")
+                .on_hover_text("Removes it from your personal macro file.")
+                .clicked()
+            {
+                delete = true;
+            }
         }
-        match m.origin {
-            Origin::Personal => {
-                if ui.button("Edit").clicked() {
-                    state.open_editor((gi, mi), m.clone());
-                }
-                if ui
-                    .button("Delete")
-                    .on_hover_text("Removes it from your personal macro file.")
-                    .clicked()
-                {
-                    delete = true;
-                }
-            }
-            Origin::Organization => {
-                ui.weak("Provided by the organization; read-only here.");
-            }
+        Origin::Organization => {
+            ui.weak("Provided by the organization; read-only here.");
         }
     });
 
@@ -717,6 +736,9 @@ pub fn settings_dialog(
     }
     let mut changed = false;
     let mut open = true;
+    // Kept apart from `changed`: opening a folder is an action, not an edit,
+    // and it must not make the app rewrite settings.toml.
+    let mut action: Option<UiRequest> = None;
 
     egui::Window::new("Settings")
         .collapsible(false)
@@ -740,6 +762,16 @@ pub fn settings_dialog(
                                 }
                             }
                         });
+                    // A theme is a TOML file edited by hand, so the useful
+                    // button next to the picker is the one that shows where
+                    // they live.
+                    if ui
+                        .button("Open folder")
+                        .on_hover_text(crate::config::themes_dir().display().to_string())
+                        .clicked()
+                    {
+                        action = Some(UiRequest::OpenFolder(crate::config::themes_dir()));
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Font");
@@ -806,7 +838,7 @@ pub fn settings_dialog(
                         "Syntax highlighting",
                     )
                     .on_hover_text(
-                        "A guess about the text on screen; a colour IRIS sets itself always wins.",
+                        "Colours globals, strings, numbers, commands, macros and class references. A guess about the text on screen; a colour IRIS sets itself always wins.",
                     )
                     .changed()
                 {
@@ -822,6 +854,9 @@ pub fn settings_dialog(
                     changed = true;
                 }
                 ui.small("Theme files live in the themes folder; drop one in and restart.");
+                ui.small(
+                    "Each theme also carries the ObjectScript colours, named after the scopes the InterSystems VS Code extension uses - copy them straight across from an editor colour customisation.",
+                );
                 ui.small(
                     "A built-in theme is rewritten on every start; clear its `builtin` flag to keep your own edits.",
                 );
@@ -949,7 +984,7 @@ pub fn settings_dialog(
     if !open {
         state.show_settings = false;
     }
-    changed.then_some(UiRequest::SettingsChanged)
+    action.or_else(|| changed.then_some(UiRequest::SettingsChanged))
 }
 
 /// Returns true when anything changed.

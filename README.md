@@ -11,17 +11,51 @@ correctly rather than being flattened into line-oriented output.
 ## Feature-set
 
 * **Done:**
-  * Multitab — one IRIS session per tab, independent scrollback and logging
+  * Multitab — one IRIS session per tab, independent scrollback and logging.
+    `+` (or Ctrl+T) connects straight away on the last-used profile/instance
+    with no dialog in the way; right-click `+` for a menu of every configured
+    profile and every discovered instance
+  * Custom window chrome — the app draws its own titlebar (hand-stroked
+    minimize / maximize-restore / close, red on close-hover), the empty part
+    of it drags the window and double-click maximizes, and the edges/corners
+    resize like a native window. Settings → Window → "Use the system title
+    bar" switches back to OS decorations if you'd rather have those
+  * Clear-screen that keeps the transcript — `W #` doesn't clear in one shot,
+    it erases row by row; the terminal catches that sweep and files the
+    pre-clear screen into scrollback instead of destroying it, the way the
+    native IrisTerm does. Ctrl+Delete (or right-click → "Clear terminal and
+    scrollback") is the separate, deliberate gesture that actually throws the
+    history away, asking IRIS for a real clear rather than wiping the grid
+    locally — which would otherwise leave IRIS's next prompt painted at a
+    stale row
+  * ObjectScript syntax colouring in the terminal, prompt-aware so it never
+    lights up plain prose: globals, strings, numbers, delimiters/operators,
+    commands (full words and their IRIS abbreviations), preprocessor macros
+    (`$$$`, `#define`), functions and system variables (`$piece`, `$horolog`),
+    class/method/attribute/member references (`##class(...)`, `..Prop`,
+    `obj.Method(`), routine and extrinsic calls (`^ROU`, `$$Tag^ROU`) and
+    labels. Field names in a theme are named after the semantic scopes of the
+    InterSystems VS Code extension, so a colour customisation can be copied
+    straight across
   * Autologon — username/password from the OS credential store, with post-login commands
   * Window resize and fit content to window — the grid reflows and the PTY is resized
-  * Macros read from XML — `{{param}}` substitution, and `confirm="true"` for anything that writes
-  * Theming support — TOML themes, hot-swappable, applied to terminal and chrome alike
+  * Macros read from XML — `{{param}}` substitution, `confirm="true"` for
+    anything that writes, an optional keyboard shortcut per macro
+    (`key="Ctrl+Shift+G"`), `hide_command="true"` to keep a password-bearing
+    command line out of the panel, and a one-click Run button on every row
+  * Theming support — TOML themes, hot-swappable, applied to terminal and
+    chrome alike, with an "Open folder" button that jumps straight to the
+    themes directory. Also covers font family (from the system's installed
+    fonts) and size, cursor style and blink, and solid vs hover-only
+    scrollbars
   * Plugin interface — sandboxed WebAssembly, behind the `plugins` feature
   * Logging — per-session transcripts, raw or clean, with password redaction and rotation
   * Easier access and dedicated interfaces for native routines (`^%RD`, `^%RS`, `ZWRITE`, `ZN`)
   * Export output — screen or full scrollback, as text or colour-preserving HTML
   * Global browser — a searchable, paginated grid replacing `^%G`'s paged text
-  * Right-click menu for copy / paste / select all
+  * Right-click menu for copy / paste / select all / clear terminal and scrollback
+  * Custom app icon, embedded both in the `.exe` (Explorer/taskbar) and loaded
+    at runtime for the window icon
 
 ## Building
 
@@ -80,7 +114,7 @@ Everything lives under the platform config directory — `%APPDATA%\newIrisTermi
 
 | File | Purpose |
 |---|---|
-| `settings.toml` | Profiles, theme, font size, scrollback, logging |
+| `settings.toml` | Profiles, theme, font/cursor/scrollbar, window decorations, scrollback, logging |
 | `macros.xml` | Your personal macros — editable from the Macros panel |
 | `themes/*.toml` | Colour schemes; drop a file in and restart |
 | `plugins/*.wasm` | Plugins, with an optional `.toml` manifest beside each |

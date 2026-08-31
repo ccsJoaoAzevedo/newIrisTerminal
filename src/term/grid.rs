@@ -59,6 +59,23 @@ impl Row {
     }
 }
 
+/// A screen-clear caught in the act.
+///
+/// IRIS does not clear the screen with one escape sequence. `W #` homes the
+/// cursor and then erases its way down the screen a row at a time - printing
+/// the new prompt on the way past - so there is never a moment at which the old
+/// screen still exists to be filed away in one piece. Each row has to be kept
+/// as it is destroyed, and the collection handed to the scrollback only once
+/// the sweep has reached the bottom and proved itself a clear rather than a
+/// repaint.
+struct ClearSweep {
+    /// Old contents of each row the sweep has destroyed, indexed by row.
+    rows: Vec<Option<Row>>,
+    /// Furthest row it has reached. A clear works down the screen; a mutation
+    /// above this is an app repainting, which must not eat the transcript.
+    at: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
     pub row: usize,
@@ -106,6 +123,11 @@ pub struct Grid {
     /// character must move to the following line first. Without this, writing
     /// exactly `cols` characters would scroll one line too early.
     pending_wrap: bool,
+    /// Set while a clear-screen is being carried out a row at a time. See
+    /// [`ClearSweep`].
+    clear: Option<ClearSweep>,
+    /// Set by [`Grid::purge_history_on_next_clear`].
+    purge_on_clear: bool,
     /// Bumped on every mutation so the UI can skip repainting an idle tab.
     pub revision: u64,
 }
@@ -133,6 +155,8 @@ impl Grid {
             insert_mode: false,
             widest: 0,
             pending_wrap: false,
+            clear: None,
+            purge_on_clear: false,
             revision: 0,
         }
     }
@@ -161,6 +185,10 @@ impl Grid {
     pub fn set_cursor(&mut self, row: usize, col: usize) {
         self.cursor.row = row.min(self.rows.saturating_sub(1));
         self.cursor.col = col.min(self.cols.saturating_sub(1));
+        // Homing the cursor is how a clear-screen opens. See [`ClearSweep`].
+        if self.cursor.row == 0 && self.cursor.col == 0 {
+            self.begin_clear();
+        }
         self.pending_wrap = false;
         self.touch();
     }
@@ -244,6 +272,7 @@ impl Grid {
         }
 
         let (row, col) = (self.cursor.row, self.cursor.col);
+        self.destroying_row(row);
         let cell = Cell::with_pen(ch, &self.pen);
         self.screen[row].cells[col] = cell;
         self.widest = self.widest.max(col + 1);
@@ -284,6 +313,9 @@ impl Grid {
     /// only when the region is the whole screen — a full-screen routine that
     /// scrolls an inner region must not pollute the transcript.
     pub fn scroll_up(&mut self, n: usize) {
+        // The screen is moving rather than being wiped, and what scrolls off
+        // reaches the scrollback by itself.
+        self.cancel_clear();
         let n = n.min(self.scroll_bottom - self.scroll_top + 1);
         let full_screen = self.scroll_top == 0 && self.scroll_bottom == self.rows - 1;
         let pen = self.pen;
@@ -300,6 +332,7 @@ impl Grid {
     }
 
     pub fn scroll_down(&mut self, n: usize) {
+        self.cancel_clear();
         let n = n.min(self.scroll_bottom - self.scroll_top + 1);
         let pen = self.pen;
         for _ in 0..n {
@@ -352,12 +385,31 @@ impl Grid {
 
     // ---- erasing ---------------------------------------------------------
 
-    /// ED. 0 = cursor to end, 1 = start to cursor, 2/3 = whole screen.
+    /// ED. 0 = cursor to end, 1 = start to cursor, 2 = whole screen,
+    /// 3 = whole screen *and* the saved lines.
+    ///
+    /// Clearing the whole display files what was on it into scrollback first.
+    /// IRIS's `W #` erases the screen where it stands rather than scrolling it
+    /// off, so blanking those rows in place is what made the transcript
+    /// disappear: nothing had ever been pushed into history, and there was
+    /// nothing left to scroll back to. Only mode 3 - the sequence whose whole
+    /// purpose is to drop the history - actually throws it away.
     pub fn erase_in_display(&mut self, mode: u16) {
         let pen = self.pen;
         let (row, col) = (self.cursor.row, self.cursor.col);
         match mode {
             0 => {
+                // Terminfo spells "clear" both ways: `\E[H\E[2J` and
+                // `\E[H\E[J`. An erase-to-end wipes every row below the
+                // cursor, so a sweep already under way finishes here rather
+                // than one row at a time.
+                if self.clear.is_some() {
+                    for r in row..self.rows {
+                        self.destroying_row(r);
+                    }
+                } else if row == 0 && col == 0 {
+                    self.archive_screen();
+                }
                 self.erase_row_range(row, col, self.cols);
                 for r in row + 1..self.rows {
                     self.screen[r] = Row::blank(self.cols, &pen);
@@ -370,12 +422,140 @@ impl Grid {
                 self.erase_row_range(row, 0, col + 1);
             }
             _ => {
+                // One sequence for the whole screen: nothing to piece together
+                // a row at a time.
+                self.cancel_clear();
+                if mode == 3 {
+                    self.scrollback.clear();
+                } else {
+                    self.archive_screen();
+                }
                 for r in 0..self.rows {
                     self.screen[r] = Row::blank(self.cols, &pen);
                 }
             }
         }
         self.touch();
+    }
+
+    // ---- clear-screen detection -----------------------------------------
+
+    /// Notes that the cursor has been homed, which is how a clear-screen
+    /// begins. Nothing is captured yet: most homings are an app about to
+    /// repaint, and the sweep is dropped again the moment it behaves like one.
+    fn begin_clear(&mut self) {
+        if self.clear.is_none() {
+            self.clear = Some(ClearSweep {
+                rows: vec![None; self.rows],
+                at: 0,
+            });
+        }
+    }
+
+    fn cancel_clear(&mut self) {
+        self.clear = None;
+    }
+
+    /// Throw the history away at the next clear-screen instead of filing the
+    /// screen into it.
+    ///
+    /// The "clear the terminal for real" gesture cannot just wipe the grid:
+    /// IRIS keeps its own idea of where the cursor is, so a screen cleared
+    /// behind its back leaves the next prompt painted back down at the row it
+    /// had reached. The app therefore asks IRIS to clear the screen itself, and
+    /// sets this so the clear that comes back drops the transcript - including
+    /// the echo of the command that asked for it - rather than archiving it.
+    pub fn purge_history_on_next_clear(&mut self) {
+        self.purge_on_clear = true;
+    }
+
+    /// Forgets a purge that was asked for and never happened, so it cannot
+    /// ambush a later clear-screen. See [`crate::app::Tab::pump`].
+    pub fn cancel_purge(&mut self) {
+        self.purge_on_clear = false;
+    }
+
+    /// Consumes a pending purge. Reports whether the caller should skip filing
+    /// anything away, the history having just been dropped instead.
+    fn purging(&mut self) -> bool {
+        if !self.purge_on_clear {
+            return false;
+        }
+        self.purge_on_clear = false;
+        self.scrollback.clear();
+        true
+    }
+
+    /// Keeps the old contents of a row that is about to be overwritten or
+    /// erased, while a clear sweep is running, and files the sweep away once it
+    /// has worked its way to the bottom of the screen.
+    ///
+    /// Both kinds of destruction count: `W #` erases most rows, but it prints
+    /// the new prompt straight over one of them, and a transcript missing that
+    /// one line would be its own small bug.
+    fn destroying_row(&mut self, row: usize) {
+        let Some(sweep) = self.clear.as_mut() else {
+            return;
+        };
+        // A clear starts at the top and only ever moves down. Anything else is
+        // an app painting its screen, and its previous screen is not history.
+        let starting = sweep.at == 0 && sweep.rows[0].is_none();
+        if row >= sweep.rows.len() || row < sweep.at || (starting && row != 0) {
+            self.clear = None;
+            return;
+        }
+        sweep.at = row;
+        if sweep.rows[row].is_none() {
+            sweep.rows[row] = Some(self.screen[row].clone());
+        }
+
+        // Reaching the last row ends the sweep. It only counts as a clear if
+        // every row on the way down was destroyed: a repaint that starts at the
+        // top and then jumps to the footer has skipped the middle, and its old
+        // screen is not history.
+        if row + 1 == self.rows {
+            let Some(sweep) = self.clear.take() else {
+                return;
+            };
+            if sweep.rows.iter().all(|r| r.is_some()) {
+                self.file_sweep(sweep);
+            }
+        }
+    }
+
+    /// Hands a completed sweep to the scrollback.
+    fn file_sweep(&mut self, sweep: ClearSweep) {
+        if self.purging() {
+            return;
+        }
+        let mut rows: Vec<Row> = sweep.rows.into_iter().flatten().collect();
+        // Blank rows at the end of the screen are padding, exactly as they are
+        // for [`Grid::archive_screen`].
+        while rows.last().is_some_and(|r| r.used_width() == 0) {
+            rows.pop();
+        }
+        for row in rows {
+            self.push_scrollback(row);
+        }
+    }
+
+    /// Files the visible screen into scrollback, so a clear-screen hides the
+    /// text rather than destroying it.
+    ///
+    /// Blank rows below the last line of content are dropped: a routine that
+    /// clears a 50-row screen holding three lines should cost three lines of
+    /// history, not fifty blank ones.
+    fn archive_screen(&mut self) {
+        if self.purging() {
+            return;
+        }
+        let Some(last) = self.screen.iter().rposition(|r| r.used_width() > 0) else {
+            return;
+        };
+        for index in 0..=last {
+            let row = self.screen[index].clone();
+            self.push_scrollback(row);
+        }
     }
 
     /// EL. 0 = cursor to end of line, 1 = start to cursor, 2 = whole line.
@@ -390,6 +570,7 @@ impl Grid {
     }
 
     fn erase_row_range(&mut self, row: usize, from: usize, to: usize) {
+        self.destroying_row(row);
         let pen = self.pen;
         let to = to.min(self.cols);
         for c in from..to {
@@ -438,6 +619,9 @@ impl Grid {
         if self.cursor.row < self.scroll_top || self.cursor.row > self.scroll_bottom {
             return;
         }
+        // Row indices are about to shift, and a half-captured sweep is indexed
+        // by row.
+        self.cancel_clear();
         let pen = self.pen;
         let row = self.cursor.row;
         for _ in 0..n.min(self.scroll_bottom - row + 1) {
@@ -452,6 +636,7 @@ impl Grid {
         if self.cursor.row < self.scroll_top || self.cursor.row > self.scroll_bottom {
             return;
         }
+        self.cancel_clear();
         let pen = self.pen;
         let row = self.cursor.row;
         for _ in 0..n.min(self.scroll_bottom - row + 1) {
@@ -462,8 +647,35 @@ impl Grid {
         self.touch();
     }
 
-    /// RIS — full reset.
+    /// RIS — full reset. The screen is filed into scrollback on the way out,
+    /// for the same reason a clear-screen is: a reset sent by IRIS must not
+    /// take the transcript with it. Use [`Grid::hard_reset`] for the one the
+    /// user asks for explicitly.
     pub fn reset(&mut self) {
+        self.cancel_clear();
+        self.archive_screen();
+        let cols = self.cols;
+        for row in &mut self.screen {
+            *row = Row::new(cols);
+        }
+        self.pen.reset();
+        self.insert_mode = false;
+        self.cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        };
+        self.reset_scroll_region();
+        self.pending_wrap = false;
+        self.saved_cursor = None;
+        self.touch();
+    }
+
+    /// Reset *and* forget the history: the deliberate "give me a clean
+    /// terminal" gesture, bound to Ctrl+Delete.
+    pub fn hard_reset(&mut self) {
+        self.cancel_clear();
+        self.scrollback.clear();
         let cols = self.cols;
         for row in &mut self.screen {
             *row = Row::new(cols);
@@ -498,6 +710,9 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        // A sweep is indexed by row, and the screen is about to be a different
+        // height.
+        self.cancel_clear();
 
         if cols != self.cols {
             for row in &mut self.screen {
@@ -657,9 +872,92 @@ mod tests {
         grid.line_feed();
         assert_eq!(grid.widest_line(), 150);
 
-        // A full reset is the one point at which it is genuinely gone.
-        grid.reset();
+        // Clearing the history is the one point at which it is genuinely gone.
+        grid.hard_reset();
         assert_eq!(grid.widest_line(), 0);
+    }
+
+    /// The bug behind "`W #` loses everything": IRIS clears the screen in
+    /// place, so unless the rows are filed away first there is no history to
+    /// scroll back to.
+    #[test]
+    fn clearing_the_screen_files_it_into_scrollback() {
+        let mut grid = Grid::new(20, 4, 100);
+        for ch in "USER>write 1".chars() {
+            grid.print(ch);
+        }
+        grid.set_cursor(1, 0);
+        for ch in "1".chars() {
+            grid.print(ch);
+        }
+
+        grid.erase_in_display(2);
+
+        assert_eq!(grid.screen[0].to_text(), "");
+        let history: Vec<String> = grid.scrollback.iter().map(Row::to_text).collect();
+        assert_eq!(history, vec!["USER>write 1".to_string(), "1".to_string()]);
+    }
+
+    /// The other spelling of "clear": home the cursor, then erase to the end.
+    #[test]
+    fn erase_to_end_from_the_home_position_is_a_clear_too() {
+        let mut grid = Grid::new(20, 3, 100);
+        for ch in "kept".chars() {
+            grid.print(ch);
+        }
+        grid.set_cursor(0, 0);
+        grid.erase_in_display(0);
+        assert_eq!(
+            grid.scrollback.front().map(Row::to_text),
+            Some("kept".to_string())
+        );
+    }
+
+    /// An erase-to-end from anywhere else is an ordinary partial erase and
+    /// must not push a copy of the screen into the history.
+    #[test]
+    fn erase_to_end_below_the_home_position_files_nothing() {
+        let mut grid = Grid::new(20, 3, 100);
+        for ch in "kept".chars() {
+            grid.print(ch);
+        }
+        grid.set_cursor(1, 0);
+        grid.erase_in_display(0);
+        assert!(grid.scrollback.is_empty());
+        assert_eq!(grid.screen[0].to_text(), "kept");
+    }
+
+    /// A screen with nothing on it costs nothing: clearing twice must not add
+    /// a screenful of blank lines.
+    #[test]
+    fn clearing_an_empty_screen_adds_no_history() {
+        let mut grid = Grid::new(20, 24, 100);
+        grid.erase_in_display(2);
+        grid.erase_in_display(2);
+        assert!(grid.scrollback.is_empty());
+    }
+
+    /// ED 3 is the sequence that means "and drop the saved lines", and the
+    /// gesture behind Ctrl+Delete.
+    #[test]
+    fn ed_3_and_hard_reset_drop_the_history() {
+        let mut grid = Grid::new(20, 3, 100);
+        for ch in "gone".chars() {
+            grid.print(ch);
+        }
+        grid.erase_in_display(2);
+        assert_eq!(grid.scrollback.len(), 1);
+
+        grid.erase_in_display(3);
+        assert!(grid.scrollback.is_empty());
+
+        for ch in "gone".chars() {
+            grid.print(ch);
+        }
+        grid.erase_in_display(2);
+        grid.hard_reset();
+        assert!(grid.scrollback.is_empty());
+        assert_eq!(grid.screen[0].to_text(), "");
     }
 
     #[test]

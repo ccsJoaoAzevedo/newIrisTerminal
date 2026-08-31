@@ -43,6 +43,29 @@ pub fn personal_macros_path() -> PathBuf {
     config_dir().join("macros.xml")
 }
 
+/// Shows `path` in the platform's file manager, creating it first if it is not
+/// there yet.
+///
+/// Themes are TOML files edited by hand, so the useful thing the app can do for
+/// them is put the user in front of the folder. The command is spawned rather
+/// than waited on: `explorer` returns a non-zero status even when it worked,
+/// and there is nothing to read back either way.
+pub fn open_in_file_manager(path: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    let program = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("opening {}", path.display()))?;
+    Ok(())
+}
+
 /// Shape the terminal cursor is drawn as.
 ///
 /// A setting rather than something the session controls: IRIS never emits

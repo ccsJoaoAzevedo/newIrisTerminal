@@ -41,9 +41,7 @@ impl Session {
             vte: vte::Parser::new(),
             capture: String::new(),
         };
-        session.wait_for(Duration::from_secs(20), |s| {
-            s.capture.contains('>')
-        });
+        session.wait_for(Duration::from_secs(20), |s| s.capture.contains('>'));
         session
     }
 
@@ -175,7 +173,11 @@ fn the_limit_paginates_and_resumes_without_gaps() {
     let mut unique = collected.clone();
     unique.sort();
     unique.dedup();
-    assert_eq!(unique.len(), 10, "resume re-read a node it had already returned");
+    assert_eq!(
+        unique.len(),
+        10,
+        "resume re-read a node it had already returned"
+    );
 }
 
 #[test]
@@ -201,5 +203,8 @@ fn a_bad_global_reports_an_error_and_leaves_the_session_usable() {
     session.capture.clear();
     session.run("Write 6*7,!");
     let alive = session.wait_for(Duration::from_secs(10), |s| s.capture.contains("42"));
-    assert!(alive, "the session was left unusable after the failed query");
+    assert!(
+        alive,
+        "the session was left unusable after the failed query"
+    );
 }

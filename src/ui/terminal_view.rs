@@ -225,6 +225,9 @@ pub enum ContextAction {
     SelectAll,
     ClearSelection,
     ExportScreen,
+    /// Reset the terminal and drop the scrollback. The same thing Ctrl+Delete
+    /// does, put where it can be found.
+    ClearTerminal,
 }
 
 pub struct RenderResult {
@@ -535,6 +538,14 @@ pub fn show(
             context_action = Some(ContextAction::ExportScreen);
             ui.close_menu();
         }
+        if ui
+            .button("Clear terminal and scrollback")
+            .on_hover_text("Ctrl+Delete. Unlike IRIS's own clear-screen, this really does throw the history away.")
+            .clicked()
+        {
+            context_action = Some(ContextAction::ClearTerminal);
+            ui.close_menu();
+        }
     });
 
     RenderResult {
@@ -558,10 +569,7 @@ fn syntax_overrides(cells: &[Cell], theme: &Theme, enabled: bool) -> Vec<Option<
     }
     let mut out = vec![None; cells.len()];
     for span in syntax::scan(cells) {
-        let colour = match span.kind {
-            syntax::Kind::Global => theme.syntax_global,
-            syntax::Kind::Str => theme.syntax_string,
-        };
+        let colour = theme.syntax_color(span.kind);
         for slot in out[span.start..span.end.min(cells.len())].iter_mut() {
             *slot = Some(colour);
         }
