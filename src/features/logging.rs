@@ -94,7 +94,16 @@ impl SessionLog {
         if self.mode != LogMode::Clean || self.muted || self.rotate_if_full()? {
             return Ok(());
         }
-        if scrollback_len <= self.next_line {
+        if scrollback_len < self.next_line {
+            // The scrollback shrank, which only happens when it is deliberately
+            // thrown away - Ctrl+Delete. Everything already written stays
+            // written; counting restarts from what is there now, or the
+            // transcript would go quiet until the history grew back past the
+            // old mark.
+            self.next_line = scrollback_len;
+            return Ok(());
+        }
+        if scrollback_len == self.next_line {
             return Ok(());
         }
         for line in lines.iter().take(scrollback_len).skip(self.next_line) {
@@ -235,6 +244,30 @@ mod tests {
         log.flush().unwrap();
         let content = std::fs::read_to_string(log.path()).unwrap();
         assert_eq!(content, "one\ntwo\nthree\n");
+    }
+
+    /// Ctrl+Delete throws the scrollback away, so the count the log follows
+    /// drops. It has to start counting again from there, or the transcript goes
+    /// quiet until the history grows back past the old mark.
+    #[test]
+    fn a_cleared_scrollback_does_not_silence_the_log() {
+        let dir = tempdir("cleared");
+        let mut log = SessionLog::open(&dir, "test", LogMode::Clean, 0).unwrap();
+
+        let before: Vec<String> = ["one", "two", "three"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        log.write_settled(&before, 3).unwrap();
+
+        // The clear, and then a fresh line settling on the empty scrollback.
+        let after: Vec<String> = vec!["afterwards".to_string()];
+        log.write_settled(&after, 0).unwrap();
+        log.write_settled(&after, 1).unwrap();
+        log.flush().unwrap();
+
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(content, "one\ntwo\nthree\nafterwards\n");
     }
 
     /// The whole point of muting: an autologon password must never reach disk.

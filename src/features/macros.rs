@@ -438,6 +438,40 @@ pub const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   the text can reach the screen and the transcript by that route.
 
   key="Ctrl+Shift+G" binds a shortcut. It needs a modifier, and it only
+  fires while the terminal has focus. No macro here claims one by default.
+-->
+<macros>
+  <group name="Macros">
+    <macro name="Developer Tools (Exec)">
+      <body>do ##class(SrcPub.Cmd).Exec()</body>
+    </macro>
+  </group>
+</macros>
+"#;
+
+/// Earlier versions of [`SAMPLE`], kept so an untouched first-run file can be
+/// replaced when the shipped set changes.
+///
+/// Matched byte for byte, which is the whole safeguard: the moment the user
+/// edits the file - by hand or through the editor, which rewrites it in a
+/// different shape entirely - it stops matching and is left alone forever.
+const RETIRED_SAMPLES: [&str; 1] = [r#"<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Personal macros for newIrisTerminal.
+
+  This file is yours: the app can edit it. Macros supplied by the
+  organisation live in a separate file, configured in Settings, and are
+  shown read-only alongside these.
+
+  {{name}} placeholders are filled in from <param> before sending.
+  confirm="true" asks for a yes/no before anything is sent - use it for
+  anything that writes, since RDB* databases are shared with the team.
+
+  hide_command="true" keeps the body out of the macro panel, for a command
+  that carries a password. Note that IRIS still echoes what it is sent, so
+  the text can reach the screen and the transcript by that route.
+
+  key="Ctrl+Shift+G" binds a shortcut. It needs a modifier, and it only
   fires while the terminal has focus.
 -->
 <macros>
@@ -466,7 +500,27 @@ pub const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     </macro>
   </group>
 </macros>
-"#;
+"#];
+
+/// Makes sure the personal macro file exists, and refreshes it while it is
+/// still exactly as shipped.
+///
+/// Called before loading. A file the user has touched is never rewritten - see
+/// [`RETIRED_SAMPLES`].
+pub fn ensure_personal_file(path: &Path) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            if RETIRED_SAMPLES.contains(&text.as_str()) {
+                let _ = std::fs::write(path, SAMPLE);
+            }
+        }
+        // Missing, or unreadable for a reason a write will hit too. Ship the
+        // sample so the format is self-documenting from the first run.
+        Err(_) => {
+            let _ = std::fs::write(path, SAMPLE);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -797,27 +851,53 @@ mod tests {
     #[test]
     fn the_bundled_sample_parses() {
         let groups = parse(SAMPLE).expect("sample must parse");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Macros");
+
         let all: Vec<&Macro> = groups.iter().flat_map(|g| g.macros.iter()).collect();
-        // Every shortcut the sample advertises has to be one the binder
-        // understands, or the file teaches something that does not work.
-        for m in &all {
-            if let Some(key) = m.key.as_deref() {
-                assert!(
-                    crate::ui::shortcut::parse(key).is_some(),
-                    "sample macro {:?} has an unbindable shortcut {key:?}",
-                    m.name
-                );
-            }
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "Developer Tools (Exec)");
+        assert_eq!(
+            all[0].body,
+            vec!["do ##class(SrcPub.Cmd).Exec()".to_string()]
+        );
+        // No shortcut by default: one that fires the moment the terminal has
+        // focus has to be chosen deliberately.
+        assert!(all[0].key.is_none());
+    }
+
+    /// Every retired sample must still parse, because it is compared against a
+    /// real file on disk and a typo in one would quietly stop matching.
+    #[test]
+    fn every_retired_sample_parses() {
+        for text in RETIRED_SAMPLES {
+            parse(text).expect("a retired sample must still be valid XML");
+            assert_ne!(text, SAMPLE, "a retired sample is still the current one");
         }
-        assert!(!groups.is_empty());
-        let kill = groups
-            .iter()
-            .flat_map(|g| &g.macros)
-            .find(|m| m.name == "Kill a global")
-            .expect("sample has the destructive example");
-        assert!(
-            kill.confirm,
-            "the destructive sample must require confirmation"
+    }
+
+    /// The migration exists to replace an untouched file - and only that.
+    #[test]
+    fn an_untouched_sample_is_refreshed_and_an_edited_one_is_not() {
+        let dir = tempdir("ensure");
+
+        let fresh = dir.join("fresh.xml");
+        ensure_personal_file(&fresh);
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), SAMPLE);
+
+        let retired = dir.join("retired.xml");
+        std::fs::write(&retired, RETIRED_SAMPLES[0]).unwrap();
+        ensure_personal_file(&retired);
+        assert_eq!(std::fs::read_to_string(&retired).unwrap(), SAMPLE);
+
+        let edited = dir.join("edited.xml");
+        let mine = format!("{}\n<!-- mine -->\n", RETIRED_SAMPLES[0]);
+        std::fs::write(&edited, &mine).unwrap();
+        ensure_personal_file(&edited);
+        assert_eq!(
+            std::fs::read_to_string(&edited).unwrap(),
+            mine,
+            "an edited file must be left alone"
         );
     }
 }

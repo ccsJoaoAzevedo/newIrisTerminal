@@ -6,16 +6,16 @@ use egui::{Context, Key, Modifiers};
 use crate::config::{self, ensure_config_tree, load_themes, LogMode, Profile, Settings, Theme};
 use crate::features::autologon::{Autologon, State as AutoState};
 use crate::features::export::{self, Range};
-use crate::features::global_browser;
+use crate::features::history::History;
 use crate::features::logging::{self, SessionLog};
 use crate::features::macros::{self, MacroGroup};
 use crate::plugins::PluginHost;
 use crate::pty::launcher::launcher;
 use crate::pty::PtySession;
-use crate::term::Grid;
+use crate::term::{lineedit, Grid, Motion};
 use crate::ui::chrome::{self, WindowAction};
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
-use crate::ui::terminal_view::{self, RenderOpts, ViewState};
+use crate::ui::terminal_view::{self, RenderOpts, Selection, ViewState};
 use crate::ui::{fonts, input, shortcut};
 
 /// Fallback PTY size, used only before the first frame has measured the
@@ -70,37 +70,6 @@ struct Renaming {
 /// Rotate a transcript once it passes this size.
 const LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// An in-flight structured query against the session.
-///
-/// The output still scrolls through the terminal — nothing is hidden from the
-/// user — but a copy is accumulated here so it can be parsed into a grid.
-pub struct Capture {
-    pub buffer: String,
-    pub started: std::time::Instant,
-    /// Substrings that mean the walk finished, one way or the other.
-    pub terminators: Vec<String>,
-}
-
-impl Capture {
-    pub fn new(terminators: Vec<String>) -> Self {
-        Capture {
-            buffer: String::new(),
-            started: std::time::Instant::now(),
-            terminators,
-        }
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.terminators.iter().any(|t| self.buffer.contains(t))
-    }
-
-    /// A query that never terminates must not leave the panel spinning
-    /// forever — a global can be slow, so this is generous.
-    pub fn is_expired(&self) -> bool {
-        self.started.elapsed() > std::time::Duration::from_secs(60)
-    }
-}
-
 /// One open session and everything that hangs off it.
 pub struct Tab {
     /// Stable for this tab's lifetime and unique across tabs, so the terminal
@@ -113,12 +82,13 @@ pub struct Tab {
     pub view: ViewState,
     pub autologon: Autologon,
     pub log: Option<SessionLog>,
-    /// Set while a structured query is running.
-    pub capture: Option<Capture>,
     /// User-set name; falls back to the OSC title, then the profile name.
     pub custom_title: Option<String>,
-    /// When a clear-screen was asked of IRIS, so a purge that never arrives
-    /// can be called off. See [`Tab::request_clear`].
+    /// How far back through the command history this tab has walked, if at
+    /// all. Per tab, so recalling in one does not move another.
+    pub recall_index: Option<usize>,
+    /// When a clear-screen was asked of IRIS, so a purge that never arrives can
+    /// be called off. See [`Tab::request_clear`].
     clear_asked: Option<std::time::Instant>,
     /// Set when the child exits, so the tab explains itself instead of freezing.
     pub ended: bool,
@@ -141,8 +111,8 @@ impl Tab {
             parser: vte::Parser::new(),
             view: ViewState::default(),
             log,
-            capture: None,
             custom_title: None,
+            recall_index: None,
             clear_asked: None,
             ended: false,
             error: None,
@@ -236,12 +206,6 @@ impl Tab {
                 let _ = session.write(&self.profile.encoding.encode(&to_send));
             }
 
-            // Feed any in-flight structured query. This runs before the
-            // password check so a capture never picks up a credential prompt.
-            if let Some(capture) = self.capture.as_mut() {
-                capture.buffer.push_str(&String::from_utf8_lossy(&decoded));
-            }
-
             let still_on_password = self.autologon.state() == AutoState::WaitPassword;
             let lines = self.grid.all_text();
             let settled = self.grid.scrollback.len();
@@ -284,13 +248,28 @@ impl Tab {
         }
     }
 
-    /// Asks IRIS to clear the screen, the way typing `W #` would.
+    /// Sends whole lines, each terminated the way Enter would terminate it.
+    pub fn send_lines(&self, lines: &[String]) {
+        for line in lines {
+            self.send_text(line);
+            self.send(b"\r");
+        }
+    }
+
+    /// Asks IRIS to clear its own screen, the way typing `W #` would, and
+    /// arranges for the clear that comes back to drop the transcript instead of
+    /// filing it.
     ///
-    /// The terminal cannot do this on its own: IRIS tracks the cursor itself
-    /// and positions absolutely, so a grid cleared locally leaves the next
-    /// prompt painted back down at the row IRIS still believes it is on. The
-    /// grid is told to drop its history when that clear arrives, so the gesture
-    /// ends with an empty terminal rather than one holding the echoed command.
+    /// The terminal cannot do this on its own. The far side keeps its own idea
+    /// of where the cursor is and repaints by absolute position, so a grid
+    /// cleared behind its back leaves the next prompt painted back down at the
+    /// row it had reached, with blank rows above it. `W #` is what resets that
+    /// idea. Nothing of it stays on screen: the echoed command and the pre-clear
+    /// screen are both dropped by the purge.
+    ///
+    /// Only ever called at an idle prompt - see
+    /// [`App::clear_active_terminal`], which is what keeps the command from
+    /// being swallowed as input by a `read` or appended to a half-typed line.
     pub fn request_clear(&mut self) {
         if self.session.is_none() {
             return;
@@ -298,14 +277,6 @@ impl Tab {
         self.grid.purge_history_on_next_clear();
         self.clear_asked = Some(std::time::Instant::now());
         self.send_lines(&["W #".to_string()]);
-    }
-
-    /// Sends whole lines, each terminated the way Enter would terminate it.
-    pub fn send_lines(&self, lines: &[String]) {
-        for line in lines {
-            self.send_text(line);
-            self.send(b"\r");
-        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -317,6 +288,29 @@ impl Tab {
             let _ = session.resize(cols as u16, rows as u16);
         }
     }
+}
+
+/// Arrow keys that walk IRIS's cursor `columns` to the right, or to the left
+/// when negative. Empty for no movement.
+fn cursor_bytes(columns: i64) -> Vec<u8> {
+    if columns == 0 {
+        return Vec::new();
+    }
+    let sequence: &[u8] = if columns < 0 { b"\x1b[D" } else { b"\x1b[C" };
+    sequence.repeat(columns.unsigned_abs() as usize)
+}
+
+/// Columns of the command line covered by the tab's selection.
+///
+/// `None` unless the whole selection sits inside the line being typed: a
+/// selection that reaches into the scrollback is highlighted text, and there is
+/// nothing in IRIS's read buffer that corresponds to it.
+fn selection_in_line(tab: &Tab, line: crate::term::LineEdit) -> Option<(usize, usize)> {
+    let at = tab.grid.scrollback.len() + tab.grid.cursor.row;
+    let (from, to) = tab.view.selection?.span_on(at)?;
+    let from = from.max(line.start);
+    let to = to.min(line.end);
+    (from < to).then_some((from, to))
 }
 
 fn open_log(profile: &Profile, settings: &Settings) -> Option<SessionLog> {
@@ -341,6 +335,9 @@ pub struct App {
     /// Instances found on this machine, for the new-tab dialog.
     pub instances: Vec<String>,
     pub macro_groups: Vec<MacroGroup>,
+    /// Commands typed at an IRIS prompt, shared by every tab so a new one opens
+    /// knowing what was run in the last.
+    history: History,
     plugins: PluginHost,
     panels: PanelState,
     /// The tab whose terminal last took keyboard focus, so a tab switch can
@@ -406,6 +403,10 @@ impl App {
                     ..Profile::default()
                 }),
             macro_groups: load_macros(&settings).groups,
+            history: History::load(
+                &config::command_history_path(),
+                settings.save_command_history,
+            ),
             settings,
             themes,
             tabs: Vec::new(),
@@ -488,6 +489,7 @@ impl App {
             scrollbar: self.settings.show_scrollbars,
             syntax: self.settings.terminal_syntax_highlight,
             wrap: self.settings.wrap_lines,
+            copy_on_select: self.settings.copy_on_select,
         }
     }
 
@@ -502,24 +504,41 @@ impl App {
     /// Clears the active terminal and forgets its history.
     ///
     /// The deliberate version of what `W #` only looks like: IRIS's own
-    /// clear-screen now files the screen into the scrollback, and this is the
+    /// clear-screen files the screen into the scrollback, and this is the
     /// gesture for when the history really is meant to go. Also on the
     /// right-click menu, because a shortcut nobody can see is a shortcut nobody
     /// uses.
     ///
-    /// The clear is asked of IRIS rather than done locally, so its idea of the
-    /// cursor is cleared along with the screen. Wiping the grid here instead
-    /// was the bug: IRIS positions the cursor absolutely, so it went on
-    /// painting from the row it had reached and the next prompt appeared back
-    /// down the screen with the cleared rows blank above it. Only a session
-    /// that cannot be asked - one that has ended - is cleared locally.
+    /// Clearing the grid on its own is not enough, and this is the whole
+    /// subtlety of the gesture: the far side keeps its own idea of where the
+    /// cursor is and repaints by absolute position, so a screen wiped behind
+    /// its back gets the next prompt painted back down at the row it had
+    /// reached, with the cleared rows blank above it. The only thing that
+    /// resets that idea is a clear-screen from IRIS, so at an idle prompt the
+    /// clear is asked of IRIS - and the echoed command and the pre-clear screen
+    /// are both dropped, so nothing of it is left on screen or in the
+    /// scrollback.
+    ///
+    /// Anywhere else - mid-line, mid-routine, or on a session that has ended -
+    /// the command could be swallowed as input or appended to what is being
+    /// typed, so the grid is cleared locally instead, and the prompt stays
+    /// where IRIS left it.
+    ///
+    /// Nothing is said about any of this in the status line. The gesture is a
+    /// frequent one, and a note that appears under every clear costs a row of
+    /// the terminal to say what the screen has already shown; what it does is
+    /// on the right-click entry's tooltip instead.
     fn clear_active_terminal(&mut self) {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
         tab.view.clear_selection();
         tab.view.scroll_to_bottom();
-        if tab.session.is_some() {
+
+        // An idle prompt: IRIS is reading a command line and nothing has been
+        // typed on it yet.
+        let idle_prompt = lineedit::current(&tab.grid).is_some_and(|line| line.is_empty());
+        if tab.session.is_some() && idle_prompt {
             tab.request_clear();
         } else {
             tab.grid.hard_reset();
@@ -710,10 +729,9 @@ impl App {
             });
             ui.separator();
             ui.toggle_value(&mut self.panels.show_macros, "Macros");
-            ui.toggle_value(&mut self.panels.show_globals, "Globals");
             // Toggles, not plain buttons: clicking the button that opened a
             // dialog is how everyone expects to close it again, and it shows
-            // which dialogs are open the way Macros/Globals already do.
+            // which dialogs are open the way Macros already does.
             ui.toggle_value(&mut self.panels.show_export, "Export");
             ui.toggle_value(&mut self.panels.show_settings, "Settings");
             ui.separator();
@@ -916,8 +934,8 @@ impl App {
                     self.send_lines_to_active(&lines);
                 }
             }
-            UiRequest::RunNative(native, arg) => {
-                let invocation = native.build(&arg);
+            UiRequest::RunNative(native, values) => {
+                let invocation = native.build(&values);
                 self.send_lines_to_active(&invocation.lines);
                 self.set_status(invocation.summary);
             }
@@ -939,6 +957,10 @@ impl App {
                 // settings the user just changed.
                 App::apply_style(ctx, &self.theme(), &self.settings);
                 self.apply_font(ctx);
+                self.history.set_persist(
+                    &config::command_history_path(),
+                    self.settings.save_command_history,
+                );
                 if let Err(e) = self.settings.save() {
                     self.set_status(format!("Could not save settings: {e:#}"));
                 }
@@ -959,12 +981,6 @@ impl App {
                     ));
                 }
             }
-            UiRequest::RunGlobalQuery => self.run_global_query(),
-            UiRequest::CopyGlobalPage => {
-                let text = panels::page_as_text(&self.panels.globals);
-                ctx.copy_text(text);
-                self.set_status("Copied the visible rows.");
-            }
             UiRequest::OpenFolder(path) => {
                 if let Err(e) = config::open_in_file_manager(&path) {
                     self.set_status(format!("Could not open {}: {e:#}", path.display()));
@@ -983,55 +999,178 @@ impl App {
         }
     }
 
-    /// Sends the global-browser query and starts capturing its output.
-    fn run_global_query(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            self.panels.globals.message = Some("No active session.".into());
+    /// Remembers the command sitting on the active tab's prompt line.
+    ///
+    /// Read off the screen rather than accumulated from keystrokes, so a line
+    /// that arrived by paste, or that IRIS recalled itself, counts exactly like
+    /// a typed one. A row with no IRIS prompt on it is not a command line and
+    /// is not recorded - which is also what keeps a password out of the file,
+    /// since a credential prompt carries no `>` and is never echoed.
+    /// `unechoed` is text typed in the same frame as the Enter, which IRIS has
+    /// not sent back yet and which the screen therefore does not show.
+    fn record_command(&mut self, tab: usize, unechoed: &str) {
+        let Some(tab) = self.tabs.get_mut(tab) else {
             return;
         };
-        if tab.session.is_none() {
-            self.panels.globals.message = Some("That session has ended.".into());
+        tab.recall_index = None;
+        if tab.autologon.state() == AutoState::WaitPassword {
             return;
         }
-        if tab.capture.is_some() {
-            self.panels.globals.message = Some("A query is already running.".into());
+        let Some(text) = lineedit::typed_text(&tab.grid) else {
             return;
-        }
-
-        let script = global_browser::build_script(&self.panels.globals.query);
-        // Both terminators, so an IRIS error ends the wait as promptly as a
-        // successful walk does.
-        tab.capture = Some(Capture::new(vec!["@E@".into(), "@X@".into()]));
-        tab.send_lines(&[script]);
-
-        self.panels.globals.running = true;
-        self.panels.globals.message = None;
-        self.panels.globals.page = global_browser::Page::default();
-        self.panels.globals.page_index = 0;
+        };
+        self.history.record(&format!("{text}{unechoed}"));
     }
 
-    /// Turns a finished capture into a page. Called once per frame.
-    fn collect_global_query(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+    /// Replaces the line being typed with the next command from the history.
+    ///
+    /// IRIS keeps its own recall, but only for as long as the process lives and
+    /// only for what was typed into it; this is the app's, shared by every tab
+    /// and - when the setting allows - by every session that came before.
+    ///
+    /// Done by rubbing the line out and typing the replacement, because IRIS
+    /// owns the read buffer and the only way to change it is to send the keys
+    /// that would have changed it.
+    fn recall(&mut self, index: usize, direction: input::Recall) {
+        let Some(tab) = self.tabs.get(index) else {
             return;
         };
-        let Some(capture) = tab.capture.as_ref() else {
+        // Only ever called at the end of a command line, but the state could
+        // have moved on between the key press and here.
+        let Some(line) = lineedit::current(&tab.grid).filter(|l| l.at_end()) else {
             return;
         };
 
-        if capture.is_done() {
-            let text = std::mem::take(&mut tab.capture).unwrap().buffer;
-            let page = global_browser::parse(&text, self.panels.globals.query.limit);
-            let count = page.nodes.len();
-            self.panels.globals.page = page;
-            self.panels.globals.running = false;
-            self.panels.globals.page_index = 0;
-            self.panels.globals.message = Some(format!("{count} nodes."));
-        } else if capture.is_expired() {
-            tab.capture = None;
-            self.panels.globals.running = false;
-            self.panels.globals.message =
-                Some("Timed out waiting for IRIS. The session is still usable.".into());
+        let next = match direction {
+            input::Recall::Back => match self.history.back(tab.recall_index) {
+                Some(at) => Some(at),
+                // Already at the oldest command: leave the line alone rather
+                // than clearing it.
+                None => return,
+            },
+            input::Recall::Forward => match self.history.forward(tab.recall_index) {
+                Some(next) => next,
+                None => return,
+            },
+        };
+
+        let text = next
+            .and_then(|at| self.history.get(at))
+            .unwrap_or_default()
+            .to_string();
+
+        let mut wire = vec![0x7f; line.len()];
+        wire.extend_from_slice(&self.tabs[index].profile.encoding.encode(&text));
+        let wire = self.plugins.on_input(&wire);
+        self.tabs[index].send(&wire);
+        self.tabs[index].recall_index = next;
+        self.tabs[index].view.scroll_to_bottom();
+    }
+
+    /// Selects the command being typed, so it can be copied or rubbed out in
+    /// one gesture. Ctrl+A.
+    fn select_typed_line(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let Some(line) = lineedit::current(&tab.grid).filter(|l| !l.is_empty()) else {
+            return;
+        };
+        let at = tab.grid.scrollback.len() + tab.grid.cursor.row;
+        tab.view.selection = Some(Selection::across(at, line.start, line.end));
+    }
+
+    /// Drags the loose end of the selection over the command line, the way
+    /// Shift plus a movement key does in a text field.
+    ///
+    /// The anchor is where the selection was started from - IRIS's cursor, the
+    /// first time - and only the other end moves, so shift-left and then
+    /// shift-right walks back over what was just selected. Nothing is sent:
+    /// IRIS's cursor stays put and only the highlight moves.
+    fn extend_selection(&mut self, index: usize, motion: Motion) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let Some(line) = lineedit::current(&tab.grid) else {
+            return;
+        };
+        let at = tab.grid.scrollback.len() + tab.grid.cursor.row;
+
+        // An existing selection on this line continues; anything else - none at
+        // all, or one left over in the scrollback - starts again from the
+        // cursor.
+        let (anchor, focus) = tab
+            .view
+            .selection
+            .filter(|s| s.span_on(at).is_some())
+            .map(|s| (s.start.1, s.end.1))
+            .unwrap_or((line.cursor, line.cursor));
+        let anchor = anchor.clamp(line.start, line.end);
+        let focus = lineedit::target(&tab.grid, line, focus, motion);
+
+        // Walking the loose end back onto the anchor selects nothing, which is
+        // no selection at all rather than an empty one - an empty selection
+        // would go on quietly claiming Ctrl+C.
+        tab.view.selection = (focus != anchor).then_some(Selection {
+            start: (at, anchor),
+            end: (at, focus),
+        });
+    }
+
+    /// Walks IRIS's cursor over the command line by a whole motion - a word at
+    /// a time, for Ctrl plus an arrow.
+    ///
+    /// Only the app knows where the word boundaries are, since only the app can
+    /// see the line; IRIS is then told in the one language it acts on, which is
+    /// arrow keys. The selection goes, exactly as it would in a text field when
+    /// the cursor walks away from it.
+    fn move_by(&mut self, index: usize, motion: Motion) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(line) = lineedit::current(&tab.grid) else {
+            return;
+        };
+        let to = lineedit::target(&tab.grid, line, line.cursor, motion);
+        self.tabs[index].view.clear_selection();
+        self.move_cursor(index, to as i64 - line.cursor as i64);
+    }
+
+    /// Rubs the selected part of the command line out of IRIS's read buffer.
+    ///
+    /// Rubout erases the character *before* the cursor, so the cursor is walked
+    /// to the end of the selection first and the whole thing goes out as one
+    /// write - a half-applied erase would leave the line in a state neither
+    /// side agrees on.
+    fn erase_selection(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(line) = lineedit::current(&tab.grid) else {
+            return;
+        };
+        let Some((from, to)) = selection_in_line(tab, line) else {
+            return;
+        };
+
+        let mut wire = cursor_bytes(to as i64 - line.cursor as i64);
+        wire.extend(std::iter::repeat_n(0x7f, to - from));
+        let wire = self.plugins.on_input(&wire);
+        self.tabs[index].send(&wire);
+        self.tabs[index].view.clear_selection();
+        self.tabs[index].recall_index = None;
+    }
+
+    /// Walks IRIS's cursor `columns` to the right, or to the left when
+    /// negative, with the arrow keys it does act on.
+    fn move_cursor(&mut self, index: usize, columns: i64) {
+        let wire = cursor_bytes(columns);
+        if wire.is_empty() {
+            return;
+        }
+        let wire = self.plugins.on_input(&wire);
+        if let Some(tab) = self.tabs.get(index) {
+            tab.send(&wire);
         }
     }
 
@@ -1072,10 +1211,10 @@ impl App {
 /// silently halving the macro list.
 fn load_macros(settings: &Settings) -> macros::LoadReport {
     let personal = config::personal_macros_path();
-    if !personal.exists() {
-        // Ship the sample on first run so the format is self-documenting.
-        let _ = std::fs::write(&personal, macros::SAMPLE);
-    }
+    // Ships the sample on first run, and refreshes it while it is still
+    // exactly as shipped, so a change to the bundled set reaches an install
+    // that has never edited the file.
+    macros::ensure_personal_file(&personal);
     macros::load_all(settings.org_macros(), &personal)
 }
 
@@ -1099,7 +1238,6 @@ impl eframe::App for App {
             }
         }
 
-        self.collect_global_query();
         self.handle_shortcuts(ctx);
 
         // A close asked for by the window manager - Alt+F4, or the taskbar -
@@ -1141,28 +1279,24 @@ impl eframe::App for App {
             egui::SidePanel::right("macros")
                 .default_width(280.0)
                 .show(ctx, |ui| {
-                    if let Some(request) =
-                        panels::macros_panel(ui, &mut self.macro_groups, &mut self.panels)
-                    {
-                        requests.push(request);
-                    }
-                    ui.separator();
-                    if let Some(request) = panels::natives_panel(ui, &mut self.panels) {
-                        requests.push(request);
-                    }
-                });
-        }
-
-        if self.panels.show_globals {
-            egui::TopBottomPanel::bottom("globals")
-                .resizable(true)
-                .default_height(280.0)
-                .show(ctx, |ui| {
-                    if let Some(request) =
-                        panels::global_browser_panel(ui, &mut self.panels.globals, &theme)
-                    {
-                        requests.push(request);
-                    }
+                    // One scroll area around the whole panel rather than one
+                    // per section: the macro list, the details under it and the
+                    // IRIS utilities below that are one column of content, and
+                    // giving each a share of the height leaves every one of
+                    // them too short on a small window.
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if let Some(request) =
+                                panels::macros_panel(ui, &mut self.macro_groups, &mut self.panels)
+                            {
+                                requests.push(request);
+                            }
+                            ui.separator();
+                            if let Some(request) = panels::natives_panel(ui, &mut self.panels) {
+                                requests.push(request);
+                            }
+                        });
                 });
         }
 
@@ -1235,6 +1369,18 @@ impl eframe::App for App {
 
                 // Right-click menu actions reuse the same paths as the
                 // keyboard shortcuts and the Export dialog.
+                // Copy-on-select: a finished drag goes straight to the
+                // clipboard, without waiting for Ctrl+C.
+                if result.copy_selection {
+                    let tab = &self.tabs[active];
+                    if let Some(text) = tab.view.selected_text(&tab.grid) {
+                        ctx.copy_text(text);
+                    }
+                }
+                if let Some(columns) = result.cursor_move {
+                    self.move_cursor(active, columns);
+                }
+
                 if let Some(action) = result.context_action {
                     use terminal_view::ContextAction;
                     match action {
@@ -1269,7 +1415,58 @@ impl eframe::App for App {
                 }
                 if result.response.has_focus() {
                     let events = ui.input(|i| i.events.clone());
-                    let mut action = input::translate(&events, has_selection);
+                    let (insert_down, delete_down) = input::chord_keys_down();
+                    let line = lineedit::current(&self.tabs[active].grid);
+                    let input_ctx = input::InputContext {
+                        has_selection,
+                        line,
+                        can_recall: !self.history.is_empty(),
+                        selected_span: line
+                            .and_then(|line| selection_in_line(&self.tabs[active], line)),
+                        insert_down,
+                        delete_down,
+                    };
+                    let mut action = input::translate(&events, &input_ctx);
+
+                    if action.select_line {
+                        self.select_typed_line(active);
+                    }
+                    if let Some(motion) = action.extend_selection {
+                        self.extend_selection(active, motion);
+                    }
+                    if let Some(motion) = action.move_cursor {
+                        self.move_by(active, motion);
+                    }
+                    if action.collapse_selection {
+                        self.tabs[active].view.clear_selection();
+                    }
+                    // A selection inside the command line behaves the way one
+                    // in a text field does: an erase key takes it out, and so
+                    // does typing or pasting over it, before the new text goes
+                    // in behind it.
+                    let replaced = input_ctx.selected_span.is_some() && !action.select_line && {
+                        !action.text.is_empty() || action.paste.is_some()
+                    };
+                    if action.erase_selection || replaced {
+                        self.erase_selection(active);
+                    }
+
+                    // Recorded before the Enter reaches IRIS, while the line is
+                    // still on screen to be read.
+                    if let Some(unechoed) = action.submitted.as_deref() {
+                        // Submitting ends the selection with the line it was
+                        // on, rather than leaving it highlighted in the
+                        // scrollback.
+                        self.tabs[active].view.clear_selection();
+                        self.record_command(active, unechoed);
+                    }
+                    if let Some(direction) = action.recall {
+                        self.recall(active, direction);
+                    }
+                    // Typing abandons wherever the recall had walked to.
+                    if !action.text.is_empty() {
+                        self.tabs[active].recall_index = None;
+                    }
 
                     if action.copy {
                         let tab = &self.tabs[active];
@@ -1278,6 +1475,9 @@ impl eframe::App for App {
                         }
                     }
                     if let Some(text) = action.paste.take() {
+                        // A paste rewrites the line, so wherever the recall had
+                        // walked to is no longer where the line came from.
+                        self.tabs[active].recall_index = None;
                         let text = input::sanitize_paste(&text);
                         let encoded = self.tabs[active].profile.encoding.encode(&text);
                         let encoded = self.plugins.on_input(&encoded);

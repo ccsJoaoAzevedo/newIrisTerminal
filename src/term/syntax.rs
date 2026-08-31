@@ -282,6 +282,16 @@ fn push(spans: &mut Vec<Span>, start: usize, end: usize, kind: Kind) {
 /// Returns the row's length when there is no prompt on it, which switches the
 /// command-line rules off for that row rather than guessing.
 fn code_start(chars: &[char]) -> usize {
+    prompt_end(chars).unwrap_or(chars.len())
+}
+
+/// Column just past an IRIS prompt on this row, or `None` when there is not
+/// one.
+///
+/// Shared with [`crate::term::lineedit`]: the same test decides whether a row
+/// is a command line for colouring and whether Home, End and Up belong to the
+/// line being typed rather than to IRIS.
+pub fn prompt_end(chars: &[char]) -> Option<usize> {
     for (i, ch) in chars.iter().enumerate() {
         if *ch != '>' {
             continue;
@@ -294,10 +304,10 @@ fn code_start(chars: &[char]) -> usize {
             })
             && head.last().is_some_and(|c| c.is_ascii_alphanumeric());
         if plausible {
-            return i + 1;
+            return Some(i + 1);
         }
     }
-    chars.len()
+    None
 }
 
 /// End of the string starting at `open`, quote included.

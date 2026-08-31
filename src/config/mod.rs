@@ -43,6 +43,11 @@ pub fn personal_macros_path() -> PathBuf {
     config_dir().join("macros.xml")
 }
 
+/// Commands typed at an IRIS prompt, one per line, oldest first.
+pub fn command_history_path() -> PathBuf {
+    config_dir().join("history.txt")
+}
+
 /// Shows `path` in the platform's file manager, creating it first if it is not
 /// there yet.
 ///
@@ -135,6 +140,16 @@ pub struct Settings {
     /// further rows, or reached by scrolling sideways.
     pub wrap_lines: bool,
     pub scrollback_limit: usize,
+    /// Put a selection on the clipboard as soon as the mouse is released,
+    /// without waiting for Ctrl+C — the way the native IrisTerm and PuTTY
+    /// behave.
+    pub copy_on_select: bool,
+    /// Keep the commands typed at an IRIS prompt in a file, so Up recalls what
+    /// was typed in earlier sessions and not only in this one.
+    ///
+    /// Recall itself is not optional; this decides only whether it outlives the
+    /// session. Off also means nothing is written to disk.
+    pub save_command_history: bool,
     pub log_dir: PathBuf,
     /// Applied to any profile whose own mode is `Off`.
     pub default_log_mode: LogMode,
@@ -173,6 +188,8 @@ impl Default for Settings {
             terminal_syntax_highlight: true,
             wrap_lines: true,
             scrollback_limit: 10_000,
+            copy_on_select: true,
+            save_command_history: true,
             log_dir: default_log_dir(),
             default_log_mode: LogMode::Off,
             log_retention_days: 30,
@@ -426,6 +443,8 @@ mod tests {
         assert!(!settings.cursor_blink);
         assert!(settings.show_scrollbars);
         assert!(settings.font_family.is_empty());
+        assert!(settings.copy_on_select);
+        assert!(settings.save_command_history);
     }
 
     #[test]

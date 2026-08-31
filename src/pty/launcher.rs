@@ -135,7 +135,19 @@ fn find_binary(override_path: Option<&Path>, dirs: &[PathBuf], names: &[&str]) -
 
 #[cfg(windows)]
 mod windows {
+    use std::os::windows::process::CommandExt;
+
     use super::*;
+
+    /// Runs a helper process with no console of its own.
+    ///
+    /// The app is a GUI process and so has no console to lend a child. Without
+    /// this, spawning `iris.exe list` gives it a brand new one - and on Windows
+    /// 11 a new console is handed to Windows Terminal, so a lookup that is meant
+    /// to be invisible opens and closes a terminal window in front of the user
+    /// just as the session starts. The output is captured through pipes either
+    /// way, so there is nothing the console was needed for.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     pub struct WindowsLauncher;
 
@@ -168,7 +180,11 @@ mod windows {
                 if !exe.is_file() {
                     continue;
                 }
-                if let Ok(output) = std::process::Command::new(&exe).arg("list").output() {
+                if let Ok(output) = std::process::Command::new(&exe)
+                    .arg("list")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                {
                     let text = String::from_utf8_lossy(&output.stdout);
                     for name in parse_iris_list(&text) {
                         if !found.iter().any(|i| i.name.eq_ignore_ascii_case(&name)) {

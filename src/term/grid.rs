@@ -459,12 +459,13 @@ impl Grid {
     /// Throw the history away at the next clear-screen instead of filing the
     /// screen into it.
     ///
-    /// The "clear the terminal for real" gesture cannot just wipe the grid:
-    /// IRIS keeps its own idea of where the cursor is, so a screen cleared
-    /// behind its back leaves the next prompt painted back down at the row it
-    /// had reached. The app therefore asks IRIS to clear the screen itself, and
-    /// sets this so the clear that comes back drops the transcript - including
-    /// the echo of the command that asked for it - rather than archiving it.
+    /// The "clear the terminal for real" gesture cannot just wipe the grid: the
+    /// far side keeps its own idea of where the cursor is and repaints by
+    /// absolute position, so a screen cleared behind its back leaves the next
+    /// prompt painted back down at the row it had reached. The app therefore
+    /// asks IRIS to clear the screen itself, and sets this so the clear that
+    /// comes back drops the transcript - including the echo of the command that
+    /// asked for it - rather than archiving it.
     pub fn purge_history_on_next_clear(&mut self) {
         self.purge_on_clear = true;
     }

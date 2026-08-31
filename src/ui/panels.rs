@@ -9,7 +9,6 @@
 use egui::{Context, Ui};
 
 use crate::config::{profile::LogMode, CursorStyle, Profile, Settings, Theme};
-use crate::features::global_browser::{Node, Page, Query};
 use crate::features::macros::{Macro, MacroGroup, Origin, Param};
 use crate::features::natives::Native;
 use crate::term::Encoding;
@@ -27,8 +26,8 @@ const BUILT_IN_FONT: &str = "Built-in monospace";
 pub enum UiRequest {
     /// Send a macro, after confirmation if it asks for one.
     RunMacro(Macro),
-    /// Send a native-utility invocation.
-    RunNative(Native, String),
+    /// Send a native-utility invocation, with one value per parameter.
+    RunNative(Native, Vec<String>),
     /// Send literal lines to the active session.
     SendLines(Vec<String>),
     ExportText(crate::features::export::Range),
@@ -38,10 +37,6 @@ pub enum UiRequest {
     ReloadMacros,
     /// Write the personal macro file back to disk.
     SavePersonalMacros,
-    /// Run the global browser's query against the active session.
-    RunGlobalQuery,
-    /// Copy the visible global-browser rows to the clipboard.
-    CopyGlobalPage,
     /// Show a folder in the platform's file manager.
     OpenFolder(std::path::PathBuf),
 }
@@ -55,9 +50,13 @@ pub struct PanelState {
     pub macro_filter: String,
     /// A macro waiting on parameter values and/or confirmation.
     pub pending: Option<PendingMacro>,
-    /// Free-text argument for the selected native helper.
-    pub native_arg: String,
+    /// One value per parameter of the selected native helper.
+    pub native_values: Vec<String>,
     pub selected_native: Option<Native>,
+    /// Which helper `native_values` belongs to, so folding one away and opening
+    /// it again keeps what was typed while switching to a different one starts
+    /// from that one's defaults.
+    native_values_of: Option<Native>,
     /// Macro shown in the details block, by (group, index).
     pub selected: Option<(usize, usize)>,
     /// The personal macro currently open in the editor, by (group, index).
@@ -70,8 +69,6 @@ pub struct PanelState {
     reveal_body: bool,
     /// Group name for a macro about to be created.
     pub new_group: String,
-    pub show_globals: bool,
-    pub globals: GlobalBrowserState,
     /// Installed monospace families, listed once. Enumerating system fonts is
     /// slow enough that doing it per frame would be felt while the Settings
     /// window is open.
@@ -79,6 +76,21 @@ pub struct PanelState {
 }
 
 impl PanelState {
+    /// Shows one IRIS helper's fields, or `None` to fold the open one away.
+    ///
+    /// The fields are only reset when a *different* helper is opened; the
+    /// compile flag starts at its default rather than blank, and re-opening the
+    /// helper you just closed gives you back what you had typed.
+    fn open_native(&mut self, native: Option<Native>) {
+        self.selected_native = native;
+        if let Some(native) = native {
+            if self.native_values_of != Some(native) {
+                self.native_values = native.default_values();
+                self.native_values_of = Some(native);
+            }
+        }
+    }
+
     /// Opens the editor on one macro, on a copy of it.
     fn open_editor(&mut self, at: (usize, usize), draft: Macro) {
         self.editing = Some(at);
@@ -128,6 +140,7 @@ impl PendingMacro {
 /// command underneath it has no room to show what that command is, and half
 /// these macros write to a shared database — so the click selects, the details
 /// below say what would happen, and Run is a separate, deliberate press.
+/// Clicking the open macro again folds those details away.
 ///
 /// Takes the groups mutably because personal macros are edited in place here;
 /// organisation macros are shown with a badge and no edit affordance, since
@@ -163,98 +176,101 @@ pub fn macros_panel(
     }
 
     let filter = state.macro_filter.to_lowercase();
-    let mut to_select: Option<(usize, usize)> = None;
+    // `Some(None)` is "fold the details away", which is what clicking the open
+    // macro again means; `None` is "nothing was clicked".
+    let mut to_select: Option<Option<(usize, usize)>> = None;
     let mut to_run: Option<Macro> = None;
 
-    egui::ScrollArea::vertical()
-        .max_height(ui.available_height() * 0.5)
-        .show(ui, |ui| {
-            for (gi, group) in groups.iter().enumerate() {
-                let matching: Vec<(usize, &Macro)> = group
-                    .macros
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, m)| {
-                        filter.is_empty()
-                            || m.name.to_lowercase().contains(&filter)
-                            || m.description.to_lowercase().contains(&filter)
-                    })
-                    .collect();
-                if matching.is_empty() {
-                    continue;
-                }
+    // No scroll area of its own: the whole panel scrolls, so a long macro list
+    // is not squeezed into half the height with the details below it fighting
+    // for the rest.
+    for (gi, group) in groups.iter().enumerate() {
+        let matching: Vec<(usize, &Macro)> = group
+            .macros
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                filter.is_empty()
+                    || m.name.to_lowercase().contains(&filter)
+                    || m.description.to_lowercase().contains(&filter)
+            })
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
 
-                let title = if group.name.is_empty() {
-                    "Macros"
-                } else {
-                    &group.name
-                };
-                egui::CollapsingHeader::new(title)
-                    .id_source(("macro-group", gi))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for (mi, m) in matching {
-                            ui.horizontal(|ui| {
-                                // Run sits on the row with the name, so firing
-                                // a macro is one press from the list. It still
-                                // goes through the same request path, so a
-                                // macro that asks for parameters or a
-                                // confirmation asks for them here too.
-                                if ui
-                                    .small_button("Run")
-                                    .on_hover_text(if m.confirm {
-                                        "Runs after confirming."
-                                    } else {
-                                        "Sends this macro to the active session."
-                                    })
-                                    .clicked()
-                                {
-                                    to_run = Some(m.clone());
-                                }
-                                let label = if m.confirm {
-                                    format!("{}  (confirms)", m.name)
-                                } else {
-                                    m.name.clone()
-                                };
-                                let selected = state.selected == Some((gi, mi));
-                                let button = ui.selectable_label(selected, label);
-                                let button = if m.description.is_empty() {
-                                    button
-                                } else {
-                                    button.on_hover_text(&m.description)
-                                };
-                                if button.clicked() {
-                                    to_select = Some((gi, mi));
-                                }
+        let title = if group.name.is_empty() {
+            "Macros"
+        } else {
+            &group.name
+        };
+        egui::CollapsingHeader::new(title)
+            .id_source(("macro-group", gi))
+            .default_open(true)
+            .show(ui, |ui| {
+                for (mi, m) in matching {
+                    ui.horizontal(|ui| {
+                        // Run sits on the row with the name, so firing
+                        // a macro is one press from the list. It still
+                        // goes through the same request path, so a
+                        // macro that asks for parameters or a
+                        // confirmation asks for them here too.
+                        if ui
+                            .small_button("Run")
+                            .on_hover_text(if m.confirm {
+                                "Runs after confirming."
+                            } else {
+                                "Sends this macro to the active session."
+                            })
+                            .clicked()
+                        {
+                            to_run = Some(m.clone());
+                        }
+                        let label = if m.confirm {
+                            format!("{}  (confirms)", m.name)
+                        } else {
+                            m.name.clone()
+                        };
+                        let selected = state.selected == Some((gi, mi));
+                        let button = ui.selectable_label(selected, label);
+                        let button = if m.description.is_empty() {
+                            button
+                        } else {
+                            button.on_hover_text(&m.description)
+                        };
+                        if button.clicked() {
+                            // Clicking the open one again folds its
+                            // details away, the same gesture the IRIS
+                            // utilities below use.
+                            to_select = Some((!selected).then_some((gi, mi)));
+                        }
 
-                                // Provenance at a glance: a shared macro
-                                // behaving oddly is someone else's file, not
-                                // something the user can have broken locally.
-                                if m.origin == Origin::Organization {
-                                    ui.weak("org").on_hover_text(
-                                        "Provided by the organization; read-only here.",
-                                    );
-                                }
+                        // Provenance at a glance: a shared macro
+                        // behaving oddly is someone else's file, not
+                        // something the user can have broken locally.
+                        if m.origin == Origin::Organization {
+                            ui.weak("org")
+                                .on_hover_text("Provided by the organization; read-only here.");
+                        }
 
-                                // The shortcut belongs next to the name. A
-                                // binding nobody can see is a binding nobody
-                                // uses.
-                                if let Some(key) = &m.key {
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.weak(key);
-                                        },
-                                    );
-                                }
-                            });
+                        // The shortcut belongs next to the name. A
+                        // binding nobody can see is a binding nobody
+                        // uses.
+                        if let Some(key) = &m.key {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.weak(key);
+                                },
+                            );
                         }
                     });
-            }
-        });
+                }
+            });
+    }
 
     if let Some(at) = to_select {
-        state.selected = Some(at);
+        state.selected = at;
     }
     if let Some(m) = to_run {
         request = Some(UiRequest::RunMacro(m));
@@ -645,24 +661,35 @@ pub fn natives_panel(ui: &mut Ui, state: &mut PanelState) -> Option<UiRequest> {
     for native in Native::ALL {
         let selected = state.selected_native == Some(native);
         if ui.selectable_label(selected, native.label()).clicked() {
-            state.selected_native = Some(native);
-            state.native_arg.clear();
+            // Clicking the open one again folds it away rather than resetting
+            // its fields, which is what the same click used to do - and losing
+            // a typed package name to a stray click is a poor trade for a
+            // gesture that reads like "close this".
+            state.open_native(if selected { None } else { Some(native) });
         }
     }
 
     if let Some(native) = state.selected_native {
         ui.separator();
-        if let Some(prompt) = native.argument_prompt() {
-            ui.label(prompt);
-            ui.text_edit_singleline(&mut state.native_arg);
+        // A selection made before the last reload could be holding fewer
+        // values than the helper now asks for.
+        state
+            .native_values
+            .resize(native.params().len(), String::new());
+        for (param, value) in native.params().iter().zip(state.native_values.iter_mut()) {
+            ui.label(param.label);
+            ui.text_edit_singleline(value);
         }
-        let invocation = native.build(&state.native_arg);
+
+        let invocation = native.build(&state.native_values);
+        ui.add_space(8.0);
         ui.label("Will send:");
         for line in &invocation.lines {
             ui.code(line);
         }
+        ui.add_space(8.0);
         if ui.button("Run").clicked() {
-            request = Some(UiRequest::RunNative(native, state.native_arg.clone()));
+            request = Some(UiRequest::RunNative(native, state.native_values.clone()));
         }
     }
 
@@ -886,6 +913,28 @@ pub fn settings_dialog(
                 ui.small(
                     "Either way the whole line is kept: the terminal is reported wider than the window, because IRIS cuts a line at the terminal width instead of wrapping it.",
                 );
+
+                if ui
+                    .checkbox(&mut settings.copy_on_select, "Copy on select")
+                    .on_hover_text(
+                        "Put a selection on the clipboard as soon as the mouse is released, without waiting for Ctrl+C.",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(
+                        &mut settings.save_command_history,
+                        "Remember commands from earlier sessions",
+                    )
+                    .on_hover_text(
+                        "Keeps the commands typed at an IRIS prompt in history.txt, so Up reaches back past the session that is open now. Off keeps recall working within the session and writes nothing to disk.",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
 
                 if ui
                     .checkbox(
@@ -1158,298 +1207,6 @@ fn labelled_edit(ui: &mut Ui, label: &str, value: &mut String) -> bool {
         changed = ui.text_edit_singleline(value).changed();
     });
     changed
-}
-
-/// State for the global browser, kept between frames.
-pub struct GlobalBrowserState {
-    pub query: Query,
-    pub page: Page,
-    /// Free-text filter applied to the fetched page.
-    pub search: String,
-    /// Zero-based page index within the fetched rows.
-    pub page_index: usize,
-    pub rows_per_page: usize,
-    /// Set while a query is in flight.
-    pub running: bool,
-    pub message: Option<String>,
-    /// Resume points already visited, so Back walks the global properly
-    /// instead of restarting from the top.
-    pub history: Vec<String>,
-}
-
-impl Default for GlobalBrowserState {
-    fn default() -> Self {
-        GlobalBrowserState {
-            query: Query::default(),
-            page: Page::default(),
-            search: String::new(),
-            page_index: 0,
-            rows_per_page: 25,
-            running: false,
-            message: None,
-            history: Vec::new(),
-        }
-    }
-}
-
-impl GlobalBrowserState {
-    /// Rows surviving the search filter.
-    pub fn filtered(&self) -> Vec<&Node> {
-        self.page
-            .nodes
-            .iter()
-            .filter(|n| n.matches(&self.search))
-            .collect()
-    }
-
-    pub fn page_count(&self) -> usize {
-        let total = self.filtered().len();
-        total.div_ceil(self.rows_per_page.max(1)).max(1)
-    }
-
-    /// Clamps the page index, which the search box can invalidate at any time.
-    pub fn clamp_page(&mut self) {
-        let last = self.page_count().saturating_sub(1);
-        self.page_index = self.page_index.min(last);
-    }
-}
-
-/// The global browser: query bar, searchable grid, pagination.
-pub fn global_browser_panel(
-    ui: &mut Ui,
-    state: &mut GlobalBrowserState,
-    theme: &Theme,
-) -> Option<UiRequest> {
-    let mut request = None;
-
-    ui.horizontal(|ui| {
-        ui.label("Global");
-        let editing = ui.add(
-            egui::TextEdit::singleline(&mut state.query.global)
-                .hint_text("CSW1")
-                .desired_width(140.0),
-        );
-        // Enter in the field runs the query, as in every other query tool.
-        let submitted = editing.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-        ui.label("Delim");
-        ui.add(egui::TextEdit::singleline(&mut state.query.delimiter).desired_width(30.0))
-            .on_hover_text("Delimiter for $Piece. ^ is the ObjectScript default.");
-
-        ui.label("Limit");
-        ui.add(
-            egui::DragValue::new(&mut state.query.limit)
-                .range(1..=20_000)
-                .speed(10),
-        )
-        .on_hover_text("Nodes fetched per request");
-
-        let runnable = state.query.is_runnable() && !state.running;
-        if (ui.add_enabled(runnable, egui::Button::new("Run")).clicked() || (submitted && runnable))
-            && runnable
-        {
-            state.query.start.clear();
-            state.history.clear();
-            request = Some(UiRequest::RunGlobalQuery);
-        }
-    });
-
-    if state.running {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label("Reading from IRIS...");
-        });
-    }
-
-    if let Some(error) = &state.page.error {
-        ui.colored_label(theme.ansi[9], format!("IRIS error: {error}"));
-    }
-    if let Some(message) = &state.message {
-        ui.small(message);
-    }
-
-    if state.page.nodes.is_empty() && !state.running {
-        ui.separator();
-        ui.small(
-            "Reads with $Query/$Get only - nothing here can modify a database. \
-             Values are split with $Piece on the IRIS side.",
-        );
-        return request;
-    }
-
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("Search");
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut state.search)
-                    .hint_text("subscript or piece text")
-                    .desired_width(180.0),
-            )
-            .changed()
-        {
-            state.page_index = 0;
-        }
-        if ui.small_button("clear").clicked() {
-            state.search.clear();
-            state.page_index = 0;
-        }
-    });
-
-    state.clamp_page();
-    let sub_cols = state.page.subscript_columns();
-    let piece_cols = state.page.piece_columns();
-    let rows_per_page = state.rows_per_page.max(1);
-    let page_index = state.page_index;
-
-    let matched: Vec<Node> = state.filtered().into_iter().cloned().collect();
-    let total = matched.len();
-    let start = page_index * rows_per_page;
-    let visible: Vec<&Node> = matched.iter().skip(start).take(rows_per_page).collect();
-
-    // The grid scrolls horizontally: a node with twenty pieces is normal in
-    // ERP data and must not squeeze the subscripts out of view.
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .max_height(ui.available_height() - 40.0)
-        .show(ui, |ui| {
-            egui::Grid::new("global-grid")
-                .striped(true)
-                .num_columns(sub_cols + piece_cols + 1)
-                .show(ui, |ui| {
-                    ui.strong("#");
-                    for i in 1..=sub_cols {
-                        ui.strong(format!("sub{i}"));
-                    }
-                    for i in 1..=piece_cols {
-                        // Numbered so a column maps directly onto
-                        // $Piece(value, delim, n).
-                        ui.strong(format!("p{i}"));
-                    }
-                    ui.end_row();
-
-                    for (offset, node) in visible.iter().enumerate() {
-                        let row = start + offset + 1;
-                        ui.label(format!("{row}")).on_hover_text(&node.reference);
-
-                        for i in 0..sub_cols {
-                            let text = node.subscripts.get(i).cloned().unwrap_or_default();
-                            ui.label(text);
-                        }
-                        for i in 0..piece_cols {
-                            match node.pieces.get(i) {
-                                Some(piece) if !piece.is_empty() => {
-                                    ui.label(piece);
-                                }
-                                // An empty piece and a missing one are
-                                // different facts; show them differently.
-                                Some(_) => {
-                                    ui.weak("");
-                                }
-                                None => {
-                                    ui.weak("-");
-                                }
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
-        });
-
-    ui.separator();
-    ui.horizontal(|ui| {
-        let pages = state.page_count();
-        if ui
-            .add_enabled(state.page_index > 0, egui::Button::new("<"))
-            .clicked()
-        {
-            state.page_index -= 1;
-        }
-        ui.label(format!(
-            "page {}/{}  -  {total} rows",
-            state.page_index + 1,
-            pages
-        ));
-        if ui
-            .add_enabled(state.page_index + 1 < pages, egui::Button::new(">"))
-            .clicked()
-        {
-            state.page_index += 1;
-        }
-
-        ui.separator();
-
-        // Fetching further nodes is a round trip to IRIS, distinct from
-        // paging within what has already been fetched.
-        if state.page.truncated {
-            let more = ui
-                .add_enabled(!state.running, egui::Button::new("Fetch more"))
-                .on_hover_text("Continue the walk from the last node");
-            if more.clicked() {
-                if let Some(resume) = state.page.resume_from() {
-                    state.history.push(state.query.start.clone());
-                    state.query.start = resume;
-                    request = Some(UiRequest::RunGlobalQuery);
-                }
-            }
-        }
-        if !state.history.is_empty()
-            && ui
-                .add_enabled(!state.running, egui::Button::new("Back"))
-                .clicked()
-        {
-            if let Some(previous) = state.history.pop() {
-                state.query.start = previous;
-                request = Some(UiRequest::RunGlobalQuery);
-            }
-        }
-
-        if ui.button("Copy page").clicked() {
-            request = Some(UiRequest::CopyGlobalPage);
-        }
-    });
-
-    if state.page.truncated {
-        ui.small(format!(
-            "Stopped at the {}-node limit; more nodes remain.",
-            state.query.limit
-        ));
-    }
-
-    request
-}
-
-/// The visible page as tab-separated text, for the clipboard.
-pub fn page_as_text(state: &GlobalBrowserState) -> String {
-    let sub_cols = state.page.subscript_columns();
-    let piece_cols = state.page.piece_columns();
-
-    let mut out = String::new();
-    for i in 1..=sub_cols {
-        out.push_str(&format!("sub{i}\t"));
-    }
-    for i in 1..=piece_cols {
-        out.push_str(&format!("p{i}"));
-        if i < piece_cols {
-            out.push('\t');
-        }
-    }
-    out.push('\n');
-
-    for node in state.filtered() {
-        for i in 0..sub_cols {
-            out.push_str(node.subscripts.get(i).map(String::as_str).unwrap_or(""));
-            out.push('\t');
-        }
-        for i in 0..piece_cols {
-            out.push_str(node.pieces.get(i).map(String::as_str).unwrap_or(""));
-            if i + 1 < piece_cols {
-                out.push('\t');
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 #[cfg(test)]

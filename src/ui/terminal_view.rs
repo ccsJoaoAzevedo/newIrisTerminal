@@ -8,7 +8,7 @@ use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Response, Sense, Str
 
 use crate::config::{CursorStyle, Theme};
 use crate::term::cell::{Cell, Color};
-use crate::term::{palette, syntax, Attrs, Grid};
+use crate::term::{lineedit, palette, syntax, Attrs, Grid};
 use crate::ui::wrap;
 
 /// Everything about how the grid should be drawn that is not the grid itself.
@@ -31,6 +31,8 @@ pub struct RenderOpts {
     /// letting the user scroll sideways. See [`TERMINAL_COLS`] for why both
     /// modes still receive the whole line.
     pub wrap: bool,
+    /// Put a selection on the clipboard the moment the mouse is released.
+    pub copy_on_select: bool,
 }
 
 impl Default for RenderOpts {
@@ -43,6 +45,7 @@ impl Default for RenderOpts {
             scrollbar: true,
             syntax: true,
             wrap: true,
+            copy_on_select: false,
         }
     }
 }
@@ -99,6 +102,25 @@ impl Selection {
     fn contains(&self, line: usize, col: usize) -> bool {
         let (start, end) = self.ordered();
         (line, col) >= start && (line, col) < end
+    }
+
+    /// Columns covered on `line`, when the whole selection sits on that one
+    /// line. The end column is exclusive, as it is everywhere else here.
+    ///
+    /// `None` for a selection that spans several lines: the only selection the
+    /// app can rub out of IRIS's read buffer is one inside the line being
+    /// typed.
+    pub fn span_on(&self, line: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.ordered();
+        (start.0 == line && end.0 == line).then_some((start.1, end.1))
+    }
+
+    /// A selection covering the whole of one line's `start..end` columns.
+    pub fn across(line: usize, start: usize, end: usize) -> Self {
+        Selection {
+            start: (line, start),
+            end: (line, end),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -234,6 +256,11 @@ pub struct RenderResult {
     pub response: Response,
     /// Set when the user picked something from the right-click menu.
     pub context_action: Option<ContextAction>,
+    /// A selection was just finished with copy-on-select turned on.
+    pub copy_selection: bool,
+    /// Columns to move IRIS's cursor by, after a click inside the line being
+    /// typed. Negative is left.
+    pub cursor_move: Option<i64>,
     /// Grid dimensions the caller should resize the PTY to.
     ///
     /// `cols` is the *grid* width - [`TERMINAL_COLS`], not the window - because
@@ -371,7 +398,7 @@ pub fn show(
     };
     let segments = wrap::from_top(total, rows, top_line, mode, used);
 
-    handle_mouse(
+    let mouse = handle_mouse(
         ui,
         &response,
         state,
@@ -383,6 +410,7 @@ pub fn show(
         max_h_offset,
         &segments,
         mode,
+        opts.copy_on_select,
     );
 
     // Where the cursor is, in grid coordinates, when it is visible and its cell
@@ -540,7 +568,7 @@ pub fn show(
         }
         if ui
             .button("Clear terminal and scrollback")
-            .on_hover_text("Ctrl+Delete. Unlike IRIS's own clear-screen, this really does throw the history away.")
+            .on_hover_text("Ctrl+Delete. Unlike IRIS's own clear-screen, this really does throw the history away. At an idle prompt it sends W # so IRIS puts its next prompt back at the top; the echo and the old screen are dropped rather than kept.")
             .clicked()
         {
             context_action = Some(ContextAction::ClearTerminal);
@@ -551,6 +579,8 @@ pub fn show(
     RenderResult {
         response,
         context_action,
+        copy_selection: mouse.copy_selection,
+        cursor_move: mouse.cursor_move,
         cols: grid_cols,
         rows,
         view_cols,
@@ -866,6 +896,13 @@ fn paint_row(
     }
 }
 
+/// What a frame's worth of mouse activity asked the caller to do.
+#[derive(Clone, Copy, Debug, Default)]
+struct MouseOutcome {
+    copy_selection: bool,
+    cursor_move: Option<i64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     ui: &Ui,
@@ -879,7 +916,9 @@ fn handle_mouse(
     max_h_offset: usize,
     segments: &[wrap::Segment],
     mode: wrap::Mode,
-) {
+    copy_on_select: bool,
+) -> MouseOutcome {
+    let mut outcome = MouseOutcome::default();
     // Wheel scrolling through scrollback.
     let (scroll, h_scroll, shift) = ui.input(|i| {
         (
@@ -935,6 +974,18 @@ fn handle_mouse(
     // started one, and the old selection stayed on screen still holding Ctrl+C.
     if response.clicked() {
         state.selection = None;
+
+        // Clicking inside the line being typed puts IRIS's cursor there. Only
+        // inside it: everywhere else a click is just a click, and off a command
+        // line there is no cursor of ours to move.
+        if let (Some(line), Some(pos)) = (lineedit::current(grid), response.interact_pointer_pos())
+        {
+            let cursor_line = grid.scrollback.len() + grid.cursor.row;
+            let (clicked_line, col) = pos_to_cell(pos);
+            if clicked_line == cursor_line && (line.start..=line.end).contains(&col) {
+                outcome.cursor_move = Some(col as i64 - line.cursor as i64);
+            }
+        }
     }
 
     if response.drag_started() {
@@ -953,16 +1004,47 @@ fn handle_mouse(
         state.dragging = false;
         // A click without movement clears rather than leaving an empty
         // selection, which would otherwise keep stealing Ctrl+C.
-        if state.selection.map(|s| s.is_empty()).unwrap_or(false) {
+        let empty = state.selection.map(|s| s.is_empty()).unwrap_or(true);
+        if empty {
             state.selection = None;
+        } else if copy_on_select {
+            outcome.copy_selection = true;
         }
     }
+
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::term::Grid;
+
+    /// The span is what decides whether an erase key can act on a selection, so
+    /// a selection that reaches off the line must not produce one.
+    #[test]
+    fn a_selection_reports_its_columns_only_while_it_stays_on_one_line() {
+        let one_line = Selection::across(7, 5, 12);
+        assert_eq!(one_line.span_on(7), Some((5, 12)));
+        assert_eq!(one_line.span_on(6), None);
+
+        let across_lines = Selection {
+            start: (6, 3),
+            end: (7, 9),
+        };
+        assert_eq!(across_lines.span_on(7), None);
+        assert_eq!(across_lines.span_on(6), None);
+    }
+
+    /// Dragging right-to-left is the same selection as dragging left-to-right.
+    #[test]
+    fn a_backwards_selection_reports_the_same_span() {
+        let backwards = Selection {
+            start: (7, 12),
+            end: (7, 5),
+        };
+        assert_eq!(backwards.span_on(7), Some((5, 12)));
+    }
 
     fn grid_with(lines: &[&str]) -> Grid {
         let mut grid = Grid::new(20, lines.len().max(1), 100);

@@ -25,9 +25,13 @@ correctly rather than being flattened into line-oriented output.
     pre-clear screen into scrollback instead of destroying it, the way the
     native IrisTerm does. Ctrl+Delete (or right-click → "Clear terminal and
     scrollback") is the separate, deliberate gesture that actually throws the
-    history away, asking IRIS for a real clear rather than wiping the grid
-    locally — which would otherwise leave IRIS's next prompt painted at a
-    stale row
+    history away. At an idle prompt it asks IRIS for the clear (`W #`) rather
+    than wiping the grid, because the far side repaints by absolute cursor
+    position and would otherwise put its next prompt back at the row it had
+    reached with blank rows above it; the echoed command and the old screen
+    are dropped rather than filed, so nothing of it stays behind. Mid-line or
+    mid-routine, where the command could be swallowed as input, the grid is
+    cleared locally instead
   * ObjectScript syntax colouring in the terminal, prompt-aware so it never
     lights up plain prose: globals, strings, numbers, delimiters/operators,
     commands (full words and their IRIS abbreviations), preprocessor macros
@@ -37,12 +41,31 @@ correctly rather than being flattened into line-oriented output.
     labels. Field names in a theme are named after the semantic scopes of the
     InterSystems VS Code extension, so a colour customisation can be copied
     straight across
+  * Line editing at the prompt, as close to a text field as a terminal gets —
+    Home and End walk to the ends of the command being typed, Ctrl+Left/Right
+    walk it a word at a time, clicking inside it puts the cursor there, Ctrl+A
+    selects it, Shift plus Left/Right/Home/End (or Ctrl+Shift+Left/Right, by
+    word) drags a selection out of it, and Backspace/Delete rub that selection
+    — or the mouse's — out, as does typing or pasting over it. An unshifted
+    movement key drops the selection again. Word boundaries are an editor's,
+    counting a run of punctuation as a stop of its own, so Ctrl+Right walks
+    `do ^%CSW1GEN("X")` a piece at a time. IRIS owns the read buffer, so all
+    of it is built from the arrow keys and rubouts it does act on — and
+    extending a selection sends nothing at all; off a command line (in `^%G`,
+    say) the keys reach IRIS untouched
+  * Command history that outlives the session — every command typed at an IRIS
+    prompt is remembered, and Up/Down walk it. Shared by every tab, and kept in
+    `history.txt` unless Settings → Session → "Remember commands from earlier
+    sessions" is off
+  * Copy on select — a finished selection goes to the clipboard without waiting
+    for Ctrl+C. Settings → Session
   * Autologon — username/password from the OS credential store, with post-login commands
   * Window resize and fit content to window — the grid reflows and the PTY is resized
   * Macros read from XML — `{{param}}` substitution, `confirm="true"` for
     anything that writes, an optional keyboard shortcut per macro
     (`key="Ctrl+Shift+G"`), `hide_command="true"` to keep a password-bearing
-    command line out of the panel, and a one-click Run button on every row
+    command line out of the panel, and a one-click Run button on every row.
+    Ships with one: **Developer Tools (Exec)**
   * Theming support — TOML themes, hot-swappable, applied to terminal and
     chrome alike, with an "Open folder" button that jumps straight to the
     themes directory. Also covers font family (from the system's installed
@@ -50,9 +73,12 @@ correctly rather than being flattened into line-oriented output.
     scrollbars
   * Plugin interface — sandboxed WebAssembly, behind the `plugins` feature
   * Logging — per-session transcripts, raw or clean, with password redaction and rotation
-  * Easier access and dedicated interfaces for native routines (`^%RD`, `^%RS`, `ZWRITE`, `ZN`)
+  * IRIS utilities panel — fill in the fields and the exact line is composed
+    and sent: **Compile classes**
+    (`do $SYSTEM.OBJ.CompilePackage("<package>","<flag>")`, flag defaulting to
+    `bkf1`) and **Generate interface** (`do ^%CSW1GEN("<routine/group>")`).
+    Clicking the open one again folds it away and keeps what you typed
   * Export output — screen or full scrollback, as text or colour-preserving HTML
-  * Global browser — a searchable, paginated grid replacing `^%G`'s paged text
   * Right-click menu for copy / paste / select all / clear terminal and scrollback
   * Custom app icon, embedded both in the `.exe` (Explorer/taskbar) and loaded
     at runtime for the window icon
@@ -97,7 +123,6 @@ Integration tests that talk to a real instance are ignored by default:
 ```sh
 cargo test --test live_session  -- --ignored --nocapture   # session opens, resizes
 cargo test --test live_input    -- --ignored --nocapture   # arrow recall, Ctrl+C interrupt
-cargo test --test live_globals  -- --ignored --nocapture   # global browser extraction
 cargo test --test live_charset  -- --ignored --nocapture   # which encoding is correct here
 cargo test --test live_wrap     -- --ignored --nocapture   # where long output gets cut
 cargo test --test live_timing   -- --ignored --nocapture   # where session-open time goes
@@ -114,8 +139,9 @@ Everything lives under the platform config directory — `%APPDATA%\newIrisTermi
 
 | File | Purpose |
 |---|---|
-| `settings.toml` | Profiles, theme, font/cursor/scrollbar, window decorations, scrollback, logging |
+| `settings.toml` | Profiles, theme, font/cursor/scrollbar, window decorations, scrollback, copy-on-select, command history, logging |
 | `macros.xml` | Your personal macros — editable from the Macros panel |
+| `history.txt` | Commands typed at an IRIS prompt, for Up/Down recall |
 | `themes/*.toml` | Colour schemes; drop a file in and restart |
 | `plugins/*.wasm` | Plugins, with an optional `.toml` manifest beside each |
 
@@ -127,7 +153,8 @@ Macros come from two files:
   mapped drive, or local copy). Shown with an `org` badge and never written to.
   If it is unreachable you get a notice and your personal macros still load.
 * **Personal** — `macros.xml` in the config directory, created on first run and
-  editable in the app.
+  editable in the app. While it is still exactly as shipped it is refreshed
+  when the bundled set changes; the first edit claims the file for good.
 
 Groups with the same name merge, organisation entries first. Saving only ever
 writes personal macros, so a shared macro cannot silently fork into a local copy.
@@ -142,27 +169,6 @@ Instances come from `iris list`. Note that the registered instance name is not
 always the install directory name, and the keyword in that output varies by
 version (`Instance 'NAME'` on standard installs, `Configuration 'NAME'` on
 custom ones) — both are handled.
-
-## Global browser
-
-`^%G` is prompt-driven and paginates as free text, which is fine to read and
-miserable to search. The **Globals** panel builds the same view from data: a
-short read-only ObjectScript walk (`$Query` + `$Get`) emits one tagged line per
-node and per `$Piece`, and the result becomes a searchable grid where every
-piece is a numbered column — `p1`, `p2`, `p3` map directly onto
-`$Piece(value, delim, n)`.
-
-* The delimiter defaults to `^` and is editable per query.
-* Splitting happens on the IRIS side, so `$Piece` stays the authority on what
-  piece *n* is.
-* Pagination is two-level: pages within the fetched rows, and **Fetch more** to
-  continue the walk from the last node. Resuming never re-reads or skips a node.
-* Nothing in the panel can write. The generated script contains no `Set`,
-  `Kill`, or `Merge`, and a test asserts that.
-
-One node per *piece* is written rather than one per node, deliberately: IRIS
-truncates output at the terminal's right margin instead of wrapping it, so a
-wide node on a single line would silently lose its tail.
 
 ## Encoding
 

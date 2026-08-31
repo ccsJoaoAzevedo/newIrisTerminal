@@ -106,15 +106,17 @@ fn clearing_the_screen_leaves_the_transcript_in_the_scrollback() {
     );
 }
 
-/// The Ctrl+Delete gesture, end to end: wipe the grid, ask IRIS to clear, and
-/// end up with an empty scrollback and a prompt IRIS agrees is at the top.
+/// The Ctrl+Delete gesture, end to end: an empty scrollback, an empty screen,
+/// and a prompt the far side agrees is at the top.
 ///
-/// Doing it locally is what did not work: IRIS positions the cursor absolutely,
-/// so a grid cleared behind its back left the next prompt painted back down at
-/// the row it had reached.
+/// The last part is the one a local clear cannot deliver, and the reason the
+/// gesture asks IRIS for the clear instead of wiping the grid: the far side
+/// repaints by absolute cursor position, so a screen cleared behind its back
+/// gets the next prompt painted back down at the row it had reached, with the
+/// cleared rows blank above it.
 #[test]
 #[ignore = "needs a local IRIS instance"]
-fn a_requested_clear_empties_the_terminal_and_moves_the_prompt_to_the_top() {
+fn the_deliberate_clear_empties_the_terminal_and_moves_the_prompt_to_the_top() {
     let instance = test_instance().expect("no instance to test against");
     let (mut session, mut grid) = start(&instance);
 
@@ -128,13 +130,14 @@ fn a_requested_clear_empties_the_terminal_and_moves_the_prompt_to_the_top() {
         "the prompt never got far enough down the screen to be worth clearing"
     );
 
-    // The gesture: ask IRIS for the clear, and drop the history when it comes.
+    // The gesture, exactly as the app performs it at an idle prompt: arm the
+    // purge, then ask IRIS to clear.
     grid.purge_history_on_next_clear();
     let _ = session.write(b"W #\r");
     pump(&mut session, &mut grid, Duration::from_secs(3));
 
-    // And a keystroke afterwards, which is where the old behaviour showed:
-    // IRIS put the next prompt back at the row it still believed it was on.
+    // And a keystroke afterwards, which is where a stale cursor would show:
+    // the next prompt would come back at the row IRIS still believed it was on.
     let _ = session.write(b"\r");
     pump(&mut session, &mut grid, Duration::from_secs(2));
 
@@ -151,6 +154,10 @@ fn a_requested_clear_empties_the_terminal_and_moves_the_prompt_to_the_top() {
             .collect::<Vec<_>>()
     );
     assert!(!screen.contains("NIT-FILLER"), "the screen was not cleared");
+    assert!(
+        !screen.contains("W #"),
+        "the command that asked for the clear was left on screen:\n{screen}"
+    );
     // Two rows for the cleared prompt and the one the Enter produced under it -
     // not the row eight lines down that IRIS used to come back to.
     assert!(
