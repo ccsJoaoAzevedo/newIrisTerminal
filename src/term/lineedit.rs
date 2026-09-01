@@ -145,6 +145,28 @@ fn next_word(chars: &[char], at: usize) -> usize {
     i
 }
 
+/// The run of like characters around `at`, as a half-open column range.
+///
+/// One run is one class: a word, a stretch of blanks, or a stretch of symbols.
+/// This is what a double-click selects, and it shares `class` with the Ctrl+
+/// arrow motions on purpose - a double-click and a Ctrl+Right must agree on
+/// where `$SYSTEM` ends and `.OBJ` begins, or the same line reads as two
+/// different sets of words depending on which hand you used.
+///
+/// `None` when `at` is past the end of `chars`, which is a click on nothing.
+pub fn word_bounds(chars: &[char], at: usize) -> Option<(usize, usize)> {
+    let kind = class(*chars.get(at)?);
+    let mut start = at;
+    while start > 0 && class(chars[start - 1]) == kind {
+        start -= 1;
+    }
+    let mut end = at + 1;
+    while end < chars.len() && class(chars[end]) == kind {
+        end += 1;
+    }
+    Some((start, end))
+}
+
 /// The command line the cursor is on, or `None` when it is not on one.
 pub fn current(grid: &Grid) -> Option<LineEdit> {
     let row = grid.screen.get(grid.cursor.row)?;

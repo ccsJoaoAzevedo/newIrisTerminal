@@ -24,8 +24,8 @@ Portuguese.
   abbreviations. Prompt-aware, so plain prose never lights up.
 * **Line editing at the prompt** — Home/End, Ctrl+Left/Right by word, click to
   place the cursor, Ctrl+A to select the line, Shift to drag a selection out of
-  it, double-click to take a whole line. Built entirely from keys IRIS acts on,
-  since IRIS owns the read buffer.
+  it, double-click to take a word and triple-click a whole line. Built entirely
+  from keys IRIS acts on, since IRIS owns the read buffer.
 * **Command history that outlives the session** — every command typed at a
   prompt is remembered, and Up/Down walk it. Lines a macro or an IRIS helper
   sent are never offered back, and IRIS's own recall — which is full of them —

@@ -1017,6 +1017,26 @@ fn paint_row(
     }
 }
 
+/// The run of like characters under `col` on `line`, as a selection.
+///
+/// The three runs a double-click can land on are a word, a stretch of blanks
+/// and a stretch of symbols, exactly as in an editor: double-clicking `%CSW1A`
+/// in `do ^%CSW1A` takes `CSW1A`, and the `^%` before it is a run of its own.
+///
+/// Bounded by the text on the line rather than by the width of the terminal, so
+/// a click out in the right margin - past everything the line holds - selects
+/// nothing instead of a mouthful of padding blanks.
+fn word_at(grid: &Grid, line: usize, col: usize) -> Option<Selection> {
+    let row = grid.line(line)?;
+    let width = row.used_width();
+    if col >= width {
+        return None;
+    }
+    let chars: Vec<char> = row.cells[..width].iter().map(|c| c.ch).collect();
+    let (start, end) = lineedit::word_bounds(&chars, col)?;
+    Some(Selection::across(line, start, end))
+}
+
 /// What a frame's worth of mouse activity asked the caller to do.
 #[derive(Clone, Copy, Debug, Default)]
 struct MouseOutcome {
@@ -1099,23 +1119,29 @@ fn handle_mouse(
         resolve(pos, offset, grid.cols)
     };
 
-    // Double-click takes the whole line, the way it does in a text editor -
-    // and the way anyone who has just seen a stack trace go past wants it to.
-    // Checked before the single click, which would otherwise clear it again on
-    // the same frame.
-    if response.double_clicked() {
+    // Double-click takes the word under the pointer and triple-click the whole
+    // line, which is what every text editor does with the same two gestures.
+    // Both are checked before the single click, which would otherwise clear the
+    // selection again on the same frame - egui reports a multi-click as a click
+    // as well.
+    if response.triple_clicked() || response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            let (line, _) = pos_to_cell(pos);
-            // To the last character, not to the width of the terminal: a line
-            // selected out to column 200 pastes as a line with 150 spaces on
-            // the end of it.
-            let width = grid.line(line).map_or(0, |row| row.used_width());
-            if width > 0 {
-                state.selection = Some(Selection::across(line, 0, width - 1));
-                state.drag_anchor = None;
-                if copy_on_select {
-                    outcome.copy_selection = true;
-                }
+            let (line, col) = pos_to_cell(pos);
+            state.selection = if response.triple_clicked() {
+                // To the last character, not to the width of the terminal: a
+                // line selected out to column 200 pastes as a line with 150
+                // spaces on the end of it.
+                let width = grid.line(line).map_or(0, |row| row.used_width());
+                (width > 0).then(|| Selection::across(line, 0, width))
+            } else {
+                word_at(grid, line, col)
+            };
+            // An empty line, or a click out past the end of one, selects
+            // nothing - and clears what was selected before, the way clicking
+            // into empty space in an editor does.
+            state.drag_anchor = None;
+            if copy_on_select && state.selection.is_some() {
+                outcome.copy_selection = true;
             }
         }
         return outcome;
@@ -1249,6 +1275,55 @@ mod tests {
             }
         }
         grid
+    }
+
+    /// Double-click takes one run of like characters, the way an editor does:
+    /// a word on its own, without the punctuation stuck to either end of it.
+    #[test]
+    fn a_double_click_takes_the_word_under_the_pointer() {
+        let grid = grid_with(&["do ^%CSW1A"]);
+
+        // Anywhere in the word is the whole word, first character to last.
+        for col in 5..10 {
+            assert_eq!(word_at(&grid, 0, col), Some(Selection::across(0, 5, 10)));
+        }
+        // The `^%` before it is a run of its own, and so is the blank.
+        assert_eq!(word_at(&grid, 0, 3), Some(Selection::across(0, 3, 5)));
+        assert_eq!(word_at(&grid, 0, 4), Some(Selection::across(0, 3, 5)));
+        assert_eq!(word_at(&grid, 0, 2), Some(Selection::across(0, 2, 3)));
+        assert_eq!(word_at(&grid, 0, 0), Some(Selection::across(0, 0, 2)));
+    }
+
+    /// Out past the text there is nothing to select: the cells are there, but
+    /// they are the padding every row is stored with, not content.
+    #[test]
+    fn a_double_click_past_the_end_of_the_line_selects_nothing() {
+        let grid = grid_with(&["do ^%CSW1A"]);
+        assert_eq!(word_at(&grid, 0, 10), None);
+        assert_eq!(word_at(&grid, 0, 19), None);
+        assert_eq!(word_at(&grid, 1, 0), None);
+    }
+
+    /// The end column is exclusive everywhere, so the last character of a word
+    /// - and of a line - has to be inside what the selection yields.
+    #[test]
+    fn a_selected_word_ends_on_its_last_character() {
+        let grid = grid_with(&["do ^%CSW1A"]);
+        let state = ViewState {
+            selection: word_at(&grid, 0, 6),
+            ..Default::default()
+        };
+        assert_eq!(state.selected_text(&grid).as_deref(), Some("CSW1A"));
+
+        // What a triple-click makes: column zero out to the used width.
+        let whole_line = ViewState {
+            selection: Some(Selection::across(0, 0, 10)),
+            ..Default::default()
+        };
+        assert_eq!(
+            whole_line.selected_text(&grid).as_deref(),
+            Some("do ^%CSW1A")
+        );
     }
 
     /// The invariant the cursor bug came down to: text, background rects and

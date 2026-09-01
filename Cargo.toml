@@ -1,6 +1,6 @@
 [package]
 name = "new-iris-terminal"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Terminal emulator for InterSystems IRIS"
 license = "MIT"
