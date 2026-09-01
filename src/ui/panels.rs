@@ -969,6 +969,24 @@ pub fn settings_dialog(
                 {
                     changed = true;
                 }
+                if ui
+                    .checkbox(&mut settings.save_terminal_size, "Save terminal size")
+                    .on_hover_text(
+                        "Reopens the window at the size it was last closed at. Off opens it at 100x30 characters, whatever the font size.",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(&mut settings.save_window_position, "Save window position")
+                    .on_hover_text(
+                        "Reopens the window where it was last closed. Off centres it on the screen.",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
                 ui.small("Takes effect the next time the app starts.");
 
                 ui.separator();

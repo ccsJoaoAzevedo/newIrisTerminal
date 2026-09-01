@@ -30,24 +30,72 @@ fn load_icon() -> egui::IconData {
     }
 }
 
+/// Inner window size, in egui points, that should hold a terminal of
+/// `cols` x `rows` characters.
+///
+/// A guess, and only a guess: the real cell size comes from the font egui ends
+/// up with, which is not known until it has a context to measure in, and the
+/// panels above the terminal are laid out at the same time. [`app::App`] takes
+/// the measurement on its first frames and corrects the window to the exact
+/// geometry; this only decides how far off it starts, so that the correction is
+/// a nudge rather than a jump.
+fn estimated_inner_size(settings: &config::Settings, cols: u16, rows: u16) -> [f32; 2] {
+    let font_size = settings.font_size.max(6.0);
+    // Ratios of a typical monospace face: half again as tall as it is set, and
+    // a little over half as wide.
+    let cell_w = font_size * 0.62;
+    let cell_h = font_size * 1.5;
+    // The menu bar, the tab strip and the scrollbar the terminal reserves.
+    let chrome_h = 78.0;
+    let chrome_w = 24.0;
+    [
+        cols as f32 * cell_w + chrome_w,
+        rows as f32 * cell_h + chrome_h,
+    ]
+}
+
 /// Starts the GUI. The binary is nothing more than a call to this.
 pub fn run() -> eframe::Result<()> {
-    // Read early, because whether the window has a system frame is fixed when
-    // it is created. `App::new` loads the settings again; the file is small and
-    // the alternative is threading it through `run_native`'s callback.
-    let decorated = config::Settings::load().native_decorations;
+    // Read early, because a window's frame, size and position are all fixed
+    // when it is created. `App::new` loads the settings again; the file is
+    // small and the alternative is threading it through `run_native`'s
+    // callback.
+    let settings = config::Settings::load();
+
+    // Restoring the last size is exact; opening at the default geometry is not,
+    // because it is expressed in characters. Either way `App` has the last word
+    // once it can measure one.
+    let inner_size = settings.restored_window_size().unwrap_or_else(|| {
+        estimated_inner_size(
+            &settings,
+            config::DEFAULT_TERMINAL_COLS,
+            config::DEFAULT_TERMINAL_ROWS,
+        )
+    });
+    let position = settings.restored_window_position();
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(inner_size)
+        .with_min_inner_size([400.0, 240.0])
+        // The title still matters with the frame off: it is what the
+        // taskbar and the window switcher show.
+        .with_title("newIrisTerminal")
+        .with_decorations(settings.native_decorations)
+        .with_resizable(true)
+        // Define o ícone da janela e barra de tarefas aqui:
+        .with_icon(Arc::new(load_icon()));
+    if let Some(position) = position {
+        viewport = viewport.with_position(position);
+    }
+    if settings.restored_maximized() {
+        viewport = viewport.with_maximized(true);
+    }
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 640.0])
-            .with_min_inner_size([400.0, 240.0])
-            // The title still matters with the frame off: it is what the
-            // taskbar and the window switcher show.
-            .with_title("newIrisTerminal")
-            .with_decorations(decorated)
-            .with_resizable(true)
-            // Define o ícone da janela e barra de tarefas aqui:
-            .with_icon(Arc::new(load_icon())),
+        viewport,
+        // eframe applies this after the builder's position, so it is only ever
+        // set when there is no saved position to honour.
+        centered: position.is_none(),
         ..Default::default()
     };
 

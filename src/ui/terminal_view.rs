@@ -308,6 +308,9 @@ pub struct RenderResult {
     /// what the status line reports.
     pub view_cols: usize,
     pub view_rows: usize,
+    /// Size of one character cell, in points. What the window has to be grown
+    /// or shrunk by to gain or lose a column or a row.
+    pub cell: Vec2,
 }
 
 /// Draws the grid into the remaining space of `ui`.
@@ -639,6 +642,7 @@ pub fn show(
         rows,
         view_cols,
         view_rows: rows,
+        cell,
     }
 }
 

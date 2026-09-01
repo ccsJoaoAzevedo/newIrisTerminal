@@ -73,6 +73,16 @@ pub fn open_in_file_manager(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Terminal geometry a window opens at when the last one is not being
+/// restored, in character cells.
+///
+/// Cells rather than pixels because that is the size the user cares about: a
+/// window of "100x30" holds the same amount of IRIS output whatever the font
+/// size is set to. The pixel size that produces it is worked out once the
+/// window has measured a character.
+pub const DEFAULT_TERMINAL_COLS: u16 = 100;
+pub const DEFAULT_TERMINAL_ROWS: u16 = 30;
+
 /// Shape the terminal cursor is drawn as.
 ///
 /// A setting rather than something the session controls: IRIS never emits
@@ -175,6 +185,24 @@ pub struct Settings {
     /// where the title bar would otherwise waste a row. An escape hatch for a
     /// window manager the custom chrome misbehaves under.
     pub native_decorations: bool,
+    /// Reopen at the size the window was last closed at. Off opens every
+    /// launch at [`DEFAULT_TERMINAL_COLS`]x[`DEFAULT_TERMINAL_ROWS`] cells.
+    pub save_terminal_size: bool,
+    /// Reopen where the window was last closed. Off centres it on the monitor.
+    pub save_window_position: bool,
+    /// Inner size of the window in egui points, as last closed. Recorded only
+    /// while `save_terminal_size` is on, and ignored when it is off, so
+    /// switching the setting back on restores what was there before rather
+    /// than nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_size: Option<[f32; 2]>,
+    /// Top-left of the window frame in egui points, as last closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_position: Option<[f32; 2]>,
+    /// Whether the window was maximized when it was last closed. Restored with
+    /// the size, because the alternative is a window the size of the screen
+    /// that the restore button cannot shrink.
+    pub window_maximized: bool,
     pub enable_plugins: bool,
 }
 
@@ -201,6 +229,11 @@ impl Default for Settings {
             open_on_start: true,
             confirm_close_with_live_session: true,
             native_decorations: false,
+            save_terminal_size: false,
+            save_window_position: false,
+            window_size: None,
+            window_position: None,
+            window_maximized: false,
             enable_plugins: false,
         }
     }
@@ -247,6 +280,30 @@ impl Settings {
     /// The organisation macro file, if one is configured.
     pub fn org_macros(&self) -> Option<&std::path::Path> {
         (!self.org_macros_path.as_os_str().is_empty()).then_some(self.org_macros_path.as_path())
+    }
+
+    /// Inner size the window should open at, if a saved one is to be restored.
+    ///
+    /// `None` means "no size to restore": the caller opens at
+    /// [`DEFAULT_TERMINAL_COLS`]x[`DEFAULT_TERMINAL_ROWS`] cells instead.
+    pub fn restored_window_size(&self) -> Option<[f32; 2]> {
+        self.save_terminal_size
+            .then_some(self.window_size)
+            .flatten()
+    }
+
+    /// Position the window should open at, or `None` to centre it.
+    pub fn restored_window_position(&self) -> Option<[f32; 2]> {
+        self.save_window_position
+            .then_some(self.window_position)
+            .flatten()
+            .filter(|[x, y]| x.is_finite() && y.is_finite())
+    }
+
+    /// Whether the window should open maximized, which only a restored size
+    /// can ask for.
+    pub fn restored_maximized(&self) -> bool {
+        self.save_terminal_size && self.window_maximized
     }
 
     /// Effective log mode for a profile, applying the global default.
@@ -447,6 +504,74 @@ mod tests {
         assert!(settings.font_family.is_empty());
         assert!(settings.copy_on_select);
         assert!(settings.save_command_history);
+    }
+
+    /// The window geometry is only ever restored through the switch that asks
+    /// for it, so a stored value has to stay inert while its switch is off.
+    #[test]
+    fn window_geometry_is_only_restored_when_it_was_asked_for() {
+        let stored = Settings {
+            window_size: Some([1200.0, 800.0]),
+            window_position: Some([120.0, 40.0]),
+            window_maximized: true,
+            ..Settings::default()
+        };
+        assert_eq!(stored.restored_window_size(), None);
+        assert_eq!(stored.restored_window_position(), None);
+        assert!(!stored.restored_maximized());
+
+        let restoring = Settings {
+            save_terminal_size: true,
+            save_window_position: true,
+            ..stored.clone()
+        };
+        assert_eq!(restoring.restored_window_size(), Some([1200.0, 800.0]));
+        assert_eq!(restoring.restored_window_position(), Some([120.0, 40.0]));
+        assert!(restoring.restored_maximized());
+
+        // Switched on before anything has been recorded: the caller opens at
+        // the default geometry rather than at nothing.
+        let first_run = Settings {
+            save_terminal_size: true,
+            save_window_position: true,
+            ..Settings::default()
+        };
+        assert_eq!(first_run.restored_window_size(), None);
+        assert_eq!(first_run.restored_window_position(), None);
+    }
+
+    /// `toml` refuses to serialise a `None`, so the geometry fields have to be
+    /// skipped rather than written - which the whole settings file depends on,
+    /// since they are `None` until a window has been closed once.
+    #[test]
+    fn window_geometry_survives_the_settings_file() {
+        let text = toml::to_string_pretty(&Settings::default()).expect("serialise defaults");
+        assert!(!text.contains("window_size"), "unexpected form: {text}");
+
+        let saved = Settings {
+            save_terminal_size: true,
+            window_size: Some([1024.5, 640.0]),
+            window_position: Some([-8.0, 300.0]),
+            ..Settings::default()
+        };
+        let back: Settings =
+            toml::from_str(&toml::to_string_pretty(&saved).expect("serialise")).expect("parse");
+        assert_eq!(back.window_size, Some([1024.5, 640.0]));
+        assert_eq!(back.window_position, Some([-8.0, 300.0]));
+        assert!(back.save_terminal_size);
+        assert!(!back.save_window_position);
+    }
+
+    /// Every settings file on disk predates the window geometry, so its absence
+    /// has to mean the default geometry and a centred window.
+    #[test]
+    fn an_old_settings_file_opens_at_the_default_geometry() {
+        let settings: Settings = toml::from_str("theme = \"Tokyo\"").expect("parse");
+        assert!(!settings.save_terminal_size);
+        assert!(!settings.save_window_position);
+        assert_eq!(settings.window_size, None);
+        assert_eq!(settings.window_position, None);
+        assert!(!settings.window_maximized);
     }
 
     #[test]

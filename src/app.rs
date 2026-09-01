@@ -29,6 +29,33 @@ use crate::ui::{fonts, input, shortcut};
 const FALLBACK_COLS: u16 = 80;
 const FALLBACK_ROWS: u16 = 24;
 
+/// How many frames the opening size may take to settle. A correction normally
+/// lands on the first one; the budget is there so a window manager that refuses
+/// the size it is asked for cannot leave the app resizing itself forever.
+const FIT_ATTEMPTS: u8 = 8;
+
+/// A window that has yet to be sized to the terminal geometry it was asked to
+/// open at.
+///
+/// The size in the settings file is a character geometry, not a pixel one, and
+/// the pixels it works out to depend on the font egui ends up with and on how
+/// tall the panels above the terminal are laid out. Neither is known before the
+/// first frame, so the window opens at an estimate and is corrected here once
+/// there is a measurement to correct it with.
+struct WindowFit {
+    cols: u16,
+    rows: u16,
+    /// Frames left to get there.
+    attempts: u8,
+    /// Whether the window is being centred rather than opened at a saved
+    /// position. Resizing anchors the top-left corner, which would walk a
+    /// centred window off-centre, so its centre is held instead.
+    recentre: bool,
+    /// The centre to hold, taken from the first frame that had a window rect to
+    /// take it from.
+    centre: Option<egui::Pos2>,
+}
+
 /// Takes one key press out of this frame's events, matching the modifiers
 /// exactly, and reports whether it was there.
 ///
@@ -391,6 +418,15 @@ pub struct App {
     /// Set once the user has said to close anyway, so the confirmation cannot
     /// cancel the very close it just approved.
     close_confirmed: bool,
+    /// The opening size still to be applied, while there is one.
+    fit: Option<WindowFit>,
+    /// Window geometry as last seen by [`App::track_window_geometry`], which is
+    /// what gets written back on exit for the next launch to open at. Kept
+    /// frame by frame because a window that is closing no longer has a rect to
+    /// ask for.
+    window_size: Option<[f32; 2]>,
+    window_position: Option<[f32; 2]>,
+    window_maximized: bool,
 }
 
 impl App {
@@ -431,6 +467,18 @@ impl App {
                 ..Profile::default()
             });
 
+        // Nothing to fit when a saved pixel size is being restored: that size
+        // already produces the geometry it was recorded at. A window opening
+        // maximized has no say in its size either.
+        let fit = (settings.restored_window_size().is_none() && !settings.restored_maximized())
+            .then(|| WindowFit {
+                cols: config::DEFAULT_TERMINAL_COLS,
+                rows: config::DEFAULT_TERMINAL_ROWS,
+                attempts: FIT_ATTEMPTS,
+                recentre: settings.restored_window_position().is_none(),
+                centre: None,
+            });
+
         let mut app = App {
             new_tab_profile: default_profile,
             macro_groups: load_macros(&settings).groups,
@@ -455,6 +503,10 @@ impl App {
             renaming: None,
             confirm_close: false,
             close_confirmed: false,
+            fit,
+            window_size: None,
+            window_position: None,
+            window_maximized: false,
         };
 
         App::apply_style(&cc.egui_ctx, &app.theme(), &app.settings);
@@ -840,6 +892,116 @@ impl App {
             self.open_new_tab();
         }
         action
+    }
+
+    /// Notes where the window is and how big it is, so that the values are at
+    /// hand when the app exits and the window has already gone.
+    ///
+    /// A minimized window is skipped rather than recorded: Windows parks one
+    /// off-screen at a nonsense position, and reopening there would put the app
+    /// somewhere the user cannot reach it. A maximized one keeps whatever
+    /// restored geometry was recorded before it was maximized, which is exactly
+    /// what its own restore button would give back.
+    fn track_window_geometry(&mut self, ctx: &Context) {
+        ctx.input(|i| {
+            let viewport = i.viewport();
+            if viewport.minimized.unwrap_or(false) {
+                return;
+            }
+            self.window_maximized = viewport.maximized.unwrap_or(false);
+            if self.window_maximized || viewport.fullscreen.unwrap_or(false) {
+                return;
+            }
+            if let Some(rect) = viewport.inner_rect {
+                if rect.width() >= 1.0 && rect.height() >= 1.0 {
+                    self.window_size = Some([rect.width(), rect.height()]);
+                }
+            }
+            if let Some(rect) = viewport.outer_rect {
+                // The off-screen parking spot again, for the platforms that do
+                // not report `minimized` at all.
+                if rect.min.x.is_finite() && rect.min.y.is_finite() && rect.min.x > -30_000.0 {
+                    self.window_position = Some([rect.min.x, rect.min.y]);
+                }
+            }
+        });
+    }
+
+    /// Writes the geometry back to the settings file, for whichever of the two
+    /// switches is on. Called as the app exits.
+    fn persist_window_geometry(&mut self) {
+        let mut changed = false;
+        if self.settings.save_terminal_size {
+            if self.window_size.is_some() && self.settings.window_size != self.window_size {
+                self.settings.window_size = self.window_size;
+                changed = true;
+            }
+            if self.settings.window_maximized != self.window_maximized {
+                self.settings.window_maximized = self.window_maximized;
+                changed = true;
+            }
+        }
+        if self.settings.save_window_position
+            && self.window_position.is_some()
+            && self.settings.window_position != self.window_position
+        {
+            self.settings.window_position = self.window_position;
+            changed = true;
+        }
+        if changed {
+            if let Err(e) = self.settings.save() {
+                log::warn!("could not save the window geometry: {e}");
+            }
+        }
+    }
+
+    /// Nudges the window until the terminal measures exactly the geometry it
+    /// was asked to open at, then stops touching it for the rest of the run.
+    ///
+    /// `view_cols` and `view_rows` are what the last frame actually drew, so
+    /// the difference from the target converts straight into points through
+    /// `cell`. The half point of slack is there because the view floors the
+    /// space it is given: a window one rounding error short of the target would
+    /// otherwise come out a column narrower.
+    fn fit_window(&mut self, ctx: &Context, view_cols: usize, view_rows: usize, cell: egui::Vec2) {
+        let Some(fit) = self.fit.as_mut() else {
+            return;
+        };
+        let target = (fit.cols as usize, fit.rows as usize);
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if maximized || fit.attempts == 0 || (view_cols, view_rows) == target {
+            let (want_cols, want_rows) = target;
+            log::debug!(
+                "window opened at {view_cols}x{view_rows} characters, asked for {want_cols}x{want_rows}"
+            );
+            self.fit = None;
+            return;
+        }
+        let Some(inner) = ctx.input(|i| i.viewport().inner_rect) else {
+            return;
+        };
+        if fit.recentre && fit.centre.is_none() {
+            fit.centre = ctx.input(|i| i.viewport().outer_rect).map(|r| r.center());
+        }
+        fit.attempts -= 1;
+
+        let size = fitted_inner_size(inner.size(), (view_cols, view_rows), target, cell);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        if let Some(centre) = fit.centre {
+            // The position is the frame's, the size asked for is the content's,
+            // so a system title bar has to be added back before the two can be
+            // put on top of each other. Zero with the app's own chrome.
+            let border = ctx
+                .input(|i| i.viewport().outer_rect)
+                .map(|outer| outer.size() - inner.size())
+                .unwrap_or_default();
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                centre - (size + border) / 2.0,
+            ));
+        }
+        // The measurement that says whether this worked only exists on the next
+        // frame, and an idle terminal has no other reason to draw one.
+        ctx.request_repaint();
     }
 
     /// Whether closing should stop and ask first.
@@ -1303,10 +1465,34 @@ fn load_macros(settings: &Settings) -> macros::LoadReport {
     macros::load_all(settings.org_macros(), &personal)
 }
 
+/// Inner window size that turns a terminal of `view` characters into one of
+/// `target` characters.
+///
+/// Only the difference is worked out, so everything around the terminal - the
+/// menu bar, the tab strip, the scrollbar it reserves - drops out of the sum
+/// without having to be known. The half point of slack covers the view flooring
+/// the space it is given: a window a rounding error short of a whole column
+/// would otherwise come out one column narrower than asked for.
+fn fitted_inner_size(
+    inner: egui::Vec2,
+    view: (usize, usize),
+    target: (usize, usize),
+    cell: egui::Vec2,
+) -> egui::Vec2 {
+    egui::Vec2::new(
+        inner.x + (target.0 as f32 - view.0 as f32) * cell.x + 0.5,
+        inner.y + (target.1 as f32 - view.1 as f32) * cell.y + 0.5,
+    )
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         let theme = self.theme();
         let mut requests: Vec<UiRequest> = Vec::new();
+        // What the terminal measured this frame, filled in once it has drawn.
+        let mut fit: Option<(usize, usize, egui::Vec2)> = None;
+
+        self.track_window_geometry(ctx);
 
         for tab in &mut self.tabs {
             tab.pump(&mut self.plugins);
@@ -1448,6 +1634,7 @@ impl eframe::App for App {
                 // that width until it was next looked at.
                 self.terminal_size = (result.cols as u16, result.rows as u16);
                 self.view_size = (result.view_cols, result.view_rows);
+                fit = Some((result.view_cols, result.view_rows, result.cell));
                 for tab in &mut self.tabs {
                     tab.resize(result.cols, result.rows);
                 }
@@ -1621,6 +1808,10 @@ impl eframe::App for App {
             self.handle_request(ctx, request);
         }
 
+        if let Some((view_cols, view_rows, cell)) = fit {
+            self.fit_window(ctx, view_cols, view_rows, cell);
+        }
+
         // A live session can produce output at any moment, so keep animating
         // while any tab is connected. A blinking cursor needs the same, because
         // an idle prompt gives the frame no other reason to be redrawn.
@@ -1639,6 +1830,7 @@ impl eframe::App for App {
                 let _ = log.flush();
             }
         }
+        self.persist_window_geometry();
     }
 }
 
@@ -1673,4 +1865,59 @@ pub fn discover_instances() -> Vec<String> {
         .into_iter()
         .map(|i| i.name)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window is corrected from a measurement, so the check that matters is
+    /// that measuring the corrected window gives the geometry that was asked
+    /// for - in one step, at any font size and whatever the chrome around the
+    /// terminal happens to take up.
+    #[test]
+    fn one_correction_lands_on_the_geometry_that_was_asked_for() {
+        let target = (
+            config::DEFAULT_TERMINAL_COLS as usize,
+            config::DEFAULT_TERMINAL_ROWS as usize,
+        );
+
+        for cell in [
+            egui::Vec2::new(8.0, 16.0),
+            egui::Vec2::new(9.0, 21.0),
+            egui::Vec2::new(13.0, 30.0),
+        ] {
+            for chrome in [egui::Vec2::new(24.0, 78.0), egui::Vec2::new(12.0, 61.0)] {
+                for inner in [
+                    egui::Vec2::new(1000.0, 640.0),
+                    egui::Vec2::new(400.0, 240.0),
+                    egui::Vec2::new(1913.0, 1027.0),
+                ] {
+                    // What `terminal_view::show` would measure in that window.
+                    let measure = |inner: egui::Vec2| {
+                        (
+                            (((inner.x - chrome.x) / cell.x).floor() as usize).max(1),
+                            (((inner.y - chrome.y) / cell.y).floor() as usize).max(1),
+                        )
+                    };
+
+                    let fitted = fitted_inner_size(inner, measure(inner), target, cell);
+                    assert_eq!(
+                        measure(fitted),
+                        target,
+                        "cell {cell:?}, chrome {chrome:?}, from {inner:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A window already at the right size is left exactly where it is, so the
+    /// fit cannot drift the window it was meant to leave alone.
+    #[test]
+    fn a_window_that_already_fits_is_not_moved() {
+        let inner = egui::Vec2::new(1000.0, 640.0);
+        let size = fitted_inner_size(inner, (100, 30), (100, 30), egui::Vec2::new(8.0, 16.0));
+        assert!((size.x - inner.x).abs() <= 0.5 && (size.y - inner.y).abs() <= 0.5);
+    }
 }
