@@ -1,6 +1,7 @@
 //! Settings, profiles, and where they live on each platform.
 
 pub mod profile;
+pub mod servers;
 pub mod theme;
 
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub use profile::{LogMode, Profile};
+pub use servers::{Server, ServerList};
 pub use theme::{Theme, ThemeFile};
 
 /// Config root. `dirs` resolves this to `%APPDATA%`, `~/.config`, or

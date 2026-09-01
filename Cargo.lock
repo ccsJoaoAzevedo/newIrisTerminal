@@ -2719,6 +2719,7 @@ dependencies = [
  "toml 0.8.23",
  "vte",
  "wasmtime",
+ "winreg",
  "winres",
 ]
 

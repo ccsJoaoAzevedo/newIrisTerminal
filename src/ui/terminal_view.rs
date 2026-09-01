@@ -123,6 +123,21 @@ impl Selection {
         }
     }
 
+    /// The selection covering every cell from `anchor` to `at`, both ends
+    /// included, however the drag ran. The stored range stays half-open, so
+    /// the cell the pointer is on is the one *past* the end column.
+    fn over(anchor: (usize, usize), at: (usize, usize)) -> Self {
+        let (first, last) = if anchor <= at {
+            (anchor, at)
+        } else {
+            (at, anchor)
+        };
+        Selection {
+            start: first,
+            end: (last.0, last.1 + 1),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         let (start, end) = self.ordered();
         start == end
@@ -137,7 +152,9 @@ pub struct ViewState {
     /// per tab so scrolling sideways in one does not move another.
     pub h_offset: usize,
     pub selection: Option<Selection>,
-    dragging: bool,
+    /// Cell the current drag started on, kept because the selection itself is
+    /// normalised and so forgets which end the pointer left behind.
+    drag_anchor: Option<(usize, usize)>,
 }
 
 impl ViewState {
@@ -223,6 +240,25 @@ pub fn cell_size(ui: &Ui, font: &FontId) -> Vec2 {
 #[inline]
 pub fn glyph_x(left: f32, col: usize, cell: Vec2) -> f32 {
     left + col as f32 * cell.x
+}
+
+/// The column boundary nearest to `x`, in view columns from `left`.
+///
+/// What a cursor works in: it sits in the gap *between* two characters, so
+/// clicking on the right half of one puts it after that one, the way a click
+/// lands in any other text field.
+fn boundary_at(x: f32, left: f32, cell_x: f32, view_cols: usize) -> usize {
+    (((x - left) / cell_x).round().max(0.0) as usize).min(view_cols)
+}
+
+/// The column the pointer is over, in view columns from `left`.
+///
+/// What a drag works in: pressing anywhere on a character takes that whole
+/// character, so the anchor is the cell itself and not the nearest gap between
+/// two of them. Rounding here instead is what made a selection only reach a
+/// character once the pointer was past its middle.
+fn column_at(x: f32, left: f32, cell_x: f32, view_cols: usize) -> usize {
+    (((x - left) / cell_x).floor().max(0.0) as usize).min(view_cols.saturating_sub(1))
 }
 
 /// The font the terminal draws with.
@@ -982,17 +1018,27 @@ fn handle_mouse(
     // Screen position to grid coordinates, through the display layout: a
     // display row is not a line any more once a line can wrap over several of
     // them, so a selection dragged over a wrapped line has to resolve to the
-    // columns it actually covers.
-    let pos_to_cell = |pos: Pos2| -> (usize, usize) {
-        let offset =
-            (((pos.x - rect.left()) / cell.x).floor().max(0.0) as usize).min(mode.view_cols);
+    // columns it actually covers. `offset` is a column of the display row,
+    // which the segment turns into a line and a grid column.
+    let resolve = |pos: Pos2, offset: usize, last: usize| -> (usize, usize) {
         let row = ((pos.y - rect.top()) / cell.y).floor().max(0.0) as usize;
 
         match segments.get(row.min(segments.len().saturating_sub(1))) {
-            Some(segment) => (segment.line, (segment.start + offset).min(grid.cols)),
+            Some(segment) => (segment.line, (segment.start + offset).min(last)),
             // Nothing laid out at all, which means an empty grid.
-            None => (top_line, (mode.offset + offset).min(grid.cols)),
+            None => (top_line, (mode.offset + offset).min(last)),
         }
+    };
+    // The cell under the pointer, for dragging out a selection.
+    let pos_to_cell = |pos: Pos2| -> (usize, usize) {
+        let offset = column_at(pos.x, rect.left(), cell.x, mode.view_cols);
+        resolve(pos, offset, grid.cols.saturating_sub(1))
+    };
+    // The gap between cells nearest the pointer, for putting a cursor there:
+    // clicking the right half of a character means after it, as anywhere else.
+    let pos_to_boundary = |pos: Pos2| -> (usize, usize) {
+        let offset = boundary_at(pos.x, rect.left(), cell.x, mode.view_cols);
+        resolve(pos, offset, grid.cols)
     };
 
     // A plain click clears the selection. This cannot be folded into the
@@ -1008,33 +1054,32 @@ fn handle_mouse(
         if let (Some(line), Some(pos)) = (lineedit::current(grid), response.interact_pointer_pos())
         {
             let cursor_line = grid.scrollback.len() + grid.cursor.row;
-            let (clicked_line, col) = pos_to_cell(pos);
+            let (clicked_line, col) = pos_to_boundary(pos);
             if clicked_line == cursor_line && (line.start..=line.end).contains(&col) {
                 outcome.cursor_move = Some(col as i64 - line.cursor as i64);
             }
         }
     }
 
+    // A drag takes every cell from the one it started on to the one under the
+    // pointer, both of them included. The anchor cell is kept as it was
+    // pressed: reading it back off the selection would lose it, since the
+    // selection is stored in reading order whichever way the drag ran.
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
             let at = pos_to_cell(pos);
-            state.selection = Some(Selection { start: at, end: at });
-            state.dragging = true;
+            state.drag_anchor = Some(at);
+            state.selection = Some(Selection::over(at, at));
         }
-    } else if response.dragged() && state.dragging {
-        if let Some(pos) = response.interact_pointer_pos() {
-            if let Some(selection) = state.selection.as_mut() {
-                selection.end = pos_to_cell(pos);
-            }
+    } else if response.dragged() {
+        if let (Some(pos), Some(anchor)) = (response.interact_pointer_pos(), state.drag_anchor) {
+            state.selection = Some(Selection::over(anchor, pos_to_cell(pos)));
         }
     } else if response.drag_stopped() {
-        state.dragging = false;
-        // A click without movement clears rather than leaving an empty
-        // selection, which would otherwise keep stealing Ctrl+C.
-        let empty = state.selection.map(|s| s.is_empty()).unwrap_or(true);
-        if empty {
-            state.selection = None;
-        } else if copy_on_select {
+        state.drag_anchor = None;
+        // Never empty: a drag always holds at least the character it started
+        // on. A press that never moved is a click, and is cleared above.
+        if copy_on_select && state.selection.is_some() {
             outcome.copy_selection = true;
         }
     }
@@ -1061,6 +1106,49 @@ mod tests {
         };
         assert_eq!(across_lines.span_on(7), None);
         assert_eq!(across_lines.span_on(6), None);
+    }
+
+    /// A drag takes whole characters: anywhere on a character is that
+    /// character, with no half-way point to reach first, and the two ends of
+    /// the drag are both inside the selection whichever way round it was made.
+    #[test]
+    fn a_drag_takes_every_character_it_touches() {
+        let (left, w, cols) = (4.0, 10.0, 80);
+        let at = |x: f32| column_at(x, left, w, cols);
+
+        // Every pixel of cell 3 is cell 3, from its left edge to its last.
+        assert_eq!(at(left + 30.0), 3);
+        assert_eq!(at(left + 35.0), 3);
+        assert_eq!(at(left + 39.9), 3);
+        assert_eq!(at(left + 40.0), 4);
+
+        // Pressing on cell 3 and letting go on cell 5 takes 3, 4 and 5 — the
+        // same three either way round.
+        let forwards = Selection::over((7, at(left + 31.0)), (7, at(left + 55.0)));
+        let backwards = Selection::over((7, at(left + 55.0)), (7, at(left + 31.0)));
+        assert_eq!(forwards.span_on(7), Some((3, 6)));
+        assert_eq!(backwards.span_on(7), forwards.span_on(7));
+
+        // A drag that never leaves the cell it started on still holds it.
+        assert_eq!(Selection::over((7, 3), (7, 3)).span_on(7), Some((3, 4)));
+
+        // Off the left edge clamps to the first column, and past the right to
+        // the last one rather than running off the grid.
+        assert_eq!(at(left - 200.0), 0);
+        assert_eq!(at(left + 10_000.0), cols - 1);
+    }
+
+    /// The cursor goes between characters, not on one, so a click on the right
+    /// half of a character puts it after that character.
+    #[test]
+    fn a_click_puts_the_cursor_at_the_nearest_gap() {
+        let (left, w, cols) = (4.0, 10.0, 80);
+        let at = |x: f32| boundary_at(x, left, w, cols);
+
+        assert_eq!(at(left + 31.0), 3);
+        assert_eq!(at(left + 36.0), 4);
+        assert_eq!(at(left - 200.0), 0);
+        assert_eq!(at(left + 10_000.0), cols);
     }
 
     /// Dragging right-to-left is the same selection as dragging left-to-right.

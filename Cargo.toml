@@ -40,6 +40,11 @@ plugins = ["dep:wasmtime"]
 version = "23"
 optional = true
 
+# Reading the InterSystems launcher's server list, which lives in the registry.
+# Already in the dependency tree via portable-pty, so this adds no download.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.10"
+
 [build-dependencies]
 winres = "0.1"
 

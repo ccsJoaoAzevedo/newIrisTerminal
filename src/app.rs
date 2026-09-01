@@ -11,7 +11,7 @@ use crate::features::logging::{self, SessionLog};
 use crate::features::macros::{self, MacroGroup};
 use crate::plugins::PluginHost;
 use crate::pty::launcher::launcher;
-use crate::pty::PtySession;
+use crate::pty::Session;
 use crate::term::{lineedit, Grid, Motion};
 use crate::ui::chrome::{self, WindowAction};
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
@@ -76,7 +76,7 @@ pub struct Tab {
     /// widget keeps one identity even as tabs are opened, closed and reordered.
     pub uid: u64,
     pub profile: Profile,
-    pub session: Option<PtySession>,
+    pub session: Option<Session>,
     pub grid: Grid,
     pub parser: vte::Parser,
     pub view: ViewState,
@@ -128,13 +128,23 @@ impl Tab {
 
         let cols = self.grid.cols as u16;
         let rows = self.grid.rows as u16;
-        let launcher = launcher();
 
-        match PtySession::spawn(launcher.as_ref(), &self.profile.launch_spec(), cols, rows) {
+        // A remote server has no process here to start: it is reached by
+        // logging in to its Telnet service, the same way the launcher's own
+        // Terminal reaches it. Everything above this point is identical.
+        let opened = match self.profile.remote.as_ref() {
+            Some(remote) => Session::telnet(&remote.address, remote.port, cols, rows),
+            None => {
+                let launcher = launcher();
+                Session::local(launcher.as_ref(), &self.profile.launch_spec(), cols, rows)
+            }
+        };
+
+        match opened {
             Ok(session) => {
                 self.session = Some(session);
-                let instance = self.profile.instance.clone();
-                self.note(&format!("session started ({instance})"));
+                let endpoint = self.profile.endpoint();
+                self.note(&format!("session started ({endpoint})"));
             }
             Err(e) => {
                 // Surface the failure in the tab rather than a popup — the user
@@ -339,6 +349,11 @@ pub struct App {
     pub active: usize,
     /// Instances found on this machine, for the new-tab dialog.
     pub instances: Vec<String>,
+    /// Servers the InterSystems launcher knows about, and which one it treats
+    /// as preferred. Read once at startup: the Server Manager is a separate
+    /// program, and a list that changed under the app mid-session would only
+    /// ever surprise the user. Restarting picks up an edit.
+    pub servers: crate::config::ServerList,
     pub macro_groups: Vec<MacroGroup>,
     /// Commands typed at an IRIS prompt, shared by every tab so a new one opens
     /// knowing what was run in the last.
@@ -393,20 +408,31 @@ impl App {
             .map(|i| i.name)
             .collect::<Vec<_>>();
 
+        // The launcher's own list, so the servers offered here are the ones the
+        // rest of the toolchain already has configured.
+        let servers = crate::config::servers::discover();
+
         let plugins = if settings.enable_plugins {
             PluginHost::load_from(&config::plugins_dir())
         } else {
             PluginHost::disabled()
         };
 
+        // What a new tab connects to, in order of how deliberate the choice
+        // was: a startup profile the user configured here, then whatever the
+        // launcher's tray menu is set to open, then whatever instance was found
+        // first.
+        let default_profile = settings
+            .startup_profile()
+            .cloned()
+            .or_else(|| preferred_profile(&servers, &instances))
+            .unwrap_or_else(|| Profile {
+                instance: instances.first().cloned().unwrap_or_default(),
+                ..Profile::default()
+            });
+
         let mut app = App {
-            new_tab_profile: settings
-                .startup_profile()
-                .cloned()
-                .unwrap_or_else(|| Profile {
-                    instance: instances.first().cloned().unwrap_or_default(),
-                    ..Profile::default()
-                }),
+            new_tab_profile: default_profile,
             macro_groups: load_macros(&settings).groups,
             history: History::load(
                 &config::command_history_path(),
@@ -417,6 +443,7 @@ impl App {
             tabs: Vec::new(),
             active: 0,
             instances,
+            servers,
             plugins,
             panels: PanelState::default(),
             focused_tab: None,
@@ -687,24 +714,61 @@ impl App {
         let mut action = None;
         // Opening a tab has to happen after the closure: it borrows `self`
         // mutably, and the bar is already holding it.
-        let mut open = false;
+        let mut open_default = false;
         let mut pick: Option<Profile> = None;
         ui.horizontal(|ui| {
-            let instance = if self.new_tab_profile.instance.is_empty() {
-                "no instance configured".to_string()
-            } else {
-                self.new_tab_profile.instance.clone()
-            };
+            let endpoint = self.new_tab_profile.endpoint();
             let new_tab = ui.button("+").on_hover_text(format!(
-                "New session on {instance} (Ctrl+T).\nRight-click to connect somewhere else."
+                "New session on {endpoint} (Ctrl+T).\nRight-click to connect somewhere else."
             ));
             if new_tab.clicked() {
-                open = true;
+                open_default = true;
             }
             // The escape hatch that replaces the dialog: everything it used to
             // offer - the profiles and the instances found on this machine -
             // one click away instead of in front of every new session.
             new_tab.context_menu(|ui| {
+                // The launcher's servers first: they are the whole reason this
+                // menu is worth opening, and the preferred one is already what
+                // the button does.
+                if !self.servers.is_empty() {
+                    ui.weak("IRIS servers");
+                    let preferred = self.new_tab_profile.name.clone();
+                    for server in self.servers.others(Some(&preferred)) {
+                        let mut button = ui.button(server.menu_label());
+                        // What the entry actually does, since a local server
+                        // opens an instance and a remote one asks for a login.
+                        let hint = match server.target(&self.instances) {
+                            crate::config::servers::Target::Local { instance } => {
+                                format!("Local session on instance {instance}")
+                            }
+                            crate::config::servers::Target::Telnet { address, port } => {
+                                format!("Telnet login to {address}:{port}")
+                            }
+                        };
+                        let hint = if server.comment.trim().is_empty() {
+                            hint
+                        } else {
+                            format!("{hint}\n{}", server.comment.trim())
+                        };
+                        button = button.on_hover_text(hint);
+                        if button.clicked() {
+                            pick = Some(Profile::for_server(
+                                server,
+                                &self.instances,
+                                &self.new_tab_profile,
+                            ));
+                            ui.close_menu();
+                        }
+                    }
+                    let loose_instances = self
+                        .instances
+                        .iter()
+                        .any(|name| !self.servers.covers_instance(&self.instances, name));
+                    if !self.settings.profiles.is_empty() || loose_instances {
+                        ui.separator();
+                    }
+                }
                 for profile in &self.settings.profiles {
                     let label = if profile.instance.is_empty() {
                         profile.name.clone()
@@ -720,16 +784,30 @@ impl App {
                     ui.separator();
                 }
                 for name in &self.instances {
+                    // Skipped when a server entry already opens it: the same
+                    // session under two names is not a choice.
+                    if self.servers.covers_instance(&self.instances, name) {
+                        continue;
+                    }
                     if ui.button(name).clicked() {
-                        pick = Some(Profile {
-                            instance: name.clone(),
-                            ..self.new_tab_profile.clone()
-                        });
+                        // Built through the same path as a server, which is what
+                        // guarantees a local instance opens locally. Inheriting
+                        // the current profile wholesale used to carry its
+                        // `remote` across, so picking the instance `CONSISTEM`
+                        // while a Telnet tab was current opened Telnet again.
+                        pick = Some(Profile::for_server(
+                            &crate::config::servers::Server::for_instance(name),
+                            &self.instances,
+                            &self.new_tab_profile,
+                        ));
                         ui.close_menu();
                     }
                 }
-                if self.settings.profiles.is_empty() && self.instances.is_empty() {
-                    ui.weak("No profiles or instances found.");
+                if self.settings.profiles.is_empty()
+                    && self.instances.is_empty()
+                    && self.servers.is_empty()
+                {
+                    ui.weak("No servers, profiles or instances found.");
                 }
             });
             ui.separator();
@@ -742,7 +820,7 @@ impl App {
             ui.separator();
             if let Some(tab) = self.active_tab() {
                 let (cols, rows) = self.view_size;
-                ui.weak(format!("{}  {cols}x{rows}", tab.profile.instance));
+                ui.weak(format!("{}  {cols}x{rows}", tab.profile.endpoint()));
             }
 
             // Last, so the leftover space it claims for dragging is whatever
@@ -752,11 +830,13 @@ impl App {
             }
         });
 
+        // A pick opens that session and leaves the default alone. Making the
+        // choice stick was worse than it sounds: after one Telnet server, the
+        // plain "+" kept reconnecting to it, and there was no longer any way to
+        // get back to the preferred server except through the menu.
         if let Some(profile) = pick {
-            self.new_tab_profile = profile;
-            open = true;
-        }
-        if open {
+            self.open_tab(profile);
+        } else if open_default {
             self.open_new_tab();
         }
         action
@@ -1558,6 +1638,30 @@ impl eframe::App for App {
                 let _ = log.write_note("application closed");
                 let _ = log.flush();
             }
+        }
+    }
+}
+
+/// The profile for whatever the launcher's tray menu is set to open.
+///
+/// Named for the target rather than built from it directly, because the tray's
+/// "Este Servidor" entry names an instance and the other entries name servers;
+/// [`crate::config::servers::preferred_target`] is what tells the two apart.
+fn preferred_profile(servers: &crate::config::ServerList, instances: &[String]) -> Option<Profile> {
+    use crate::config::servers::{Server, Target};
+    let base = Profile::default();
+    match crate::config::servers::preferred_target(servers, instances)? {
+        Target::Local { instance } => Some(Profile::for_server(
+            &Server::for_instance(&instance),
+            instances,
+            &base,
+        )),
+        Target::Telnet { .. } => {
+            // The entry itself carries the address, the port and the name the
+            // tab should show, so the server is looked up rather than rebuilt
+            // from the bare target.
+            let server = servers.preferred()?;
+            Some(Profile::for_server(server, instances, &base))
         }
     }
 }

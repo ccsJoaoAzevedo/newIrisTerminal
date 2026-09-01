@@ -15,6 +15,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use portable_pty::{Child, MasterPty, PtySize};
 
 use super::launcher::{IrisLauncher, LaunchSpec};
+use super::telnet::TelnetSession;
 
 /// What the reader thread reports back to the UI.
 pub enum SessionEvent {
@@ -92,23 +93,11 @@ impl PtySession {
     /// Non-blocking drain of everything the child has produced since the last
     /// call. Returns the concatenated bytes and whether the session ended.
     pub fn drain(&mut self) -> (Vec<u8>, bool) {
-        let mut bytes = Vec::new();
-        let mut ended = false;
-        loop {
-            match self.events.try_recv() {
-                Ok(SessionEvent::Output(chunk)) => bytes.extend_from_slice(&chunk),
-                Ok(SessionEvent::Closed) => {
-                    ended = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    ended = true;
-                    break;
-                }
-            }
-        }
-        (bytes, ended)
+        drain_events(&self.events)
+    }
+
+    pub fn events(&self) -> &Receiver<SessionEvent> {
+        &self.events
     }
 
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
@@ -181,6 +170,117 @@ impl Drop for PtySession {
         if matches!(self.child.try_wait(), Ok(None)) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+    }
+}
+
+/// Non-blocking drain shared by both transports: the reader threads differ,
+/// the channel they push into does not.
+fn drain_events(events: &Receiver<SessionEvent>) -> (Vec<u8>, bool) {
+    let mut bytes = Vec::new();
+    let mut ended = false;
+    loop {
+        match events.try_recv() {
+            Ok(SessionEvent::Output(chunk)) => bytes.extend_from_slice(&chunk),
+            Ok(SessionEvent::Closed) => {
+                ended = true;
+                break;
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                ended = true;
+                break;
+            }
+        }
+    }
+    (bytes, ended)
+}
+
+/// One session, whichever way it is reached.
+///
+/// A local instance is a child process on a pseudo-terminal; a remote server
+/// from the launcher's Server Manager is a Telnet login (see
+/// [`crate::pty::telnet`]). The two have nothing in common below this point and
+/// everything in common above it — the grid, the parser, autologon, logging and
+/// the renderer never ask which one they are attached to.
+pub enum Session {
+    Pty(PtySession),
+    Telnet(TelnetSession),
+}
+
+impl Session {
+    /// Opens a local session on an instance.
+    pub fn local(
+        launcher: &dyn IrisLauncher,
+        spec: &LaunchSpec,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
+        PtySession::spawn(launcher, spec, cols, rows).map(Session::Pty)
+    }
+
+    /// Opens a session on a remote server over Telnet.
+    pub fn telnet(address: &str, port: u16, cols: u16, rows: u16) -> Result<Self> {
+        TelnetSession::connect(address, port, cols, rows).map(Session::Telnet)
+    }
+
+    pub fn drain(&mut self) -> (Vec<u8>, bool) {
+        match self {
+            Session::Pty(s) => drain_events(s.events()),
+            Session::Telnet(s) => drain_events(s.events()),
+        }
+    }
+
+    pub fn write(&self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Session::Pty(s) => s.write(bytes),
+            Session::Telnet(s) => s.write(bytes),
+        }
+    }
+
+    pub fn write_str(&self, text: &str) -> Result<()> {
+        self.write(text.as_bytes())
+    }
+
+    /// Sends a line the way pressing Enter would: IRIS expects CR, never LF,
+    /// regardless of the host operating system or the transport.
+    pub fn write_line(&self, text: &str) -> Result<()> {
+        self.write(text.as_bytes())?;
+        self.write(b"\r")
+    }
+
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        match self {
+            Session::Pty(s) => s.resize(cols, rows),
+            Session::Telnet(s) => s.resize(cols, rows),
+        }
+    }
+
+    pub fn size(&self) -> (u16, u16) {
+        match self {
+            Session::Pty(s) => s.size(),
+            Session::Telnet(s) => s.size(),
+        }
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        match self {
+            Session::Pty(s) => s.is_alive(),
+            Session::Telnet(s) => s.is_alive(),
+        }
+    }
+
+    pub fn request_halt(&self) {
+        match self {
+            Session::Pty(s) => s.request_halt(),
+            Session::Telnet(s) => s.request_halt(),
+        }
+    }
+
+    pub fn kill(&mut self) {
+        match self {
+            Session::Pty(s) => s.kill(),
+            Session::Telnet(s) => s.kill(),
         }
     }
 }
