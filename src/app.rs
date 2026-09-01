@@ -207,13 +207,18 @@ impl Tab {
             }
 
             let still_on_password = self.autologon.state() == AutoState::WaitPassword;
-            let lines = self.grid.all_text();
             let settled = self.grid.scrollback.len();
             if let Some(log) = self.log.as_mut() {
                 if !still_on_password {
                     log.unmute();
                 }
-                let _ = log.write_settled(&lines, settled);
+                // Only transcribed once the log says it will read it: this runs
+                // on every chunk of output, and the transcript is a `String`
+                // per line of the whole history.
+                if log.wants_settled() {
+                    let lines = self.grid.all_text();
+                    let _ = log.write_settled(&lines, settled);
+                }
             }
         }
 

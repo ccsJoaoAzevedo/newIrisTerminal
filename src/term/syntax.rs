@@ -292,20 +292,33 @@ fn code_start(chars: &[char]) -> usize {
 /// is a command line for colouring and whether Home, End and Up belong to the
 /// line being typed rather than to IRIS.
 pub fn prompt_end(chars: &[char]) -> Option<usize> {
-    for (i, ch) in chars.iter().enumerate() {
-        if *ch != '>' {
-            continue;
-        }
-        let head = &chars[..i];
+    prompt_end_by(chars.len(), |i| chars[i])
+}
+
+/// The same test over a row of cells, so a caller holding those does not have
+/// to collect them into a `Vec<char>` to ask.
+pub fn prompt_end_of(cells: &[Cell]) -> Option<usize> {
+    prompt_end_by(cells.len(), |i| cells[i].ch)
+}
+
+/// One forward pass: the head must be entirely made of prompt characters and
+/// end on an alphanumeric, both of which can be carried along as it goes.
+///
+/// The first `>` decides the row either way. `>` is not itself a prompt
+/// character, so a head that fails here still contains whatever spoiled it when
+/// a later `>` looks back over the same columns.
+fn prompt_end_by(len: usize, at: impl Fn(usize) -> char) -> Option<usize> {
+    let mut prev_alphanumeric = false;
+    for i in 0..len {
+        let ch = at(i);
         // `USER>`, `%SYS>`, and the `TL1:USER>` a transaction adds.
-        let plausible = !head.is_empty()
-            && head.iter().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, '%' | '^' | '_' | '-' | '.' | ':')
-            })
-            && head.last().is_some_and(|c| c.is_ascii_alphanumeric());
-        if plausible {
-            return Some(i + 1);
+        if ch == '>' {
+            return prev_alphanumeric.then_some(i + 1);
         }
+        if !(ch.is_ascii_alphanumeric() || matches!(ch, '%' | '^' | '_' | '-' | '.' | ':')) {
+            return None;
+        }
+        prev_alphanumeric = ch.is_ascii_alphanumeric();
     }
     None
 }
@@ -418,8 +431,16 @@ fn word_is(word: &[char], list: &[&str]) -> bool {
     if word.is_empty() || word.len() > 9 {
         return false;
     }
-    let lowered: String = word.iter().map(|c| c.to_ascii_lowercase()).collect();
-    list.contains(&lowered.as_str())
+    // Compared char by char rather than by lowercasing into a `String` first:
+    // this runs on every identifier of every row of every frame, and the list
+    // is pure ASCII, so a non-ASCII char simply matches nothing.
+    list.iter().any(|candidate| {
+        candidate.len() == word.len()
+            && candidate
+                .bytes()
+                .zip(word)
+                .all(|(b, c)| char::from(b) == c.to_ascii_lowercase())
+    })
 }
 
 /// Whether a word ending at `end` is being used as a command rather than as

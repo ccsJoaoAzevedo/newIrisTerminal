@@ -148,8 +148,7 @@ fn next_word(chars: &[char], at: usize) -> usize {
 /// The command line the cursor is on, or `None` when it is not on one.
 pub fn current(grid: &Grid) -> Option<LineEdit> {
     let row = grid.screen.get(grid.cursor.row)?;
-    let chars: Vec<char> = row.cells.iter().map(|c| c.ch).collect();
-    let start = syntax::prompt_end(&chars)?;
+    let start = syntax::prompt_end_of(&row.cells)?;
 
     let cursor = grid.cursor.col;
     if cursor < start {
@@ -171,13 +170,14 @@ pub fn current(grid: &Grid) -> Option<LineEdit> {
 pub fn typed_text(grid: &Grid) -> Option<String> {
     let line = current(grid)?;
     let row = grid.screen.get(grid.cursor.row)?;
-    let text: String = row
+    let mut text: String = row
         .cells
         .get(line.start..line.end.min(row.cells.len()))?
         .iter()
         .map(|c| c.ch)
         .collect();
-    Some(text.trim_end().to_string())
+    text.truncate(text.trim_end().len());
+    Some(text)
 }
 
 #[cfg(test)]

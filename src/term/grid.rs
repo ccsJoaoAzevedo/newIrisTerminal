@@ -57,6 +57,22 @@ impl Row {
     fn resize(&mut self, cols: usize) {
         self.cells.resize(cols, Cell::default());
     }
+
+    /// Re-blanks the row in place, reusing its buffer. What `Row::blank` does
+    /// without the allocation, for the rows scrolling recycles.
+    fn reblank(&mut self, pen: &Pen) {
+        self.cells.fill(Cell::blank(pen));
+        self.wrapped = false;
+    }
+
+    /// A copy carrying only the columns in use — the shape a row reaches the
+    /// scrollback in anyway, so the padding is never cloned in the first place.
+    fn trimmed(&self) -> Row {
+        Row {
+            cells: self.cells[..self.used_width()].to_vec(),
+            wrapped: self.wrapped,
+        }
+    }
 }
 
 /// A screen-clear caught in the act.
@@ -320,13 +336,18 @@ impl Grid {
         let full_screen = self.scroll_top == 0 && self.scroll_bottom == self.rows - 1;
         let pen = self.pen;
 
-        for _ in 0..n {
-            let row = self.screen.remove(self.scroll_top);
+        // Rotating the region moves its top `n` rows to the bottom in one
+        // pass, where they are recycled as the blank rows. The alternative -
+        // `remove` plus `insert` per line - shifts the whole screen `n` times
+        // over and allocates a row of cells each time round.
+        self.screen[self.scroll_top..=self.scroll_bottom].rotate_left(n);
+        for index in self.scroll_bottom + 1 - n..=self.scroll_bottom {
             if full_screen {
+                let row = std::mem::replace(&mut self.screen[index], Row::blank(self.cols, &pen));
                 self.push_scrollback(row);
+            } else {
+                self.screen[index].reblank(&pen);
             }
-            self.screen
-                .insert(self.scroll_bottom, Row::blank(self.cols, &pen));
         }
         self.touch();
     }
@@ -334,13 +355,28 @@ impl Grid {
     pub fn scroll_down(&mut self, n: usize) {
         self.cancel_clear();
         let n = n.min(self.scroll_bottom - self.scroll_top + 1);
-        let pen = self.pen;
-        for _ in 0..n {
-            self.screen.remove(self.scroll_bottom);
-            self.screen
-                .insert(self.scroll_top, Row::blank(self.cols, &pen));
-        }
+        self.open_lines_at(self.scroll_top, self.scroll_bottom, n);
         self.touch();
+    }
+
+    /// Pushes `top..=bottom` down by `n`, blanking the rows that opens at the
+    /// top and dropping what falls off the bottom. Shared by SD and IL.
+    fn open_lines_at(&mut self, top: usize, bottom: usize, n: usize) {
+        let pen = self.pen;
+        self.screen[top..=bottom].rotate_right(n);
+        for row in &mut self.screen[top..top + n] {
+            row.reblank(&pen);
+        }
+    }
+
+    /// Pulls `top..=bottom` up by `n`, blanking the rows that opens at the
+    /// bottom. The inner-region half of [`Grid::scroll_up`], shared with DL.
+    fn drop_lines_at(&mut self, top: usize, bottom: usize, n: usize) {
+        let pen = self.pen;
+        self.screen[top..=bottom].rotate_left(n);
+        for row in &mut self.screen[bottom + 1 - n..=bottom] {
+            row.reblank(&pen);
+        }
     }
 
     fn push_scrollback(&mut self, mut row: Row) {
@@ -356,8 +392,9 @@ impl Grid {
         // `resize`, which re-expands it.
         row.cells.truncate(row.used_width());
         self.scrollback.push_back(row);
-        while self.scrollback.len() > self.scrollback_limit {
-            self.scrollback.pop_front();
+        let over = self.scrollback.len().saturating_sub(self.scrollback_limit);
+        if over > 0 {
+            self.scrollback.drain(..over);
         }
     }
 
@@ -507,7 +544,7 @@ impl Grid {
         }
         sweep.at = row;
         if sweep.rows[row].is_none() {
-            sweep.rows[row] = Some(self.screen[row].clone());
+            sweep.rows[row] = Some(self.screen[row].trimmed());
         }
 
         // Reaching the last row ends the sweep. It only counts as a clear if
@@ -554,7 +591,7 @@ impl Grid {
             return;
         };
         for index in 0..=last {
-            let row = self.screen[index].clone();
+            let row = self.screen[index].trimmed();
             self.push_scrollback(row);
         }
     }
@@ -574,9 +611,7 @@ impl Grid {
         self.destroying_row(row);
         let pen = self.pen;
         let to = to.min(self.cols);
-        for c in from..to {
-            self.screen[row].cells[c] = Cell::blank(&pen);
-        }
+        self.screen[row].cells[from..to].fill(Cell::blank(&pen));
         if from == 0 && to == self.cols {
             self.screen[row].wrapped = false;
         }
@@ -594,11 +629,12 @@ impl Grid {
         let pen = self.pen;
         let (row, col) = (self.cursor.row, self.cursor.col);
         let cols = self.cols;
+        let n = n.min(cols - col);
         let cells = &mut self.screen[row].cells;
-        for _ in 0..n.min(cols - col) {
-            cells.insert(col, Cell::blank(&pen));
-            cells.pop();
-        }
+        // Shifting the tail right in one rotate, rather than inserting a blank
+        // and popping the last cell `n` times over.
+        cells[col..].rotate_right(n);
+        cells[col..col + n].fill(Cell::blank(&pen));
         self.touch();
     }
 
@@ -607,11 +643,10 @@ impl Grid {
         let pen = self.pen;
         let (row, col) = (self.cursor.row, self.cursor.col);
         let cols = self.cols;
+        let n = n.min(cols - col);
         let cells = &mut self.screen[row].cells;
-        for _ in 0..n.min(cols - col) {
-            cells.remove(col);
-            cells.push(Cell::blank(&pen));
-        }
+        cells[col..].rotate_left(n);
+        cells[cols - n..].fill(Cell::blank(&pen));
         self.touch();
     }
 
@@ -623,12 +658,8 @@ impl Grid {
         // Row indices are about to shift, and a half-captured sweep is indexed
         // by row.
         self.cancel_clear();
-        let pen = self.pen;
         let row = self.cursor.row;
-        for _ in 0..n.min(self.scroll_bottom - row + 1) {
-            self.screen.remove(self.scroll_bottom);
-            self.screen.insert(row, Row::blank(self.cols, &pen));
-        }
+        self.open_lines_at(row, self.scroll_bottom, n.min(self.scroll_bottom - row + 1));
         self.touch();
     }
 
@@ -638,13 +669,8 @@ impl Grid {
             return;
         }
         self.cancel_clear();
-        let pen = self.pen;
         let row = self.cursor.row;
-        for _ in 0..n.min(self.scroll_bottom - row + 1) {
-            self.screen.remove(row);
-            self.screen
-                .insert(self.scroll_bottom, Row::blank(self.cols, &pen));
-        }
+        self.drop_lines_at(row, self.scroll_bottom, n.min(self.scroll_bottom - row + 1));
         self.touch();
     }
 
@@ -655,21 +681,7 @@ impl Grid {
     pub fn reset(&mut self) {
         self.cancel_clear();
         self.archive_screen();
-        let cols = self.cols;
-        for row in &mut self.screen {
-            *row = Row::new(cols);
-        }
-        self.pen.reset();
-        self.insert_mode = false;
-        self.cursor = Cursor {
-            row: 0,
-            col: 0,
-            visible: true,
-        };
-        self.reset_scroll_region();
-        self.pending_wrap = false;
-        self.saved_cursor = None;
-        self.touch();
+        self.blank_everything();
     }
 
     /// Reset *and* forget the history: the deliberate "give me a clean
@@ -677,13 +689,21 @@ impl Grid {
     pub fn hard_reset(&mut self) {
         self.cancel_clear();
         self.scrollback.clear();
+        self.widest = 0;
+        self.blank_everything();
+    }
+
+    /// The part of a reset both spellings share: an empty screen, the default
+    /// pen, a homed cursor and no leftover modes.
+    fn blank_everything(&mut self) {
         let cols = self.cols;
         for row in &mut self.screen {
-            *row = Row::new(cols);
+            row.cells.clear();
+            row.cells.resize(cols, Cell::default());
+            row.wrapped = false;
         }
         self.pen.reset();
         self.insert_mode = false;
-        self.widest = 0;
         self.cursor = Cursor {
             row: 0,
             col: 0,
@@ -733,7 +753,7 @@ impl Grid {
                 let mut to_remove = self.rows - rows;
                 while to_remove > 0 {
                     let last = self.screen.len() - 1;
-                    if last > self.cursor.row && self.screen[last].to_text().is_empty() {
+                    if last > self.cursor.row && self.screen[last].used_width() == 0 {
                         self.screen.pop();
                     } else {
                         let row = self.screen.remove(0);

@@ -90,6 +90,15 @@ impl SessionLog {
     /// between what we last wrote and that point is now final and safe to
     /// record. Lines still on screen may yet be overwritten by a full-screen
     /// routine, so they are deliberately not logged until they scroll away.
+    /// Whether [`Log::write_settled`] would look at the lines it is handed.
+    ///
+    /// Transcribing the whole grid to build them costs a `String` per line of
+    /// history, so the caller asks first rather than doing that work for a log
+    /// that is off, raw, or muted across the password step.
+    pub fn wants_settled(&self) -> bool {
+        self.mode == LogMode::Clean && !self.muted
+    }
+
     pub fn write_settled(&mut self, lines: &[String], scrollback_len: usize) -> Result<()> {
         if self.mode != LogMode::Clean || self.muted || self.rotate_if_full()? {
             return Ok(());

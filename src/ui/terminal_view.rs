@@ -166,8 +166,9 @@ impl ViewState {
                 }
                 continue;
             }
-            let text: String = row.cells[from..to].iter().map(|c| c.ch).collect();
-            out.push_str(text.trim_end());
+            let kept = out.len();
+            out.extend(row.cells[from..to].iter().map(|c| c.ch));
+            out.truncate(kept + out[kept..].trim_end().len());
             if line_index != end.0 {
                 out.push('\n');
             }
@@ -426,10 +427,27 @@ pub fn show(
         None
     };
 
+    // One scan per logical line, reusing one buffer for the frame. A wrapped
+    // line arrives as several consecutive segments, and rescanning it for each
+    // of them was the most expensive thing a frame did.
+    let mut overrides: Vec<Option<Color32>> = Vec::new();
+    let mut scanned: Option<usize> = None;
+
     for (screen_row, segment) in segments.iter().enumerate() {
         let Some(row) = grid.line(segment.line) else {
             continue;
         };
+        if opts.syntax && scanned != Some(segment.line) {
+            scanned = Some(segment.line);
+            if row.used_width() == 0 {
+                // Nothing on the row, so nothing to colour. Worth its own case:
+                // most of an idle screen is blank, and the scan would still
+                // walk every one of the grid's columns.
+                overrides.clear();
+            } else {
+                syntax_overrides(&row.cells, theme, &mut overrides);
+            }
+        }
         let y = rect.top() + screen_row as f32 * cell.y;
         let hide_glyph_at = cursor_at
             .filter(|(row, _, _)| *row == screen_row && opts.cursor_style == CursorStyle::Block)
@@ -447,7 +465,7 @@ pub fn show(
             state,
             &font,
             hide_glyph_at,
-            opts.syntax,
+            &overrides,
         );
     }
 
@@ -593,18 +611,13 @@ pub fn show(
 ///
 /// Computed per row rather than per cell because the scan has to see a whole
 /// line to know whether a `^` is inside quotes.
-fn syntax_overrides(cells: &[Cell], theme: &Theme, enabled: bool) -> Vec<Option<Color32>> {
-    if !enabled {
-        return Vec::new();
-    }
-    let mut out = vec![None; cells.len()];
+fn syntax_overrides(cells: &[Cell], theme: &Theme, out: &mut Vec<Option<Color32>>) {
+    out.clear();
+    out.resize(cells.len(), None);
     for span in syntax::scan(cells) {
         let colour = theme.syntax_color(span.kind);
-        for slot in out[span.start..span.end.min(cells.len())].iter_mut() {
-            *slot = Some(colour);
-        }
+        out[span.start..span.end.min(cells.len())].fill(Some(colour));
     }
-    out
 }
 
 /// Draws the horizontal scrollbar and handles dragging it.
@@ -802,12 +815,13 @@ fn paint_row(
     font: &FontId,
     // Column whose glyph the cursor will draw itself, if it is on this row.
     hide_glyph_at: Option<usize>,
-    syntax_enabled: bool,
+    // Per-column syntax colour, scanned over the whole row by the caller — not
+    // the slice, because whether a `^` is inside quotes depends on text that
+    // may be on an earlier display row. Empty when the feature is off.
+    overrides: &[Option<Color32>],
 ) {
-    // Scanned over the whole row, not the slice: whether a `^` is inside quotes
-    // depends on text that may be on an earlier display row.
-    let overrides = syntax_overrides(&row.cells, theme, syntax_enabled);
     let to = (from + view_cols).min(row.cells.len());
+    let selection = state.selection;
 
     // Everything about how one column looks, in one place, so the run-batching
     // below compares exactly what it draws.
@@ -822,21 +836,30 @@ fn paint_row(
                 fg = *colour;
             }
         }
-        let selected = state
-            .selection
-            .map(|s| s.contains(line_index, col))
-            .unwrap_or(false);
+        let selected = selection.is_some_and(|s| s.contains(line_index, col));
         (fg, bg, selected)
     };
 
+    if from >= to {
+        return;
+    }
+
     let mut col = from;
+    let mut look = appearance(from);
     while col < to {
-        let (fg, bg, selected) = appearance(col);
+        let (fg, bg, selected) = look;
 
         // Extend the run while appearance is unchanged, so a line of plain
-        // text becomes one background rect instead of `cols` of them.
+        // text becomes one background rect instead of `cols` of them. Each
+        // column is costed once: the appearance that ended the run opens the
+        // next one.
         let mut end = col + 1;
-        while end < to && appearance(end) == (fg, bg, selected) {
+        while end < to {
+            let next = appearance(end);
+            if next != (fg, bg, selected) {
+                look = next;
+                break;
+            }
             end += 1;
         }
 
@@ -855,15 +878,19 @@ fn paint_row(
         // away from the columns the cursor and the rects are drawn at. Blank
         // cells are skipped, so a mostly empty row still costs a handful of
         // draws rather than one per column.
-        let has_text = row.cells[col..end].iter().any(|c| !c.is_blank());
-        for c in col..end {
-            if row.cells[c].is_blank() || hide_glyph_at == Some(c) {
+        let mut has_text = false;
+        for (c, cell_at) in (col..end).zip(&row.cells[col..end]) {
+            if cell_at.is_blank() {
+                continue;
+            }
+            has_text = true;
+            if hide_glyph_at == Some(c) {
                 continue;
             }
             painter.text(
                 Pos2::new(glyph_x(left, c - from, cell), y),
                 Align2::LEFT_TOP,
-                row.cells[c].ch,
+                cell_at.ch,
                 font.clone(),
                 fg,
             );
