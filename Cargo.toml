@@ -1,10 +1,10 @@
 [package]
 name = "new-iris-terminal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Terminal emulator for InterSystems IRIS"
 license = "MIT"
-repository = "https://github.com/consistem/newIrisTerminal"
+repository = "https://github.com/ccsJoaoAzevedo/newIrisTerminal"
 build = "build.rs"
 
 [dependencies]
@@ -31,6 +31,11 @@ chrono = "0.4"
 log = "0.4"
 env_logger = "0.11"
 image = "0.24"
+# The update check: a blocking HTTPS GET against the GitHub releases API, and
+# the JSON it answers with. `ureq` is the small end of the HTTP clients - no
+# async runtime - which matters for a check that runs once at startup.
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
 
 [features]
 default = []

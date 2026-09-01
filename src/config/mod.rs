@@ -83,6 +83,12 @@ pub fn open_in_file_manager(path: &std::path::Path) -> Result<()> {
 pub const DEFAULT_TERMINAL_COLS: u16 = 100;
 pub const DEFAULT_TERMINAL_ROWS: u16 = 30;
 
+/// The geometries a terminal is conventionally set to, offered as one click
+/// each: 80 and 132 columns are the two widths a VT had, and 24 and 48 the two
+/// heights the InterSystems terminal offers.
+pub const COMMON_COLS: [u16; 3] = [80, 100, 132];
+pub const COMMON_ROWS: [u16; 3] = [24, 30, 48];
+
 /// Shape the terminal cursor is drawn as.
 ///
 /// A setting rather than something the session controls: IRIS never emits
@@ -123,6 +129,10 @@ impl CursorStyle {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Language the interface is drawn in. English unless asked otherwise: a
+    /// guess from the system locale would change the language of an install
+    /// that was happy, and the picker is one line into Settings.
+    pub language: crate::i18n::Lang,
     pub theme: String,
     pub font_size: f32,
     /// Draw solid scrollbars instead of egui's floating ones, which are all but
@@ -152,6 +162,9 @@ pub struct Settings {
     /// further rows, or reached by scrolling sideways.
     pub wrap_lines: bool,
     pub scrollback_limit: usize,
+    /// Seconds a status message stays in the footer before it goes on its own.
+    /// 0 keeps it until it is dismissed, which is what the app always did.
+    pub status_timeout_secs: u32,
     /// Put a selection on the clipboard as soon as the mouse is released,
     /// without waiting for Ctrl+C — the way the native IrisTerm and PuTTY
     /// behave.
@@ -185,9 +198,20 @@ pub struct Settings {
     /// where the title bar would otherwise waste a row. An escape hatch for a
     /// window manager the custom chrome misbehaves under.
     pub native_decorations: bool,
+    /// Draw the minimize / maximize / close controls in the app's own title
+    /// bar. Off leaves the row to the tabs and the drag area: the window can
+    /// still be moved, maximized by double-click, and closed with Ctrl+W or
+    /// Alt+F4. Ignored while the system title bar is in use, which brings its
+    /// own controls.
+    pub show_window_buttons: bool,
     /// Reopen at the size the window was last closed at. Off opens every
-    /// launch at [`DEFAULT_TERMINAL_COLS`]x[`DEFAULT_TERMINAL_ROWS`] cells.
+    /// launch at [`Settings::default_geometry`].
     pub save_terminal_size: bool,
+    /// Terminal size a window opens at when the last one is not being restored,
+    /// in characters. The size anyone actually means by "how big is the
+    /// terminal": 80x24 holds the same amount of IRIS output at any font size.
+    pub default_cols: u16,
+    pub default_rows: u16,
     /// Reopen where the window was last closed. Off centres it on the monitor.
     pub save_window_position: bool,
     /// Inner size of the window in egui points, as last closed. Recorded only
@@ -204,11 +228,17 @@ pub struct Settings {
     /// that the restore button cannot shrink.
     pub window_maximized: bool,
     pub enable_plugins: bool,
+    /// Ask GitHub at startup whether a newer build has been released.
+    ///
+    /// One HTTPS request through the machine's own proxy, and nothing is
+    /// downloaded or replaced without being asked for.
+    pub check_for_updates: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            language: crate::i18n::Lang::default(),
             theme: "IRIS Dark".into(),
             font_size: 14.0,
             show_scrollbars: true,
@@ -218,6 +248,7 @@ impl Default for Settings {
             terminal_syntax_highlight: true,
             wrap_lines: true,
             scrollback_limit: 10_000,
+            status_timeout_secs: 8,
             copy_on_select: true,
             save_command_history: true,
             log_dir: default_log_dir(),
@@ -229,12 +260,16 @@ impl Default for Settings {
             open_on_start: true,
             confirm_close_with_live_session: true,
             native_decorations: false,
+            show_window_buttons: true,
             save_terminal_size: false,
+            default_cols: DEFAULT_TERMINAL_COLS,
+            default_rows: DEFAULT_TERMINAL_ROWS,
             save_window_position: false,
             window_size: None,
             window_position: None,
             window_maximized: false,
             enable_plugins: false,
+            check_for_updates: true,
         }
     }
 }
@@ -282,6 +317,18 @@ impl Settings {
         (!self.org_macros_path.as_os_str().is_empty()).then_some(self.org_macros_path.as_path())
     }
 
+    /// Terminal size a new window opens at, in characters.
+    ///
+    /// Clamped rather than trusted: the numbers come from a settings file that
+    /// can be edited by hand, and a zero-column terminal is not something the
+    /// rest of the app is prepared for.
+    pub fn default_geometry(&self) -> (u16, u16) {
+        (
+            self.default_cols.clamp(20, 500),
+            self.default_rows.clamp(5, 200),
+        )
+    }
+
     /// Inner size the window should open at, if a saved one is to be restored.
     ///
     /// `None` means "no size to restore": the caller opens at
@@ -316,109 +363,115 @@ impl Settings {
     }
 }
 
-/// Who owns a theme file that is already on disk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Owner {
-    /// Marked `builtin = true` — a copy we wrote and nobody has claimed.
-    Ours,
-    /// No `builtin` key at all, so it predates the marker. Every install that
-    /// ran an earlier version has one of these.
-    Unmarked,
-    /// The user's, either by `builtin = false` or because it will not parse.
-    /// Left strictly alone.
-    User,
-}
-
-fn owner_of(path: &std::path::Path) -> Owner {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Owner::User;
-    };
-    // Parsed as a bare table rather than a `ThemeFile`, so a file that is
-    // missing a required colour is still classified rather than treated as
-    // unreadable.
-    let Ok(table) = toml::from_str::<toml::Table>(&text) else {
-        return Owner::User;
-    };
-    match table.get("builtin") {
-        Some(value) => {
-            if value.as_bool().unwrap_or(false) {
-                Owner::Ours
-            } else {
-                Owner::User
-            }
-        }
-        None => Owner::Unmarked,
-    }
-}
-
-/// Creates the config tree and refreshes the built-in theme files.
+/// Creates the config tree.
 ///
-/// The refresh is the point: [`load_themes`] lets a file in the themes folder
-/// replace the built-in of the same name, so a copy written by an earlier
-/// version masks every later correction to that theme. Files we still own are
-/// rewritten; a file predating the `builtin` marker is rewritten too, but only
-/// after being kept as `<name>.toml.bak` so an edit is never destroyed.
-/// Clearing `builtin` (or renaming the theme) claims the file for good.
+/// The built-in themes used to be written out here as well, and a copy on disk
+/// replaced the built-in of the same name - so a file written by an earlier
+/// version masked every later correction to that theme, and there was no such
+/// thing as an immutable built-in. They now live only in the binary; the themes
+/// folder holds the user's own, which nothing here ever writes over.
 pub fn ensure_config_tree() -> Result<()> {
     std::fs::create_dir_all(config_dir())?;
     std::fs::create_dir_all(themes_dir())?;
     std::fs::create_dir_all(plugins_dir())?;
-
-    for file in theme::builtin_files() {
-        let path = themes_dir().join(format!("{}.toml", slugify(&file.name)));
-        if path.exists() {
-            match owner_of(&path) {
-                Owner::User => continue,
-                Owner::Ours => {}
-                Owner::Unmarked => {
-                    // One-time migration. `.bak` is not `.toml`, so the copy is
-                    // invisible to `load_themes` and cannot shadow anything.
-                    let backup = path.with_extension("toml.bak");
-                    if !backup.exists() {
-                        let _ = std::fs::copy(&path, &backup);
-                    }
-                }
-            }
-        }
-        if let Ok(text) = toml::to_string_pretty(&file) {
-            let _ = std::fs::write(&path, text);
-        }
-    }
     Ok(())
 }
 
-/// Loads every theme in the themes directory, always including the built-ins
-/// so a deleted or broken file cannot leave the app with nothing to render.
+/// Loads the built-in themes and then every theme in the themes directory.
+///
+/// A built-in can no longer be replaced by a file of the same name: it is
+/// immutable, and shadowing was how a stale copy used to mask a correction. A
+/// copy this app wrote itself is dropped, since it holds nothing of the user's;
+/// anything else that collides keeps its colours under a name of its own.
 pub fn load_themes() -> Vec<Theme> {
     let mut themes: Vec<Theme> = theme::builtin_files()
         .iter()
-        .map(Theme::from_file)
+        .map(|file| Theme::from_file(file).as_builtin())
         .collect();
 
-    if let Ok(entries) = std::fs::read_dir(themes_dir()) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            match toml::from_str::<ThemeFile>(&text) {
-                Ok(file) => {
-                    let loaded = Theme::from_file(&file);
-                    // A file that shares a built-in's name replaces it.
-                    if let Some(slot) = themes.iter_mut().find(|t| t.name == loaded.name) {
-                        *slot = loaded;
-                    } else {
-                        themes.push(loaded);
-                    }
-                }
-                Err(e) => log::warn!("skipping theme {}: {e}", path.display()),
-            }
+    let Ok(entries) = std::fs::read_dir(themes_dir()) else {
+        return themes;
+    };
+    // Sorted, so which of two files that want the same name gets renamed does
+    // not depend on the order the filesystem happens to hand them back in.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+
+    for path in paths {
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
         }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let file = match toml::from_str::<ThemeFile>(&text) {
+            Ok(file) => file,
+            Err(e) => {
+                log::warn!("skipping theme {}: {e}", path.display());
+                continue;
+            }
+        };
+        let taken = themes.iter().any(|t| t.name == file.name);
+        // A copy of a built-in that an earlier version wrote. Nothing of the
+        // user's is in it, so it is dropped rather than kept as a duplicate.
+        if taken && file.builtin {
+            log::info!("ignoring stale built-in copy {}", path.display());
+            continue;
+        }
+        let mut loaded = Theme::from_file(&file).at_path(path);
+        if taken {
+            loaded.name = unclaimed_name(&themes, &file.name);
+        }
+        themes.push(loaded);
     }
     themes
+}
+
+/// `<name> (custom)`, and then `(custom 2)`, until nothing else answers to it.
+fn unclaimed_name(themes: &[Theme], name: &str) -> String {
+    let taken = |candidate: &str| themes.iter().any(|t| t.name == candidate);
+    let first = format!("{name} (custom)");
+    if !taken(&first) {
+        return first;
+    }
+    (2..)
+        .map(|n| format!("{name} (custom {n})"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or(first)
+}
+
+/// Filename a theme is stored under, unique within `themes`.
+///
+/// Derived from the name so the folder stays readable by hand, but never
+/// allowed to land on a file that is already there: two themes whose names
+/// slugify the same way would otherwise overwrite each other.
+pub fn theme_path_for(name: &str) -> PathBuf {
+    let stem = {
+        let slug = slugify(name);
+        let trimmed = slug.trim_matches('-').to_string();
+        if trimmed.is_empty() {
+            "theme".to_string()
+        } else {
+            trimmed
+        }
+    };
+    let dir = themes_dir();
+    let first = dir.join(format!("{stem}.toml"));
+    if !first.exists() {
+        return first;
+    }
+    (2..)
+        .map(|n| dir.join(format!("{stem}-{n}.toml")))
+        .find(|path| !path.exists())
+        .unwrap_or(first)
+}
+
+/// Writes a theme to its own file, which is by definition the user's.
+pub fn save_theme(theme: &Theme, path: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(themes_dir())?;
+    let text = toml::to_string_pretty(&theme.to_file()).context("serialising theme")?;
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 fn slugify(name: &str) -> String {
@@ -504,6 +557,21 @@ mod tests {
         assert!(settings.font_family.is_empty());
         assert!(settings.copy_on_select);
         assert!(settings.save_command_history);
+        assert!(settings.show_window_buttons);
+        assert_eq!(settings.status_timeout_secs, 8);
+        assert_eq!(
+            settings.default_geometry(),
+            (DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
+        );
+    }
+
+    /// The geometry is written down by hand as often as it is set in the
+    /// dialog, and nothing downstream survives a terminal with no columns.
+    #[test]
+    fn a_hand_written_geometry_is_clamped() {
+        let settings: Settings =
+            toml::from_str("default_cols = 0\ndefault_rows = 60000").expect("parse");
+        assert_eq!(settings.default_geometry(), (20, 200));
     }
 
     /// The window geometry is only ever restored through the switch that asks
@@ -574,57 +642,8 @@ mod tests {
         assert!(!settings.window_maximized);
     }
 
-    #[test]
-    fn theme_files_are_classified_by_who_owns_them() {
-        let dir = std::env::temp_dir().join("nit-owner-test");
-        let _ = std::fs::create_dir_all(&dir);
-
-        let write = |name: &str, body: &str| {
-            let path = dir.join(name);
-            std::fs::write(&path, body).expect("write");
-            path
-        };
-
-        let ours = write(
-            "ours.toml",
-            "name = \"X\"
-builtin = true
-",
-        );
-        assert_eq!(owner_of(&ours), Owner::Ours);
-
-        // What every install that ran an earlier version has on disk.
-        let unmarked = write(
-            "unmarked.toml",
-            "name = \"X\"
-background = \"#000\"
-",
-        );
-        assert_eq!(owner_of(&unmarked), Owner::Unmarked);
-
-        let claimed = write(
-            "claimed.toml",
-            "name = \"X\"
-builtin = false
-",
-        );
-        assert_eq!(owner_of(&claimed), Owner::User);
-
-        // A half-written file is the user's business, not ours to replace.
-        let broken = write(
-            "broken.toml",
-            "name = \"X\"
-this is not toml",
-        );
-        assert_eq!(owner_of(&broken), Owner::User);
-
-        assert_eq!(owner_of(&dir.join("absent.toml")), Owner::User);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The marker is what lets a corrected built-in reach a disk that already
-    /// has a stale copy, so every built-in must carry it.
+    /// The marker is what lets `load_themes` recognise a copy of a built-in
+    /// that an earlier version left on disk, so every built-in must carry it.
     #[test]
     fn every_builtin_theme_is_marked_as_one() {
         for file in theme::builtin_files() {

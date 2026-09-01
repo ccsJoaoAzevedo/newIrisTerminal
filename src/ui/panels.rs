@@ -11,12 +11,13 @@ use egui::{Context, Ui};
 use crate::config::{profile::LogMode, CursorStyle, Profile, Settings, Theme};
 use crate::features::macros::{Macro, MacroGroup, Origin, Param};
 use crate::features::natives::Native;
+use crate::i18n::{tr, tr1, tr2};
 use crate::term::Encoding;
 use crate::ui::shortcut;
 
 /// Colour for "this is set, but it will not do what you expect". Not from the
 /// theme: it has to stay legible as a warning in every one of them.
-const WARNING: egui::Color32 = egui::Color32::from_rgb(220, 120, 60);
+pub const WARNING: egui::Color32 = egui::Color32::from_rgb(220, 120, 60);
 
 /// Shown in the font picker for "whatever egui ships with".
 const BUILT_IN_FONT: &str = "Built-in monospace";
@@ -39,6 +40,8 @@ pub enum UiRequest {
     SavePersonalMacros,
     /// Show a folder in the platform's file manager.
     OpenFolder(std::path::PathBuf),
+    /// Ask GitHub whether there is a newer version, and say either way.
+    CheckForUpdates,
 }
 
 /// State the panels own between frames.
@@ -47,6 +50,8 @@ pub struct PanelState {
     pub show_macros: bool,
     pub show_settings: bool,
     pub show_export: bool,
+    /// The theme manager, which keeps its own selection and rename draft.
+    pub themes: crate::ui::theme_manager::ThemeManagerState,
     pub macro_filter: String,
     /// A macro waiting on parameter values and/or confirmation.
     pub pending: Option<PendingMacro>,
@@ -153,17 +158,19 @@ pub fn macros_panel(
     let mut request = None;
 
     ui.horizontal(|ui| {
-        ui.label("Filter");
+        ui.label(tr("Filter"));
         ui.text_edit_singleline(&mut state.macro_filter);
-        if ui.button("Reload").clicked() {
+        if ui.button(tr("Reload")).clicked() {
             request = Some(UiRequest::ReloadMacros);
         }
     });
     ui.separator();
 
     if groups.is_empty() {
-        ui.label("No macros defined.");
-        ui.small("Add them below, or configure the organization file in Settings.");
+        ui.label(tr("No macros defined."));
+        ui.small(tr(
+            "Add them below, or configure the organization file in Settings.",
+        ));
     }
 
     // An index into a list that has since been reloaded, or had a macro
@@ -216,18 +223,18 @@ pub fn macros_panel(
                         // macro that asks for parameters or a
                         // confirmation asks for them here too.
                         if ui
-                            .small_button("Run")
+                            .small_button(tr("Run"))
                             .on_hover_text(if m.confirm {
-                                "Runs after confirming."
+                                tr("Runs after confirming.")
                             } else {
-                                "Sends this macro to the active session."
+                                tr("Sends this macro to the active session.")
                             })
                             .clicked()
                         {
                             to_run = Some(m.clone());
                         }
                         let label = if m.confirm {
-                            format!("{}  (confirms)", m.name)
+                            format!("{}  ({})", m.name, tr("confirms"))
                         } else {
                             m.name.clone()
                         };
@@ -249,8 +256,8 @@ pub fn macros_panel(
                         // behaving oddly is someone else's file, not
                         // something the user can have broken locally.
                         if m.origin == Origin::Organization {
-                            ui.weak("org")
-                                .on_hover_text("Provided by the organization; read-only here.");
+                            ui.weak(tr("org"))
+                                .on_hover_text(tr("Provided by the organization; read-only here."));
                         }
 
                         // The shortcut belongs next to the name. A
@@ -278,7 +285,7 @@ pub fn macros_panel(
 
     ui.separator();
     ui.horizontal(|ui| {
-        ui.label("New in group");
+        ui.label(tr("New in group"));
         ui.add(egui::TextEdit::singleline(&mut state.new_group).desired_width(90.0));
         let named = !state.new_group.trim().is_empty();
         if ui.add_enabled(named, egui::Button::new("Add")).clicked() {
@@ -333,34 +340,34 @@ fn macro_details(
     // reachable without selecting the macro first.
     ui.horizontal(|ui| match m.origin {
         Origin::Personal => {
-            if ui.button("Edit").clicked() {
+            if ui.button(tr("Edit")).clicked() {
                 state.open_editor((gi, mi), m.clone());
             }
             if ui
-                .button("Delete")
-                .on_hover_text("Removes it from your personal macro file.")
+                .button(tr("Delete"))
+                .on_hover_text(tr("Removes it from your personal macro file."))
                 .clicked()
             {
                 delete = true;
             }
         }
         Origin::Organization => {
-            ui.weak("Provided by the organization; read-only here.");
+            ui.weak(tr("Provided by the organization; read-only here."));
         }
     });
 
     if let Some(key) = &m.key {
         ui.horizontal(|ui| {
-            ui.label("Shortcut");
+            ui.label(tr("Shortcut"));
             ui.weak(key);
             if shortcut::parse(key).is_none() {
-                ui.colored_label(WARNING, "not a shortcut this app understands");
+                ui.colored_label(WARNING, tr("not a shortcut this app understands"));
             }
         });
     }
 
     if !m.params.is_empty() {
-        ui.label("Parameters");
+        ui.label(tr("Parameters"));
         for p in &m.params {
             let prompt = if p.prompt.is_empty() {
                 &p.name
@@ -402,8 +409,8 @@ fn macro_details(
 /// How many body lines a hidden macro has, without saying what they are.
 fn hidden_body_note(m: &Macro) -> String {
     match m.body.len() {
-        1 => "1 command hidden".to_string(),
-        n => format!("{n} commands hidden"),
+        1 => tr("1 command hidden").to_string(),
+        n => tr1("{} commands hidden", &n.to_string()),
     }
 }
 
@@ -429,7 +436,8 @@ pub fn macro_editor_dialog(
     let mut open = true;
     let mut reveal = state.reveal_body;
 
-    egui::Window::new("Edit macro")
+    egui::Window::new(tr("Edit macro"))
+        .id(egui::Id::new("nit-macro-editor"))
         .collapsible(false)
         .resizable(true)
         .default_width(480.0)
@@ -441,16 +449,16 @@ pub fn macro_editor_dialog(
             };
 
             ui.horizontal(|ui| {
-                ui.label("Name");
+                ui.label(tr("Name"));
                 ui.text_edit_singleline(&mut draft.name);
             });
             ui.horizontal(|ui| {
-                ui.label("Description");
+                ui.label(tr("Description"));
                 ui.text_edit_singleline(&mut draft.description);
             });
 
             ui.horizontal(|ui| {
-                ui.label("Shortcut");
+                ui.label(tr("Shortcut"));
                 let mut key = draft.key.clone().unwrap_or_default();
                 if ui
                     .add(
@@ -472,14 +480,14 @@ pub fn macro_editor_dialog(
                     None => {
                         ui.colored_label(
                             WARNING,
-                            "Not understood, so it will not fire. Needs a modifier, like Ctrl+Shift+G.",
+                            tr("Not understood, so it will not fire. Needs a modifier, like Ctrl+Shift+G."),
                         );
                     }
                     Some((modifiers, parsed)) => {
                         if let Some(used_for) = shortcut::is_reserved(modifiers, parsed) {
                             ui.colored_label(
                                 WARNING,
-                                format!("The app already uses this for {used_for}; add Shift."),
+                                tr1("The app already uses this for {}; add Shift.", used_for),
                             );
                         }
                     }
@@ -488,12 +496,12 @@ pub fn macro_editor_dialog(
 
             ui.checkbox(
                 &mut draft.confirm,
-                "Confirm before sending (use for anything that writes)",
+                tr("Confirm before sending (use for anything that writes)"),
             );
             if ui
-                .checkbox(&mut draft.hide_command, "Hide command")
+                .checkbox(&mut draft.hide_command, tr("Hide command"))
                 .on_hover_text(
-                    "For a body that carries a password. Keeps it out of the macro panel; IRIS still echoes what it is sent.",
+                    tr("For a body that carries a password. Keeps it out of the macro panel; IRIS still echoes what it is sent."),
                 )
                 .changed()
             {
@@ -502,11 +510,11 @@ pub fn macro_editor_dialog(
                 reveal = false;
             }
 
-            ui.label("Body - one command per line, {{param}} is substituted");
+            ui.label(tr("Body - one command per line, {{param}} is substituted"));
             if draft.hide_command && !reveal {
                 ui.horizontal(|ui| {
                     ui.weak(hidden_body_note(draft));
-                    if ui.button("Reveal").clicked() {
+                    if ui.button(tr("Reveal")).clicked() {
                         reveal = true;
                     }
                 });
@@ -525,16 +533,16 @@ pub fn macro_editor_dialog(
                 }
             }
 
-            ui.label("Parameters");
+            ui.label(tr("Parameters"));
             let mut drop_param = None;
             for (pi, param) in draft.params.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut param.name).desired_width(60.0))
-                        .on_hover_text("Name used as {{name}} in the body");
+                        .on_hover_text(tr("Name used as {{name}} in the body"));
                     ui.add(egui::TextEdit::singleline(&mut param.prompt).desired_width(100.0))
-                        .on_hover_text("Prompt shown when running");
+                        .on_hover_text(tr("Prompt shown when running"));
                     ui.add(egui::TextEdit::singleline(&mut param.default).desired_width(70.0))
-                        .on_hover_text("Default value");
+                        .on_hover_text(tr("Default value"));
                     if ui.small_button("x").clicked() {
                         drop_param = Some(pi);
                     }
@@ -543,13 +551,13 @@ pub fn macro_editor_dialog(
             if let Some(pi) = drop_param {
                 draft.params.remove(pi);
             }
-            if ui.small_button("Add parameter").clicked() {
+            if ui.small_button(tr("Add parameter")).clicked() {
                 draft.params.push(Param::default());
             }
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if ui.button(tr("Save")).clicked() {
                     // Origin is never taken from the draft: an edited macro
                     // stays personal, so nothing can promote itself into the
                     // shared file.
@@ -559,7 +567,7 @@ pub fn macro_editor_dialog(
                     close = true;
                     request = Some(UiRequest::SavePersonalMacros);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(tr("Cancel")).clicked() {
                     close = true;
                 }
             });
@@ -588,7 +596,7 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
     let mut open = true;
 
     let title = if pending.confirming {
-        format!("Confirm: {}", pending.source.name)
+        tr1("Confirm: {}", &pending.source.name)
     } else {
         pending.source.name.clone()
     };
@@ -613,7 +621,7 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
             }
 
             ui.separator();
-            ui.label("Will send:");
+            ui.label(tr("Will send:"));
             let preview = pending.source.expand(&pending.values);
             for line in &preview {
                 ui.code(line);
@@ -623,23 +631,22 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
                 ui.separator();
                 ui.colored_label(
                     WARNING,
-                    "This macro is marked as modifying data. \
-                     RDB* databases are shared with the team.",
+                    tr("This macro is marked as modifying data. RDB* databases are shared with the team."),
                 );
             }
 
             ui.separator();
             ui.horizontal(|ui| {
                 let send_label = if pending.source.confirm {
-                    "Yes, send it"
+                    tr("Yes, send it")
                 } else {
-                    "Send"
+                    tr("Send")
                 };
                 if ui.button(send_label).clicked() {
                     request = Some(UiRequest::SendLines(preview.clone()));
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(tr("Cancel")).clicked() {
                     close = true;
                 }
             });
@@ -655,12 +662,12 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
 pub fn natives_panel(ui: &mut Ui, state: &mut PanelState) -> Option<UiRequest> {
     let mut request = None;
 
-    ui.label("IRIS utilities");
+    ui.label(tr("IRIS utilities"));
     ui.separator();
 
     for native in Native::ALL {
         let selected = state.selected_native == Some(native);
-        if ui.selectable_label(selected, native.label()).clicked() {
+        if ui.selectable_label(selected, tr(native.label())).clicked() {
             // Clicking the open one again folds it away rather than resetting
             // its fields, which is what the same click used to do - and losing
             // a typed package name to a stray click is a poor trade for a
@@ -677,18 +684,18 @@ pub fn natives_panel(ui: &mut Ui, state: &mut PanelState) -> Option<UiRequest> {
             .native_values
             .resize(native.params().len(), String::new());
         for (param, value) in native.params().iter().zip(state.native_values.iter_mut()) {
-            ui.label(param.label);
+            ui.label(tr(param.label));
             ui.text_edit_singleline(value);
         }
 
         let invocation = native.build(&state.native_values);
         ui.add_space(8.0);
-        ui.label("Will send:");
+        ui.label(tr("Will send:"));
         for line in &invocation.lines {
             ui.code(line);
         }
         ui.add_space(8.0);
-        if ui.button("Run").clicked() {
+        if ui.button(tr("Run")).clicked() {
             request = Some(UiRequest::RunNative(native, state.native_values.clone()));
         }
     }
@@ -706,36 +713,37 @@ pub fn export_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiRequest>
     let mut request = None;
     let mut open = true;
 
-    egui::Window::new("Export output")
+    egui::Window::new(tr("Export output"))
+        .id(egui::Id::new("nit-export"))
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
         .show(ctx, |ui| {
-            ui.label("Save to a file");
+            ui.label(tr("Save to a file"));
             ui.horizontal(|ui| {
-                if ui.button("Screen as text").clicked() {
+                if ui.button(tr("Screen as text")).clicked() {
                     request = Some(UiRequest::ExportText(Range::Screen));
                 }
-                if ui.button("Everything as text").clicked() {
+                if ui.button(tr("Everything as text")).clicked() {
                     request = Some(UiRequest::ExportText(Range::All));
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("Screen as HTML").clicked() {
+                if ui.button(tr("Screen as HTML")).clicked() {
                     request = Some(UiRequest::ExportHtml(Range::Screen));
                 }
-                if ui.button("Everything as HTML").clicked() {
+                if ui.button(tr("Everything as HTML")).clicked() {
                     request = Some(UiRequest::ExportHtml(Range::All));
                 }
             });
 
             ui.separator();
-            ui.label("Copy to the clipboard");
+            ui.label(tr("Copy to the clipboard"));
             ui.horizontal(|ui| {
-                if ui.button("Screen").clicked() {
+                if ui.button(tr("Screen")).clicked() {
                     request = Some(UiRequest::CopyRange(Range::Screen));
                 }
-                if ui.button("Everything").clicked() {
+                if ui.button(tr("Everything")).clicked() {
                     request = Some(UiRequest::CopyRange(Range::All));
                 }
             });
@@ -750,6 +758,91 @@ pub fn export_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiRequest>
     request
 }
 
+/// Offers the newer version that was found. Returns true when the user asked
+/// for it to be applied.
+///
+/// Two steps, because they are two different waits: the download runs on a
+/// thread and can take a while over a proxy, and only once it is on disk is
+/// there anything to restart into.
+pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool {
+    let Some(release) = state.available.clone() else {
+        return false;
+    };
+    if !state.asked {
+        return false;
+    }
+    let mut apply = false;
+    let mut open = true;
+
+    egui::Window::new(tr("Update available"))
+        .id(egui::Id::new("nit-update"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(tr2(
+                "Version {} is available. This one is {}.",
+                &release.version,
+                crate::features::update::CURRENT,
+            ));
+            if !release.notes.is_empty() {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_source("update-notes")
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        ui.small(&release.notes);
+                    });
+            }
+            if let Some(error) = state.error.as_ref() {
+                ui.add_space(4.0);
+                ui.colored_label(WARNING, error);
+            }
+            ui.add_space(6.0);
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                if state.downloading {
+                    ui.spinner();
+                    ui.label(tr("Downloading..."));
+                    return;
+                }
+                if state.staged.is_some() {
+                    if ui
+                        .button(tr("Restart and update"))
+                        .on_hover_text(tr(
+                            "Puts the new version in place and starts it. A session still connected is asked about first.",
+                        ))
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                } else if ui.button(tr("Download")).clicked() {
+                    state.start_download();
+                }
+                if ui.button(tr("Later")).clicked() {
+                    // Dismissed for this run. The next start asks again, which
+                    // is the whole of the nagging this does.
+                    state.asked = false;
+                }
+            });
+        });
+
+    if !open {
+        state.asked = false;
+    }
+    apply
+}
+
+/// A heading with room around it, so the sections of the settings window read
+/// as sections rather than as one list with bold lines in it.
+fn section(ui: &mut Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.heading(title);
+    ui.add_space(2.0);
+}
+
 /// Settings: theme, font, scrollback, logging, and profiles.
 pub fn settings_dialog(
     ctx: &Context,
@@ -757,6 +850,7 @@ pub fn settings_dialog(
     themes: &[Theme],
     state: &mut PanelState,
     instances: &[String],
+    buttons: &crate::config::theme::WindowButtons,
 ) -> Option<UiRequest> {
     if !state.show_settings {
         return None;
@@ -766,16 +860,49 @@ pub fn settings_dialog(
     // Kept apart from `changed`: opening a folder is an action, not an edit,
     // and it must not make the app rewrite settings.toml.
     let mut action: Option<UiRequest> = None;
+    // Read before the closure borrows `settings`: the window's own frame is
+    // drawn around the very setting that decides whether it has one.
+    let native_decorations = settings.native_decorations;
 
-    egui::Window::new("Settings")
-        .collapsible(false)
-        .default_width(520.0)
-        .open(&mut open)
-        .show(ctx, |ui| {
+    crate::ui::detach::shell(
+        ctx,
+        "nit-settings",
+        tr("Settings"),
+        &mut open,
+        [560.0, 680.0],
+        buttons,
+        native_decorations,
+        |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Appearance");
+                // Roomier than egui's default. A settings window is read down
+                // the page one item at a time, and at the default 3pt the
+                // checkboxes and their hints ran together into a wall.
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.heading(tr("Appearance"));
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.label("Theme");
+                    ui.label(tr("Language"));
+                    egui::ComboBox::from_id_source("language-picker")
+                        .selected_text(settings.language.label())
+                        .show_ui(ui, |ui| {
+                            for lang in crate::i18n::Lang::ALL {
+                                if ui
+                                    .selectable_label(settings.language == lang, lang.label())
+                                    .clicked()
+                                {
+                                    settings.language = lang;
+                                    // Applied at once rather than at the next
+                                    // start: the rest of this window is what
+                                    // anyone changing the language wants to
+                                    // read in it.
+                                    crate::i18n::set_language(lang);
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr("Theme"));
                     egui::ComboBox::from_id_source("theme-picker")
                         .selected_text(settings.theme.clone())
                         .show_ui(ui, |ui| {
@@ -789,11 +916,18 @@ pub fn settings_dialog(
                                 }
                             }
                         });
-                    // A theme is a TOML file edited by hand, so the useful
-                    // button next to the picker is the one that shows where
-                    // they live.
+                    // Editing a theme by hand is still possible, but it is no
+                    // longer the only way: the manager is what the button next
+                    // to the picker offers first.
                     if ui
-                        .button("Open folder")
+                        .button(tr("Manage themes..."))
+                        .on_hover_text(tr("Duplicate a built-in theme and change any of its colours, including the ObjectScript ones."))
+                        .clicked()
+                    {
+                        state.themes.open = true;
+                    }
+                    if ui
+                        .button(tr("Open folder"))
                         .on_hover_text(crate::config::themes_dir().display().to_string())
                         .clicked()
                     {
@@ -801,12 +935,12 @@ pub fn settings_dialog(
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Font");
+                    ui.label(tr("Font"));
                     let families = state
                         .font_families
                         .get_or_insert_with(crate::ui::fonts::monospace_families);
                     let selected = if settings.font_family.is_empty() {
-                        BUILT_IN_FONT
+                        tr(BUILT_IN_FONT)
                     } else {
                         settings.font_family.as_str()
                     };
@@ -814,7 +948,10 @@ pub fn settings_dialog(
                         .selected_text(selected)
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(settings.font_family.is_empty(), BUILT_IN_FONT)
+                                .selectable_label(
+                                    settings.font_family.is_empty(),
+                                    tr(BUILT_IN_FONT),
+                                )
                                 .clicked()
                             {
                                 settings.font_family.clear();
@@ -831,10 +968,10 @@ pub fn settings_dialog(
                             }
                         });
                 });
-                ui.small("Monospace families only: the terminal is a character grid, so a proportional font would not line up.");
+                ui.small(tr("Monospace families only: the terminal is a character grid, so a proportional font would not line up."));
 
                 ui.horizontal(|ui| {
-                    ui.label("Font size");
+                    ui.label(tr("Font size"));
                     if ui
                         .add(egui::Slider::new(&mut settings.font_size, 8.0..=28.0))
                         .changed()
@@ -844,17 +981,17 @@ pub fn settings_dialog(
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label("Cursor");
+                    ui.label(tr("Cursor"));
                     for style in CursorStyle::ALL {
                         if ui
-                            .selectable_label(settings.cursor_style == style, style.label())
+                            .selectable_label(settings.cursor_style == style, tr(style.label()))
                             .clicked()
                         {
                             settings.cursor_style = style;
                             changed = true;
                         }
                     }
-                    if ui.checkbox(&mut settings.cursor_blink, "Blink").changed() {
+                    if ui.checkbox(&mut settings.cursor_blink, tr("Blink")).changed() {
                         changed = true;
                     }
                 });
@@ -862,36 +999,47 @@ pub fn settings_dialog(
                 if ui
                     .checkbox(
                         &mut settings.terminal_syntax_highlight,
-                        "Syntax highlighting",
+                        tr("Syntax highlighting"),
                     )
                     .on_hover_text(
-                        "Colours globals, strings, numbers, commands, macros and class references. A guess about the text on screen; a colour IRIS sets itself always wins.",
+                        tr("Colours globals, strings, numbers, commands, macros and class references. A guess about the text on screen; a colour IRIS sets itself always wins."),
                     )
                     .changed()
                 {
                     changed = true;
                 }
                 if ui
-                    .checkbox(&mut settings.show_scrollbars, "Show scrollbars")
+                    .checkbox(&mut settings.show_scrollbars, tr("Show scrollbars"))
                     .on_hover_text(
-                        "Solid scrollbars instead of the thin ones that only appear on hover.",
+                        tr("Solid scrollbars instead of the thin ones that only appear on hover."),
                     )
                     .changed()
                 {
                     changed = true;
                 }
-                ui.small("Theme files live in the themes folder; drop one in and restart.");
                 ui.small(
-                    "Each theme also carries the ObjectScript colours, named after the scopes the InterSystems VS Code extension uses - copy them straight across from an editor colour customisation.",
-                );
-                ui.small(
-                    "A built-in theme is rewritten on every start; clear its `builtin` flag to keep your own edits.",
+                    tr("The built-in themes are read-only; duplicating one in the theme manager gives you a copy to edit. A theme file dropped into the themes folder by hand is picked up at the next start."),
                 );
 
-                ui.separator();
-                ui.heading("Session");
+                section(ui, tr("Session"));
                 ui.horizontal(|ui| {
-                    ui.label("Scrollback lines");
+                    ui.label(tr("Hide status messages after"));
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut settings.status_timeout_secs)
+                                .range(0..=600)
+                                .suffix(" s"),
+                        )
+                        .on_hover_text(tr(
+                            "Seconds before a message in the footer goes away on its own. 0 leaves it until it is dismissed.",
+                        ))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr("Scrollback lines"));
                     if ui
                         .add(
                             egui::DragValue::new(&mut settings.scrollback_limit).range(0..=200_000),
@@ -902,22 +1050,22 @@ pub fn settings_dialog(
                     }
                 });
                 if ui
-                    .checkbox(&mut settings.wrap_lines, "Wrap long lines")
+                    .checkbox(&mut settings.wrap_lines, tr("Wrap long lines"))
                     .on_hover_text(
-                        "On: a long line continues on the next row, breaking at the window edge. Off: it runs off to the right, reached by scrolling sideways or widening the window.",
+                        tr("On: a long line continues on the next row, breaking at the window edge. Off: it runs off to the right, reached by scrolling sideways or widening the window."),
                     )
                     .changed()
                 {
                     changed = true;
                 }
                 ui.small(
-                    "Either way the whole line is kept: the terminal is reported wider than the window, because IRIS cuts a line at the terminal width instead of wrapping it.",
+                    tr("Either way the whole line is kept: the terminal is reported wider than the window, because IRIS cuts a line at the terminal width instead of wrapping it."),
                 );
 
                 if ui
-                    .checkbox(&mut settings.copy_on_select, "Copy on select")
+                    .checkbox(&mut settings.copy_on_select, tr("Copy on select"))
                     .on_hover_text(
-                        "Put a selection on the clipboard as soon as the mouse is released, without waiting for Ctrl+C.",
+                        tr("Put a selection on the clipboard as soon as the mouse is released, without waiting for Ctrl+C."),
                     )
                     .changed()
                 {
@@ -926,10 +1074,10 @@ pub fn settings_dialog(
                 if ui
                     .checkbox(
                         &mut settings.save_command_history,
-                        "Remember commands from earlier sessions",
+                        tr("Remember commands from earlier sessions"),
                     )
                     .on_hover_text(
-                        "Keeps the commands typed at an IRIS prompt in history.txt, so Up reaches back past the session that is open now. Off keeps recall working within the session and writes nothing to disk.",
+                        tr("Keeps the commands typed at an IRIS prompt in history.txt, so Up reaches back past the session that is open now. Off keeps recall working within the session and writes nothing to disk. Either way, Up and Down are the recall, and lines sent by a macro or an IRIS helper are never offered back."),
                     )
                     .changed()
                 {
@@ -939,7 +1087,7 @@ pub fn settings_dialog(
                 if ui
                     .checkbox(
                         &mut settings.open_on_start,
-                        "Open the default profile at startup",
+                        tr("Open the default profile at startup"),
                     )
                     .changed()
                 {
@@ -948,80 +1096,165 @@ pub fn settings_dialog(
                 if ui
                     .checkbox(
                         &mut settings.confirm_close_with_live_session,
-                        "Ask before closing with a session still connected",
+                        tr("Ask before closing with a session still connected"),
                     )
                     .changed()
                 {
                     changed = true;
                 }
 
-                ui.separator();
-                ui.heading("Window");
+                section(ui, tr("Window"));
                 if ui
                     .checkbox(
                         &mut settings.native_decorations,
-                        "Use the system title bar",
+                        tr("Use the system title bar"),
                     )
                     .on_hover_text(
-                        "Off by default: the app draws its own, which frees the row the system bar would take.",
+                        tr("Off by default: the app draws its own, which frees the row the system bar would take."),
                     )
                     .changed()
                 {
                     changed = true;
                 }
                 if ui
-                    .checkbox(&mut settings.save_terminal_size, "Save terminal size")
+                    .checkbox(
+                        &mut settings.show_window_buttons,
+                        tr("Show the window buttons"),
+                    )
                     .on_hover_text(
-                        "Reopens the window at the size it was last closed at. Off opens it at 100x30 characters, whatever the font size.",
+                        tr("Minimize, maximize and close in the app's own title bar. Off leaves the row to the tabs: the window still drags, double-click still maximizes, and Ctrl+W still closes. The active theme decides how the buttons look and which end they sit at."),
                     )
                     .changed()
                 {
                     changed = true;
                 }
-                if ui
-                    .checkbox(&mut settings.save_window_position, "Save window position")
-                    .on_hover_text(
-                        "Reopens the window where it was last closed. Off centres it on the screen.",
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.small("Takes effect the next time the app starts.");
+                ui.horizontal(|ui| {
+                    ui.label(tr("Terminal size"));
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut settings.default_cols)
+                                .range(20..=500)
+                                .prefix(format!("{} ", tr("Columns"))),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    for cols in crate::config::COMMON_COLS {
+                        if ui
+                            .selectable_label(settings.default_cols == cols, cols.to_string())
+                            .clicked()
+                        {
+                            settings.default_cols = cols;
+                            changed = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("     ");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut settings.default_rows)
+                                .range(5..=200)
+                                .prefix(format!("{} ", tr("Rows"))),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    for rows in crate::config::COMMON_ROWS {
+                        if ui
+                            .selectable_label(settings.default_rows == rows, rows.to_string())
+                            .clicked()
+                        {
+                            settings.default_rows = rows;
+                            changed = true;
+                        }
+                    }
+                });
+                ui.small(tr(
+                    "The size a window opens at when it is not reopening at the last one. In characters, so it holds the same amount of output at any font size.",
+                ));
 
-                ui.separator();
-                ui.heading("Macros");
-                ui.label("Organization macro file (shared, read-only)");
+                if ui
+                    .checkbox(&mut settings.save_terminal_size, tr("Save terminal size"))
+                    .on_hover_text(
+                        tr("Reopens the window at the size it was last closed at. Off opens it at 100x30 characters, whatever the font size."),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(&mut settings.save_window_position, tr("Save window position"))
+                    .on_hover_text(
+                        tr("Reopens the window where it was last closed. Off centres it on the screen."),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.small(tr("Takes effect the next time the app starts."));
+
+                section(ui, tr("Updates"));
+                if ui
+                    .checkbox(
+                        &mut settings.check_for_updates,
+                        tr("Check for a new version at startup"),
+                    )
+                    .on_hover_text(tr(
+                        "One request to GitHub through the machine's own proxy. Nothing is downloaded or replaced without being asked.",
+                    ))
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(tr1(
+                        "This build is version {}.",
+                        crate::features::update::CURRENT,
+                    ));
+                    if ui.button(tr("Check now")).clicked() {
+                        action = Some(UiRequest::CheckForUpdates);
+                    }
+                });
+                if let Some(proxy) = crate::features::update::system_proxy() {
+                    ui.small(tr1("Going through the system proxy at {}.", &proxy));
+                } else {
+                    ui.small(tr("No system proxy configured; connecting directly."));
+                }
+
+                section(ui, tr("Macros"));
+                ui.label(tr("Organization macro file (shared, read-only)"));
                 let mut org = settings.org_macros_path.display().to_string();
                 if ui.text_edit_singleline(&mut org).changed() {
                     settings.org_macros_path = std::path::PathBuf::from(org.trim());
                     changed = true;
                 }
                 ui.small(
-                    "A UNC share, mapped drive, or local copy. Leave empty for none.                      Your personal macros are edited in the Macros panel.",
+                    tr("A UNC share, mapped drive, or local copy. Leave empty for none.                      Your personal macros are edited in the Macros panel."),
                 );
                 if let Some(path) = settings.org_macros() {
                     if path.exists() {
-                        ui.small("Found.");
+                        ui.small(tr("Found."));
                     } else {
                         ui.colored_label(
                             WARNING,
-                            "Not reachable right now - personal macros will still load.",
+                            tr("Not reachable right now - personal macros will still load."),
                         );
                     }
                 }
 
-                ui.separator();
-                ui.heading("Logging");
+                section(ui, tr("Logging"));
                 ui.horizontal(|ui| {
-                    ui.label("Default mode");
+                    ui.label(tr("Default mode"));
                     for (mode, label) in [
                         (LogMode::Off, "Off"),
                         (LogMode::Clean, "Clean text"),
                         (LogMode::Raw, "Raw bytes"),
                     ] {
                         if ui
-                            .selectable_label(settings.default_log_mode == mode, label)
+                            .selectable_label(settings.default_log_mode == mode, tr(label))
                             .clicked()
                         {
                             settings.default_log_mode = mode;
@@ -1030,7 +1263,7 @@ pub fn settings_dialog(
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Keep logs for (days, 0 = forever)");
+                    ui.label(tr("Keep logs for (days, 0 = forever)"));
                     if ui
                         .add(egui::DragValue::new(&mut settings.log_retention_days).range(0..=3650))
                         .changed()
@@ -1038,15 +1271,15 @@ pub fn settings_dialog(
                         changed = true;
                     }
                 });
-                ui.small(format!("Logs: {}", settings.log_dir.display()));
+                ui.small(tr1("Logs: {}", &settings.log_dir.display().to_string()));
 
-                ui.separator();
-                ui.heading("Profiles");
+                section(ui, tr("Profiles"));
                 if profiles_editor(ui, settings, instances) {
                     changed = true;
                 }
             });
-        });
+        },
+    );
 
     if !open {
         state.show_settings = false;
@@ -1061,7 +1294,7 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
 
     for (index, profile) in settings.profiles.iter_mut().enumerate() {
         egui::CollapsingHeader::new(if profile.name.is_empty() {
-            format!("Profile {}", index + 1)
+            tr1("Profile {}", &(index + 1).to_string())
         } else {
             profile.name.clone()
         })
@@ -1070,7 +1303,7 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
             changed |= labelled_edit(ui, "Name", &mut profile.name);
 
             ui.horizontal(|ui| {
-                ui.label("Instance");
+                ui.label(tr("Instance"));
                 if instances.is_empty() {
                     changed |= ui.text_edit_singleline(&mut profile.instance).changed();
                 } else {
@@ -1093,13 +1326,13 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
             changed |= labelled_edit(ui, "Namespace", &mut profile.namespace);
 
             ui.horizontal(|ui| {
-                ui.label("Encoding");
+                ui.label(tr("Encoding"));
                 egui::ComboBox::from_id_source(("encoding", index))
-                    .selected_text(profile.encoding.label())
+                    .selected_text(tr(profile.encoding.label()))
                     .show_ui(ui, |ui| {
                         for enc in Encoding::ALL {
                             if ui
-                                .selectable_label(profile.encoding == enc, enc.label())
+                                .selectable_label(profile.encoding == enc, tr(enc.label()))
                                 .clicked()
                             {
                                 profile.encoding = enc;
@@ -1108,30 +1341,32 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
                         }
                     });
             });
-            ui.small("Leave as UTF-8 unless accented characters come out wrong.");
+            ui.small(tr(
+                "Leave as UTF-8 unless accented characters come out wrong.",
+            ));
 
             ui.separator();
             changed |= ui
-                .checkbox(&mut profile.autologon, "Log in automatically")
+                .checkbox(&mut profile.autologon, tr("Log in automatically"))
                 .changed();
             if profile.autologon {
                 changed |= labelled_edit(ui, "Username", &mut profile.username);
                 password_editor(ui, profile, index);
                 if profile.username.is_empty() {
-                    ui.colored_label(WARNING, "Autologon needs a username.");
+                    ui.colored_label(WARNING, tr("Autologon needs a username."));
                 }
             }
 
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label("Logging");
+                ui.label(tr("Logging"));
                 for (mode, label) in [
                     (LogMode::Off, "Use default"),
                     (LogMode::Clean, "Clean"),
                     (LogMode::Raw, "Raw"),
                 ] {
                     if ui
-                        .selectable_label(profile.logging == mode, label)
+                        .selectable_label(profile.logging == mode, tr(label))
                         .clicked()
                     {
                         profile.logging = mode;
@@ -1140,7 +1375,7 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
                 }
             });
 
-            if ui.button("Delete this profile").clicked() {
+            if ui.button(tr("Delete this profile")).clicked() {
                 remove = Some(index);
             }
         });
@@ -1155,7 +1390,7 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
     }
 
     ui.horizontal(|ui| {
-        if ui.button("Add profile").clicked() {
+        if ui.button(tr("Add profile")).clicked() {
             settings.profiles.push(Profile {
                 name: format!("Profile {}", settings.profiles.len() + 1),
                 instance: instances.first().cloned().unwrap_or_default(),
@@ -1164,7 +1399,7 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
             changed = true;
         }
         if !settings.profiles.is_empty() {
-            ui.label("Default");
+            ui.label(tr("Default"));
             egui::ComboBox::from_id_source("default-profile")
                 .selected_text(settings.default_profile.clone())
                 .show_ui(ui, |ui| {
@@ -1196,16 +1431,16 @@ fn password_editor(ui: &mut Ui, profile: &Profile, index: usize) {
 
     let stored = profile.password().is_some();
     ui.horizontal(|ui| {
-        ui.label("Password");
+        ui.label(tr("Password"));
         ui.add(egui::TextEdit::singleline(&mut buffer).password(true));
 
-        if ui.button("Save").clicked() {
+        if ui.button(tr("Save")).clicked() {
             match profile.set_password(&buffer) {
                 Ok(()) => buffer.clear(),
                 Err(e) => log::error!("could not store the password: {e:#}"),
             }
         }
-        if stored && ui.button("Forget").clicked() {
+        if stored && ui.button(tr("Forget")).clicked() {
             profile.clear_password();
         }
     });
@@ -1218,10 +1453,10 @@ fn password_editor(ui: &mut Ui, profile: &Profile, index: usize) {
     ui.memory_mut(|m| m.data.insert_temp(id, buffer));
 }
 
-fn labelled_edit(ui: &mut Ui, label: &str, value: &mut String) -> bool {
+fn labelled_edit(ui: &mut Ui, label: &'static str, value: &mut String) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label(label);
+        ui.label(tr(label));
         changed = ui.text_edit_singleline(value).changed();
     });
     changed

@@ -1,195 +1,176 @@
 # newIrisTerminal
 
-Terminal emulator for InterSystems IRIS.
+A terminal emulator for InterSystems IRIS — Rust, egui, and a real
+pseudo-terminal, so full-screen routines such as `^%G` page correctly instead of
+being flattened into line-oriented output.
 
-Written in Rust, with egui. Runs on Windows, Linux, and macOS.
+Runs on Windows, Linux and macOS. Interface in English and Brazilian
+Portuguese.
 
-Sessions are driven through a real pseudo-terminal (ConPTY on Windows,
-`openpty` elsewhere), so full-screen routines such as `^%G` render and page
-correctly rather than being flattened into line-oriented output.
+## Highlights
 
-## Feature-set
+* **Tabs** — one IRIS session per tab, each with its own scrollback and log.
+  `+` (Ctrl+T) connects on the last-used server; right-click it for every
+  profile, server and discovered instance.
+* **Its own window frame** — the tab strip sits where the title bar would be.
+  Drag, double-click to maximize, resize from any edge. The buttons come from
+  the theme, can be moved to either end, hidden one at a time, or switched off
+  altogether.
+* **A clear-screen that keeps the transcript** — `W #` files the old screen into
+  scrollback instead of destroying it, the way the native IrisTerm does.
+  Ctrl+Delete is the separate, deliberate gesture that really throws it away.
+* **ObjectScript colouring in the terminal** — globals, strings, macros,
+  class/method references, routine and extrinsic calls, commands and their IRIS
+  abbreviations. Prompt-aware, so plain prose never lights up.
+* **Line editing at the prompt** — Home/End, Ctrl+Left/Right by word, click to
+  place the cursor, Ctrl+A to select the line, Shift to drag a selection out of
+  it, double-click to take a whole line. Built entirely from keys IRIS acts on,
+  since IRIS owns the read buffer.
+* **Command history that outlives the session** — every command typed at a
+  prompt is remembered, and Up/Down walk it. Lines a macro or an IRIS helper
+  sent are never offered back, and IRIS's own recall — which is full of them —
+  is never reachable.
+* **Themes you can edit in the app** — ten built-in and immutable; duplicate one
+  and every colour is yours, including the sixteen ANSI slots and the sixteen
+  ObjectScript ones, with a live sample beside the editor.
+* **Analyze with Claude** — right-click → *Analyze with Claude* opens a Claude
+  Code session in a window of its own with the terminal output already in its
+  context, then waits for your question rather than asking one for you. Four
+  scopes: all output, the last 10 commands, the last 5, or just the selection.
+  Needs `claude` on the PATH.
+* **Macros from XML** — `{{param}}` substitution, `confirm="true"` for anything
+  that writes, a keyboard shortcut per macro, `hide_command="true"` for a
+  command line carrying a password.
+* **IRIS utilities** — fill in the fields and the exact line is composed and
+  sent: compile a package, generate an interface.
+* **Export** — screen or full scrollback, as text or colour-preserving HTML.
+* **Logging** — per-session transcripts, raw or clean, with password redaction
+  and rotation.
+* **Autologon** — credentials from the OS credential store, never from
+  `settings.toml`.
+* **Auto-update** — checks GitHub for a newer release at startup, through the
+  machine's own proxy. Nothing is downloaded or replaced without being asked.
+* **Plugins** — sandboxed WebAssembly, behind the optional `plugins` feature.
 
-* **Done:**
-  * Multitab — one IRIS session per tab, independent scrollback and logging.
-    `+` (or Ctrl+T) connects straight away on the last-used profile/instance
-    with no dialog in the way; right-click `+` for a menu of every configured
-    profile and every discovered instance
-  * Custom window chrome — the app draws its own titlebar (hand-stroked
-    minimize / maximize-restore / close, red on close-hover), the empty part
-    of it drags the window and double-click maximizes, and the edges/corners
-    resize like a native window. Settings → Window → "Use the system title
-    bar" switches back to OS decorations if you'd rather have those
-  * Clear-screen that keeps the transcript — `W #` doesn't clear in one shot,
-    it erases row by row; the terminal catches that sweep and files the
-    pre-clear screen into scrollback instead of destroying it, the way the
-    native IrisTerm does. Ctrl+Delete (or right-click → "Clear terminal and
-    scrollback") is the separate, deliberate gesture that actually throws the
-    history away. At an idle prompt it asks IRIS for the clear (`W #`) rather
-    than wiping the grid, because the far side repaints by absolute cursor
-    position and would otherwise put its next prompt back at the row it had
-    reached with blank rows above it; the echoed command and the old screen
-    are dropped rather than filed, so nothing of it stays behind. Mid-line or
-    mid-routine, where the command could be swallowed as input, the grid is
-    cleared locally instead
-  * ObjectScript syntax colouring in the terminal, prompt-aware so it never
-    lights up plain prose: globals, strings, numbers, delimiters/operators,
-    commands (full words and their IRIS abbreviations), preprocessor macros
-    (`$$$`, `#define`), functions and system variables (`$piece`, `$horolog`),
-    class/method/attribute/member references (`##class(...)`, `..Prop`,
-    `obj.Method(`), routine and extrinsic calls (`^ROU`, `$$Tag^ROU`) and
-    labels. Field names in a theme are named after the semantic scopes of the
-    InterSystems VS Code extension, so a colour customisation can be copied
-    straight across
-  * Line editing at the prompt, as close to a text field as a terminal gets —
-    Home and End walk to the ends of the command being typed, Ctrl+Left/Right
-    walk it a word at a time, clicking inside it puts the cursor there, Ctrl+A
-    selects it, Shift plus Left/Right/Home/End (or Ctrl+Shift+Left/Right, by
-    word) drags a selection out of it, and Backspace/Delete rub that selection
-    — or the mouse's — out, as does typing or pasting over it. An unshifted
-    movement key drops the selection again. Word boundaries are an editor's,
-    counting a run of punctuation as a stop of its own, so Ctrl+Right walks
-    `do ^%CSW1GEN("X")` a piece at a time. IRIS owns the read buffer, so all
-    of it is built from the arrow keys and rubouts it does act on — and
-    extending a selection sends nothing at all; off a command line (in `^%G`,
-    say) the keys reach IRIS untouched
-  * Command history that outlives the session — every command typed at an IRIS
-    prompt is remembered, and Up/Down walk it. Shared by every tab, and kept in
-    `history.txt` unless Settings → Session → "Remember commands from earlier
-    sessions" is off
-  * Copy on select — a finished selection goes to the clipboard without waiting
-    for Ctrl+C. Settings → Session
-  * Autologon — username/password from the OS credential store, with post-login commands
-  * Window resize and fit content to window — the grid reflows and the PTY is resized
-  * Macros read from XML — `{{param}}` substitution, `confirm="true"` for
-    anything that writes, an optional keyboard shortcut per macro
-    (`key="Ctrl+Shift+G"`), `hide_command="true"` to keep a password-bearing
-    command line out of the panel, and a one-click Run button on every row.
-    Ships with one: **Developer Tools (Exec)**
-  * Theming support — TOML themes, hot-swappable, applied to terminal and
-    chrome alike, with an "Open folder" button that jumps straight to the
-    themes directory. Also covers font family (from the system's installed
-    fonts) and size, cursor style and blink, and solid vs hover-only
-    scrollbars
-  * Plugin interface — sandboxed WebAssembly, behind the `plugins` feature
-  * Logging — per-session transcripts, raw or clean, with password redaction and rotation
-  * IRIS utilities panel — fill in the fields and the exact line is composed
-    and sent: **Compile classes**
-    (`do $SYSTEM.OBJ.CompilePackage("<package>","<flag>")`, flag defaulting to
-    `bkf1`) and **Generate interface** (`do ^%CSW1GEN("<routine/group>")`).
-    Clicking the open one again folds it away and keeps what you typed
-  * Export output — screen or full scrollback, as text or colour-preserving HTML
-  * Right-click menu for copy / paste / select all / clear terminal and scrollback
-  * Custom app icon, embedded both in the `.exe` (Explorer/taskbar) and loaded
-    at runtime for the window icon
+## Themes
 
-## Building
+Ten built-ins, none of which can be edited or deleted:
 
-Requires a Rust toolchain with a working linker.
+| Theme | |
+|---|---|
+| IRIS Dark | the default |
+| IRIS Classic Green | phosphor, with a syntax palette of its own so the colours do not fight the hue |
+| Tokyo | ported from the author's VS Code theme |
+| Light | for a bright room |
+| Tiger Aqua / Tiger Graphite | Mac OS X 10.4, with glass traffic lights and the Aqua scroll handle |
+| Windows XP | Luna's blue title bar and its gradient buttons |
+| KDE Plastik | KDE 3's grey-blue widgets around a white Konsole |
+| Hello Kitty / Hello Kitty Dark | pink, and pink after dark |
+
+Duplicate one and the theme manager gives you every colour it carries —
+terminal, chrome, window buttons, the sixteen ANSI slots and the sixteen
+ObjectScript scopes — with a sample beside the editor that repaints as you drag
+a swatch. Themes you make are TOML files in the config directory; a file dropped
+in there by hand is picked up at the next start.
+
+Settings and the theme manager open as windows of their own, framed by the app
+the way the main window is, so they are not covering the terminal you are
+choosing colours against.
+
+## Install
+
+Grab a build from the
+[releases page](https://github.com/ccsJoaoAzevedo/newIrisTerminal/releases), or
+build it yourself:
 
 ```sh
 cargo build --release
 cargo test
 ```
 
-The plugin host is optional and off by default, because it pulls in wasmtime:
+The plugin host pulls in wasmtime and is off by default:
 
 ```sh
 cargo build --release --features plugins
 ```
 
-### Windows without Visual Studio
-
-The GNU toolchain avoids the Visual Studio Build Tools dependency, but the
-minimal MinGW that ships inside the Rust MSI lacks the assembler `dlltool`
-needs. Install a full MinGW-w64 alongside it:
+On Windows without Visual Studio, the GNU toolchain needs a full MinGW-w64
+beside it (the one inside the Rust MSI lacks the assembler `dlltool` wants):
 
 ```powershell
 winget install Rustlang.Rust.GNU
 winget install BrechtSanders.WinLibs.POSIX.MSVCRT
 ```
 
-## Testing
+## Configuration
 
-Unit tests cover the VT parser, grid, encodings, macro XML, autologon, logging,
-export, and input mapping. None of them need IRIS:
+Everything lives under the platform config directory —
+`%APPDATA%\newIrisTerminal`, `~/.config/newIrisTerminal`, or
+`~/Library/Application Support/newIrisTerminal`:
+
+| File | Purpose |
+|---|---|
+| `settings.toml` | Language, theme, font, window, session and logging settings, and the profiles |
+| `macros.xml` | Your personal macros — editable in the app |
+| `history.txt` | Commands typed at an IRIS prompt, for recall |
+| `themes/*.toml` | Your own themes, written by the theme manager |
+| `analysis/*.md` | Output handed to Claude Code by *Analyze with Claude* |
+| `plugins/*.wasm` | Plugins, with an optional `.toml` manifest beside each |
+
+Passwords are never in `settings.toml`: they go to the OS credential store
+(Windows Credential Manager, macOS Keychain, Secret Service), keyed by profile
+name.
+
+Macros come from two files — a shared organisation file (read-only, shown with
+an `org` badge) and your personal `macros.xml`. Groups of the same name merge,
+organisation entries first, and saving only ever writes the personal file.
+
+### Encoding
+
+Defaults to **UTF-8 double-encoded via CP850 (repair)**, because that is what
+the instances here need: some IRIS configurations translate output to UTF-8 and
+then run the result through CP850 → UTF-8 again, so `Configuração` arrives as
+`Configura├º├úo`. The repair only converts a run of non-ASCII bytes that both
+form valid UTF-8 and decode to ordinary Latin text, so genuine box drawing
+passes through untouched. Plain UTF-8, CP850, Windows-1252 and ISO 8859-1 are
+selectable per profile.
+
+To see which one your instance needs:
+
+```sh
+cargo test --test live_charset -- --ignored --nocapture
+```
+
+## Versioning
+
+[ZeroVer](https://0ver.org): the major version stays at zero. A release bumps
+the minor, and the updater compares the numbers rather than the string, so
+`0.2.0` is newer than `0.1.9`.
+
+## Tests
+
+The unit tests cover the VT parser, grid, encodings, macro XML, autologon,
+logging, export, themes, translations, the updater and input mapping, and need
+no IRIS:
 
 ```sh
 cargo test
 ```
 
-Integration tests that talk to a real instance are ignored by default:
+The tests that talk to a real instance are ignored by default; they open a
+session and read the banner, never logging in and never writing data:
 
 ```sh
-cargo test --test live_session  -- --ignored --nocapture   # session opens, resizes
-cargo test --test live_input    -- --ignored --nocapture   # arrow recall, Ctrl+C interrupt
-cargo test --test live_charset  -- --ignored --nocapture   # which encoding is correct here
-cargo test --test live_wrap     -- --ignored --nocapture   # where long output gets cut
-cargo test --test live_timing   -- --ignored --nocapture   # where session-open time goes
+cargo test --test live_session -- --ignored --nocapture
 ```
 
-Set `IRIS_TEST_INSTANCE` to choose the instance; otherwise the first discovered
-one is used. These tests only open a session and read the banner — they never
-log in and never write data.
-
-## Configuration
-
-Everything lives under the platform config directory — `%APPDATA%\newIrisTerminal`,
-`~/.config/newIrisTerminal`, or `~/Library/Application Support/newIrisTerminal`:
-
-| File | Purpose |
-|---|---|
-| `settings.toml` | Profiles, theme, font/cursor/scrollbar, window decorations, scrollback, copy-on-select, command history, logging |
-| `macros.xml` | Your personal macros — editable from the Macros panel |
-| `history.txt` | Commands typed at an IRIS prompt, for Up/Down recall |
-| `themes/*.toml` | Colour schemes; drop a file in and restart |
-| `plugins/*.wasm` | Plugins, with an optional `.toml` manifest beside each |
-
-### Macros
-
-Macros come from two files:
-
-* **Organization** — a shared file, path configured in Settings (UNC share,
-  mapped drive, or local copy). Shown with an `org` badge and never written to.
-  If it is unreachable you get a notice and your personal macros still load.
-* **Personal** — `macros.xml` in the config directory, created on first run and
-  editable in the app. While it is still exactly as shipped it is refreshed
-  when the bundled set changes; the first edit claims the file for good.
-
-Groups with the same name merge, organisation entries first. Saving only ever
-writes personal macros, so a shared macro cannot silently fork into a local copy.
-
-Passwords are **not** stored in `settings.toml`. They go to the OS credential
-store (Windows Credential Manager, macOS Keychain, Secret Service) keyed by
-profile name.
-
-### Instance discovery
-
-Instances come from `iris list`. Note that the registered instance name is not
-always the install directory name, and the keyword in that output varies by
-version (`Instance 'NAME'` on standard installs, `Configuration 'NAME'` on
-custom ones) — both are handled.
-
-## Encoding
-
-Defaults to **UTF-8 double-encoded via CP850 (repair)**, because that is what
-the instances here actually need: some IRIS configurations translate output to
-UTF-8 and then run the result through CP850 → UTF-8 a second time, so `Nó`
-arrives as `├│` and `Configuração` as `Configura├º├úo`.
-
-The repair is safe to leave on. It works per run of non-ASCII characters and
-only converts a run whose bytes form valid UTF-8 *and* decode to ordinary Latin
-text — so genuine box drawing (`├───┤`) and already-correct accented text pass
-through untouched. Plain `UTF-8`, `CP850`, `Windows-1252` and `ISO 8859-1` are
-selectable per profile if your instance differs.
-
-Run `cargo test --test live_charset -- --ignored --nocapture` to see which
-encoding renders your instance correctly.
+`IRIS_TEST_INSTANCE` picks the instance; otherwise the first discovered one is
+used. Instances come from `iris list`, whose keyword varies by version
+(`Instance 'NAME'`, `Configuration 'NAME'`) — both are handled.
 
 ## Safety note
 
-Macros and native helpers type into a live session. `RDB*` databases are shared
-with the whole team, so any macro that modifies data should carry
-`confirm="true"`; the terminal then shows the exact expanded text and requires
-an explicit yes before sending. The bundled sample demonstrates this on its
-`KILL` example.
+Macros and the IRIS utilities type into a live session, and `RDB*` databases are
+shared with the whole team. Any macro that modifies data should carry
+`confirm="true"`: the terminal then shows the exact expanded text and requires
+an explicit yes before sending.

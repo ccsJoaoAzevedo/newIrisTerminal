@@ -6,6 +6,7 @@
 pub mod app;
 pub mod config;
 pub mod features;
+pub mod i18n;
 pub mod plugins;
 pub mod pty;
 pub mod term;
@@ -66,11 +67,8 @@ pub fn run() -> eframe::Result<()> {
     // because it is expressed in characters. Either way `App` has the last word
     // once it can measure one.
     let inner_size = settings.restored_window_size().unwrap_or_else(|| {
-        estimated_inner_size(
-            &settings,
-            config::DEFAULT_TERMINAL_COLS,
-            config::DEFAULT_TERMINAL_ROWS,
-        )
+        let (cols, rows) = settings.default_geometry();
+        estimated_inner_size(&settings, cols, rows)
     });
     let position = settings.restored_window_position();
 

@@ -4,11 +4,14 @@
 use egui::{Context, Key, Modifiers};
 
 use crate::config::{self, ensure_config_tree, load_themes, LogMode, Profile, Settings, Theme};
+use crate::features::analyze;
 use crate::features::autologon::{Autologon, State as AutoState};
 use crate::features::export::{self, Range};
 use crate::features::history::History;
 use crate::features::logging::{self, SessionLog};
 use crate::features::macros::{self, MacroGroup};
+use crate::features::update;
+use crate::i18n::{tr, tr1, tr2};
 use crate::plugins::PluginHost;
 use crate::pty::launcher::launcher;
 use crate::pty::Session;
@@ -16,7 +19,64 @@ use crate::term::{lineedit, Grid, Motion};
 use crate::ui::chrome::{self, WindowAction};
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
 use crate::ui::terminal_view::{self, RenderOpts, Selection, ViewState};
+use crate::ui::theme_manager::{self, ThemeAction};
 use crate::ui::{fonts, input, shortcut};
+
+/// What the app knows about a newer version.
+///
+/// The check runs on a thread, so this is the state machine between "asked" and
+/// "the user has decided": nothing here blocks a frame.
+#[derive(Default)]
+pub struct UpdateState {
+    events: Option<crossbeam_channel::Receiver<update::Event>>,
+    /// A release newer than this build, once one has been found.
+    pub available: Option<update::Release>,
+    /// The downloaded executable, waiting to be put in place.
+    pub staged: Option<std::path::PathBuf>,
+    pub downloading: bool,
+    pub error: Option<String>,
+    /// The dialog has been shown for this release and dismissed. Kept so a
+    /// "later" is not undone by the next frame.
+    pub asked: bool,
+    /// The user asked for this check, so its answer is worth a status line even
+    /// when the answer is "nothing new".
+    announce: bool,
+}
+
+impl UpdateState {
+    /// Starts a check on a thread of its own.
+    fn start_check(&mut self) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.events = Some(rx);
+        self.error = None;
+        update::check_in_background(tx);
+    }
+
+    /// Starts a check the user asked for, whose answer is always reported.
+    pub fn check_now(&mut self) {
+        self.announce = true;
+        self.start_check();
+    }
+
+    /// Starts downloading the release that was found.
+    pub fn start_download(&mut self) {
+        let Some(release) = self.available.clone() else {
+            return;
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.events = Some(rx);
+        self.downloading = true;
+        self.error = None;
+        update::download_in_background(release, tx);
+    }
+
+    fn drain(&mut self) -> Vec<update::Event> {
+        let Some(rx) = self.events.as_ref() else {
+            return Vec::new();
+        };
+        rx.try_iter().collect()
+    }
+}
 
 /// Fallback PTY size, used only before the first frame has measured the
 /// window. After that, new sessions open at the size the terminal is actually
@@ -171,7 +231,7 @@ impl Tab {
             Ok(session) => {
                 self.session = Some(session);
                 let endpoint = self.profile.endpoint();
-                self.note(&format!("session started ({endpoint})"));
+                self.note(&crate::i18n::tr1("session started ({})", &endpoint));
             }
             Err(e) => {
                 // Surface the failure in the tab rather than a popup — the user
@@ -402,6 +462,12 @@ pub struct App {
     /// connect to. Right-clicking `+` picks a different one.
     new_tab_profile: Profile,
     status: Option<String>,
+    /// When the message in the footer went up, so it can be taken down again
+    /// once `status_timeout_secs` has passed.
+    status_at: Option<std::time::Instant>,
+    /// What the update thread has told us so far, and what the dialog is
+    /// showing. Every field is `None` on a build that has never checked.
+    updates: UpdateState,
     /// Font family egui has actually been given, which is not always the one
     /// in `settings`: a family that is no longer installed has to degrade to
     /// the bundled monospace, because naming an unregistered family panics
@@ -433,6 +499,9 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let _ = ensure_config_tree();
         let settings = Settings::load();
+        // Before anything is drawn: every label the first frame asks for goes
+        // through `tr`, which reads this.
+        crate::i18n::set_language(settings.language);
         let themes = load_themes();
 
         // Housekeeping that would otherwise never happen.
@@ -472,8 +541,8 @@ impl App {
         // maximized has no say in its size either.
         let fit = (settings.restored_window_size().is_none() && !settings.restored_maximized())
             .then(|| WindowFit {
-                cols: config::DEFAULT_TERMINAL_COLS,
-                rows: config::DEFAULT_TERMINAL_ROWS,
+                cols: settings.default_geometry().0,
+                rows: settings.default_geometry().1,
                 attempts: FIT_ATTEMPTS,
                 recentre: settings.restored_window_position().is_none(),
                 centre: None,
@@ -498,6 +567,8 @@ impl App {
             terminal_size: (FALLBACK_COLS, FALLBACK_ROWS),
             view_size: (FALLBACK_COLS as usize, FALLBACK_ROWS as usize),
             status: None,
+            status_at: None,
+            updates: UpdateState::default(),
             font_family: String::new(),
             font_request: String::new(),
             renaming: None,
@@ -508,6 +579,14 @@ impl App {
             window_position: None,
             window_maximized: false,
         };
+
+        // Whatever the last update left behind is no longer running and can
+        // go, and the check for the next one starts now: it is a request over
+        // a corporate proxy, so it is not going to answer this frame.
+        update::clean_up();
+        if app.settings.check_for_updates {
+            app.updates.start_check();
+        }
 
         App::apply_style(&cc.egui_ctx, &app.theme(), &app.settings);
         app.apply_font(&cc.egui_ctx);
@@ -557,8 +636,9 @@ impl App {
             self.font_family = wanted;
         } else {
             self.font_family = String::new();
-            self.set_status(format!(
-                "Font {wanted:?} is not installed; using the built-in monospace."
+            self.set_status(tr1(
+                "Font {} is not installed; using the built-in monospace.",
+                &format!("{wanted:?}"),
             ));
         }
     }
@@ -663,6 +743,31 @@ impl App {
 
     fn set_status(&mut self, text: impl Into<String>) {
         self.status = Some(text.into());
+        self.status_at = Some(std::time::Instant::now());
+    }
+
+    /// Takes the footer message down once it has had its time, and asks for the
+    /// frame that will do it.
+    ///
+    /// Without the repaint request the message would sit there until something
+    /// else happened to draw a frame - which, at an idle prompt, is nothing at
+    /// all.
+    fn expire_status(&mut self, ctx: &Context) {
+        let seconds = self.settings.status_timeout_secs;
+        if seconds == 0 || self.status.is_none() {
+            return;
+        }
+        let life = std::time::Duration::from_secs(u64::from(seconds));
+        let Some(at) = self.status_at else {
+            return;
+        };
+        match life.checked_sub(at.elapsed()) {
+            Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
+            _ => {
+                self.status = None;
+                self.status_at = None;
+            }
+        }
     }
 
     /// Whether the active terminal currently owns the keyboard.
@@ -762,16 +867,32 @@ impl App {
 
     /// The top row: app controls on the left, and - when the app is drawing its
     /// own frame - the window buttons and the draggable area on the right.
-    fn menu_bar(&mut self, ui: &mut egui::Ui) -> Option<WindowAction> {
+    fn menu_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        buttons: &crate::config::theme::WindowButtons,
+    ) -> Option<WindowAction> {
         let mut action = None;
         // Opening a tab has to happen after the closure: it borrows `self`
         // mutably, and the bar is already holding it.
         let mut open_default = false;
         let mut pick: Option<Profile> = None;
+        // The system bar brings its own controls, and the setting can turn the
+        // app's off entirely.
+        let own_buttons = !self.settings.native_decorations && self.settings.show_window_buttons;
         ui.horizontal(|ui| {
+            // Drawn before anything else when the theme puts them on the left,
+            // which is where Aqua has them.
+            if own_buttons && buttons.left {
+                if let Some(asked) = chrome::leading_window_buttons(ui, buttons) {
+                    action = Some(asked);
+                }
+                ui.add_space(6.0);
+            }
             let endpoint = self.new_tab_profile.endpoint();
-            let new_tab = ui.button("+").on_hover_text(format!(
-                "New session on {endpoint} (Ctrl+T).\nRight-click to connect somewhere else."
+            let new_tab = ui.button("+").on_hover_text(tr1(
+                "New session on {} (Ctrl+T).\nRight-click to connect somewhere else.",
+                &endpoint,
             ));
             if new_tab.clicked() {
                 open_default = true;
@@ -784,7 +905,7 @@ impl App {
                 // menu is worth opening, and the preferred one is already what
                 // the button does.
                 if !self.servers.is_empty() {
-                    ui.weak("IRIS servers");
+                    ui.weak(tr("IRIS servers"));
                     let preferred = self.new_tab_profile.name.clone();
                     for server in self.servers.others(Some(&preferred)) {
                         let mut button = ui.button(server.menu_label());
@@ -792,10 +913,10 @@ impl App {
                         // opens an instance and a remote one asks for a login.
                         let hint = match server.target(&self.instances) {
                             crate::config::servers::Target::Local { instance } => {
-                                format!("Local session on instance {instance}")
+                                tr1("Local session on instance {}", &instance)
                             }
                             crate::config::servers::Target::Telnet { address, port } => {
-                                format!("Telnet login to {address}:{port}")
+                                tr1("Telnet login to {}", &format!("{address}:{port}"))
                             }
                         };
                         let hint = if server.comment.trim().is_empty() {
@@ -859,16 +980,16 @@ impl App {
                     && self.instances.is_empty()
                     && self.servers.is_empty()
                 {
-                    ui.weak("No servers, profiles or instances found.");
+                    ui.weak(tr("No servers, profiles or instances found."));
                 }
             });
             ui.separator();
-            ui.toggle_value(&mut self.panels.show_macros, "Macros");
+            ui.toggle_value(&mut self.panels.show_macros, tr("Macros"));
             // Toggles, not plain buttons: clicking the button that opened a
             // dialog is how everyone expects to close it again, and it shows
             // which dialogs are open the way Macros already does.
-            ui.toggle_value(&mut self.panels.show_export, "Export");
-            ui.toggle_value(&mut self.panels.show_settings, "Settings");
+            ui.toggle_value(&mut self.panels.show_export, tr("Export"));
+            ui.toggle_value(&mut self.panels.show_settings, tr("Settings"));
             ui.separator();
             if let Some(tab) = self.active_tab() {
                 let (cols, rows) = self.view_size;
@@ -876,9 +997,14 @@ impl App {
             }
 
             // Last, so the leftover space it claims for dragging is whatever
-            // the items above did not take.
+            // the items above did not take. Claimed even when the controls are
+            // hidden or already drawn on the left: without it there is nothing
+            // to drag the window by.
             if !self.settings.native_decorations {
-                action = chrome::title_bar_controls(ui);
+                let trailing = own_buttons && !buttons.left;
+                if let Some(asked) = chrome::title_bar_controls(ui, buttons, trailing, "nit-main") {
+                    action = Some(asked);
+                }
             }
         });
 
@@ -1027,22 +1153,23 @@ impl App {
         let mut cancel = false;
         let mut open = true;
 
-        egui::Window::new("Close newIrisTerminal?")
+        egui::Window::new(tr("Close newIrisTerminal?"))
+            .id(egui::Id::new("nit-close-confirm"))
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(match live {
-                    1 => "1 session is still connected.".to_string(),
-                    n => format!("{n} sessions are still connected."),
+                    1 => tr("1 session is still connected.").to_string(),
+                    n => tr1("{} sessions are still connected.", &n.to_string()),
                 });
-                ui.small("Closing sends HALT to each of them.");
+                ui.small(tr("Closing sends HALT to each of them."));
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Close anyway").clicked() {
+                    if ui.button(tr("Close anyway")).clicked() {
                         close_anyway = true;
                     }
-                    if ui.button("Keep working").clicked() {
+                    if ui.button(tr("Keep working")).clicked() {
                         cancel = true;
                     }
                 });
@@ -1070,7 +1197,7 @@ impl App {
                     }
                     let response = ui
                         .selectable_label(selected, label)
-                        .on_hover_text("Double-click to rename.");
+                        .on_hover_text(tr("Double-click to rename."));
                     if response.clicked() {
                         self.active = index;
                     }
@@ -1078,11 +1205,11 @@ impl App {
                         to_rename = Some(index);
                     }
                     response.context_menu(|ui| {
-                        if ui.button("Rename...").clicked() {
+                        if ui.button(tr("Rename...")).clicked() {
                             to_rename = Some(index);
                             ui.close_menu();
                         }
-                        if ui.button("Close").clicked() {
+                        if ui.button(tr("Close")).clicked() {
                             to_close = Some(index);
                             ui.close_menu();
                         }
@@ -1128,7 +1255,8 @@ impl App {
         let mut clear = false;
         let mut cancel = false;
 
-        egui::Window::new("Rename tab")
+        egui::Window::new(tr("Rename tab"))
+            .id(egui::Id::new("nit-rename-tab"))
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -1143,16 +1271,16 @@ impl App {
                     commit = true;
                 }
 
-                ui.small("Empty goes back to the automatic name.");
+                ui.small(tr("Empty goes back to the automatic name."));
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Rename").clicked() {
+                    if ui.button(tr("Rename")).clicked() {
                         commit = true;
                     }
-                    if ui.button("Automatic").clicked() {
+                    if ui.button(tr("Automatic")).clicked() {
                         clear = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr("Cancel")).clicked() {
                         cancel = true;
                     }
                 });
@@ -1194,7 +1322,7 @@ impl App {
                 if let Some(tab) = self.active_tab() {
                     let text = export::to_text(&tab.grid, range);
                     ctx.copy_text(text);
-                    self.set_status("Copied to the clipboard.");
+                    self.set_status(tr("Copied to the clipboard."));
                 }
             }
 
@@ -1209,7 +1337,7 @@ impl App {
                     self.settings.save_command_history,
                 );
                 if let Err(e) = self.settings.save() {
-                    self.set_status(format!("Could not save settings: {e:#}"));
+                    self.set_status(tr1("Could not save settings: {}", &format!("{e:#}")));
                 }
             }
             UiRequest::ReloadMacros => {
@@ -1219,28 +1347,188 @@ impl App {
                 // replaced, so they would now address a different macro.
                 self.panels.forget_macro_selection();
                 let count: usize = self.macro_groups.iter().map(|g| g.macros.len()).sum();
+                let reloaded = tr1("Reloaded {} macros.", &count.to_string());
                 if report.problems.is_empty() {
-                    self.set_status(format!("Reloaded {count} macros."));
+                    self.set_status(reloaded);
                 } else {
-                    self.set_status(format!(
-                        "Reloaded {count} macros. {}",
-                        report.problems.join(" ")
-                    ));
+                    self.set_status(format!("{reloaded} {}", report.problems.join(" ")));
                 }
             }
             UiRequest::OpenFolder(path) => {
                 if let Err(e) = config::open_in_file_manager(&path) {
-                    self.set_status(format!("Could not open {}: {e:#}", path.display()));
+                    self.set_status(tr2(
+                        "Could not open {}: {}",
+                        &path.display().to_string(),
+                        &format!("{e:#}"),
+                    ));
                 }
             }
+            UiRequest::CheckForUpdates => self.updates.check_now(),
             UiRequest::SavePersonalMacros => {
                 let path = config::personal_macros_path();
                 let xml = macros::to_xml(&self.macro_groups);
                 match std::fs::write(&path, xml) {
-                    Ok(()) => {
-                        self.set_status(format!("Saved personal macros to {}", path.display()))
+                    Ok(()) => self.set_status(tr1(
+                        "Saved personal macros to {}",
+                        &path.display().to_string(),
+                    )),
+                    Err(e) => self.set_status(tr1("Could not save macros: {}", &format!("{e:#}"))),
+                }
+            }
+        }
+    }
+
+    /// Takes whatever the update thread has said since the last frame.
+    fn poll_updates(&mut self) {
+        for event in self.updates.drain() {
+            match event {
+                update::Event::Available(release) => {
+                    self.updates.available = Some(release);
+                    self.updates.asked = true;
+                }
+                update::Event::UpToDate => {
+                    // Only worth saying when the user asked the question.
+                    if self.updates.announce {
+                        self.set_status(tr1("This is the newest version ({}).", update::CURRENT));
                     }
-                    Err(e) => self.set_status(format!("Could not save macros: {e:#}")),
+                }
+                update::Event::Downloaded(path) => {
+                    self.updates.downloading = false;
+                    self.updates.staged = Some(path);
+                }
+                update::Event::Failed(why) => {
+                    self.updates.downloading = false;
+                    // A failed check at startup is not the user's problem: it
+                    // goes to the log. One they asked for is answered.
+                    if self.updates.announce {
+                        self.set_status(tr1("Could not check for updates: {}", &why));
+                    } else {
+                        log::warn!("update check failed: {why}");
+                    }
+                }
+            }
+            self.updates.announce = false;
+        }
+    }
+
+    /// Puts the downloaded build in place and closes, so the copy that is
+    /// starting takes over.
+    fn apply_update(&mut self, ctx: &Context) {
+        let Some(staged) = self.updates.staged.clone() else {
+            return;
+        };
+        match update::install(&staged) {
+            Ok(()) => {
+                // The new copy is already starting; this one has to go, and it
+                // goes the way Alt+F4 does so a live session is still asked
+                // about.
+                self.updates.available = None;
+                self.updates.staged = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                self.updates.error = Some(format!("{e:#}"));
+                self.set_status(tr1("Could not apply the update: {}", &format!("{e:#}")));
+            }
+        }
+    }
+
+    /// Writes the active tab's output to a file and opens a Claude Code
+    /// session on it.
+    ///
+    /// Two steps rather than one because they fail for different reasons and
+    /// the user can act on each: nothing to analyze yet, or no `claude` on the
+    /// PATH.
+    fn analyze_with_claude(&mut self, scope: analyze::Scope) {
+        let Some(tab) = self.active_tab() else {
+            self.set_status(tr("No active session."));
+            return;
+        };
+        let endpoint = tab.profile.endpoint();
+        let selection = tab.view.selected_text(&tab.grid);
+        let path = match analyze::write_context(&tab.grid, scope, &endpoint, selection.as_deref()) {
+            Ok(path) => path,
+            Err(e) => {
+                self.set_status(tr1("Could not prepare the output: {}", &format!("{e:#}")));
+                return;
+            }
+        };
+        match analyze::launch(&path) {
+            Ok(()) => self.set_status(tr1(
+                "Claude is opening with this output in context ({}). Ask it whatever you like.",
+                &path.display().to_string(),
+            )),
+            Err(e) => self.set_status(tr2(
+                "Could not start claude: {}. The output is in {}",
+                &format!("{e:#}"),
+                &path.display().to_string(),
+            )),
+        }
+    }
+
+    /// Carries out what the theme manager asked for.
+    ///
+    /// The manager edits the themes in place so the window behind it repaints
+    /// as a colour is dragged; this is the half that reaches the disk, which a
+    /// paint pass has no business doing.
+    fn apply_theme_action(&mut self, ctx: &Context, action: ThemeAction) {
+        match action {
+            ThemeAction::Activate(name) => {
+                self.settings.theme = name;
+                if let Err(e) = self.settings.save() {
+                    self.set_status(tr1("Could not save settings: {}", &format!("{e:#}")));
+                }
+                App::apply_style(ctx, &self.theme(), &self.settings);
+                self.apply_font(ctx);
+            }
+            ThemeAction::Save(name) => {
+                let Some(index) = self.themes.iter().position(|t| t.name == name) else {
+                    return;
+                };
+                // A built-in lives in the binary. Nothing here can edit one, so
+                // nothing here writes one out either.
+                if self.themes[index].builtin {
+                    return;
+                }
+                let path = match self.themes[index].path.clone() {
+                    Some(path) => path,
+                    None => {
+                        let path = config::theme_path_for(&name);
+                        self.themes[index].path = Some(path.clone());
+                        path
+                    }
+                };
+                if let Err(e) = config::save_theme(&self.themes[index], &path) {
+                    self.set_status(tr1("Could not save theme: {}", &format!("{e:#}")));
+                }
+            }
+            ThemeAction::Delete(name) => {
+                let Some(index) = self.themes.iter().position(|t| t.name == name) else {
+                    return;
+                };
+                if self.themes[index].builtin {
+                    return;
+                }
+                let removed = self.themes.remove(index);
+                if let Some(path) = removed.path.as_ref() {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        self.set_status(tr2(
+                            "Could not delete {}: {}",
+                            &path.display().to_string(),
+                            &e.to_string(),
+                        ));
+                    }
+                }
+                // Deleting the theme in use has to leave something on screen.
+                if self.settings.theme == name {
+                    let fallback = self
+                        .themes
+                        .first()
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default();
+                    self.apply_theme_action(ctx, ThemeAction::Activate(fallback));
+                } else {
+                    self.set_status(tr1("Deleted theme {}.", &name));
                 }
             }
         }
@@ -1423,11 +1711,11 @@ impl App {
 
     fn send_lines_to_active(&mut self, lines: &[String]) {
         let Some(tab) = self.tabs.get(self.active) else {
-            self.set_status("No active session.");
+            self.set_status(tr("No active session."));
             return;
         };
         if tab.session.is_none() {
-            self.set_status("That session has ended.");
+            self.set_status(tr("That session has ended."));
             return;
         }
         tab.send_lines(lines);
@@ -1435,7 +1723,7 @@ impl App {
 
     fn export(&mut self, range: Range, format: export::Format) {
         let Some(tab) = self.active_tab() else {
-            self.set_status("No active session to export.");
+            self.set_status(tr("No active session to export."));
             return;
         };
         let theme = self.theme();
@@ -1447,8 +1735,8 @@ impl App {
         let path = self.settings.log_dir.join(name);
 
         match export::write_file(&path, &contents) {
-            Ok(()) => self.set_status(format!("Exported to {}", path.display())),
-            Err(e) => self.set_status(format!("Export failed: {e:#}")),
+            Ok(()) => self.set_status(tr1("Exported to {}", &path.display().to_string())),
+            Err(e) => self.set_status(tr1("Export failed: {}", &format!("{e:#}"))),
         }
     }
 }
@@ -1504,11 +1792,13 @@ impl eframe::App for App {
                 crate::plugins::api::Hook::SendText(text) => {
                     requests.push(UiRequest::SendLines(vec![text]))
                 }
-                crate::plugins::api::Hook::SetStatus(text) => self.status = Some(text),
+                crate::plugins::api::Hook::SetStatus(text) => self.set_status(text),
                 crate::plugins::api::Hook::RegisterCommand(_) => {}
             }
         }
 
+        self.poll_updates();
+        self.expire_status(ctx);
         self.handle_shortcuts(ctx);
 
         // A close asked for by the window manager - Alt+F4, or the taskbar -
@@ -1521,7 +1811,7 @@ impl eframe::App for App {
 
         let mut window_action = None;
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            window_action = self.menu_bar(ui);
+            window_action = self.menu_bar(ui, &theme.window_buttons);
         });
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| self.tab_strip(ui));
 
@@ -1539,8 +1829,9 @@ impl eframe::App for App {
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(status);
-                    if ui.small_button("dismiss").clicked() {
+                    if ui.small_button(tr("dismiss")).clicked() {
                         self.status = None;
+                        self.status_at = None;
                     }
                 });
             });
@@ -1577,7 +1868,7 @@ impl eframe::App for App {
                 if self.tabs.is_empty() {
                     let mut open = false;
                     ui.centered_and_justified(|ui| {
-                        if ui.button("Open a session (Ctrl+T)").clicked() {
+                        if ui.button(tr("Open a session (Ctrl+T)")).clicked() {
                             open = true;
                         }
                     });
@@ -1599,8 +1890,8 @@ impl eframe::App for App {
                 }
                 if self.tabs[active].ended && self.tabs[active].error.is_none() {
                     ui.horizontal(|ui| {
-                        ui.label("Session ended.");
-                        if ui.button("Reconnect").clicked() {
+                        ui.label(tr("Session ended."));
+                        if ui.button(tr("Reconnect")).clicked() {
                             self.tabs[active].start();
                         }
                     });
@@ -1677,6 +1968,7 @@ impl eframe::App for App {
                             self.tabs[active].view.clear_selection();
                         }
                         ContextAction::ExportScreen => self.panels.show_export = true,
+                        ContextAction::Analyze(scope) => self.analyze_with_claude(scope),
                         ContextAction::ClearTerminal => self.clear_active_terminal(),
                     }
                 }
@@ -1776,11 +2068,14 @@ impl eframe::App for App {
 
         self.rename_tab_dialog(ctx);
         self.close_confirm_dialog(ctx);
+        if panels::update_dialog(ctx, &mut self.updates) {
+            self.apply_update(ctx);
+        }
 
         // Last, and in a foreground layer: the panels and the terminal reach
         // the window edge, and the terminal senses drags of its own.
         if !self.settings.native_decorations {
-            chrome::resize_grips(ctx);
+            chrome::resize_grips(ctx, "nit-main");
         }
 
         if let Some(request) =
@@ -1800,8 +2095,30 @@ impl eframe::App for App {
             &self.themes,
             &mut self.panels,
             &self.instances,
+            &theme.window_buttons,
         ) {
             requests.push(request);
+        }
+        // After the settings window, which is where it is opened from, and
+        // before the requests are carried out, so a colour changed this frame is
+        // on screen in the next one.
+        let active_theme = self.settings.theme.clone();
+        let native_decorations = self.settings.native_decorations;
+        let theme_actions = theme_manager::theme_manager(
+            ctx,
+            &mut self.panels.themes,
+            &mut self.themes,
+            &active_theme,
+            &theme.window_buttons,
+            native_decorations,
+        );
+        // An edit to the theme in use has to show at once, which is the whole
+        // point of editing it with the terminal behind the window.
+        if !theme_actions.is_empty() || self.panels.themes.open {
+            App::apply_style(ctx, &self.theme(), &self.settings);
+        }
+        for action in theme_actions {
+            self.apply_theme_action(ctx, action);
         }
 
         for request in requests {

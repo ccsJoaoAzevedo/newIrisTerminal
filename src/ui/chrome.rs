@@ -11,6 +11,10 @@ use egui::{
     ViewportCommand,
 };
 
+use crate::config::theme::{WindowButtonStyle, WindowButtons};
+use crate::i18n::tr;
+use crate::ui::shading::{darken, gloss, gradient, lighten, radial, white};
+
 /// How wide the grab area along each window edge is.
 const RESIZE_GRAB: f32 = 5.0;
 
@@ -28,16 +32,59 @@ enum Icon {
     Close,
 }
 
+impl Icon {
+    /// Which of the theme's three colours this control is drawn in.
+    fn tint(self, style: &WindowButtons) -> Option<Color32> {
+        match self {
+            Icon::Close => style.close,
+            Icon::Minimize => style.minimize,
+            Icon::Maximize | Icon::Restore => style.maximize,
+        }
+    }
+
+    /// Whether the theme asks for this control at all.
+    fn shown(self, style: &WindowButtons) -> bool {
+        match self {
+            Icon::Close => style.show_close,
+            Icon::Minimize => style.show_minimize,
+            Icon::Maximize | Icon::Restore => style.show_maximize,
+        }
+    }
+}
+
+/// A control, or nothing at all when the theme has hidden it.
+///
+/// Hidden means gone: no space allocated, so the row closes up rather than
+/// leaving a gap where the button was.
+fn optional_button(ui: &mut Ui, icon: Icon, hint: &str, style: &WindowButtons) -> Option<Response> {
+    icon.shown(style)
+        .then(|| window_button(ui, icon, hint, style))
+}
+
+/// The grey Aqua greys its traffic lights out to when the window is not the
+/// active one. Tiger did this, and it is the cheapest way for a window drawn by
+/// the app to still say which one has the keyboard.
+const AQUA_INACTIVE: Color32 = Color32::from_rgb(203, 203, 203);
+
 /// A square control with a hand-drawn icon.
-fn window_button(ui: &mut Ui, icon: Icon, hint: &str) -> Response {
+fn window_button(ui: &mut Ui, icon: Icon, hint: &str, style: &WindowButtons) -> Response {
     let side = ui.spacing().interact_size.y;
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
-    let painter = ui.painter();
+    let hovered = response.hovered();
+    match style.style {
+        WindowButtonStyle::Stroke => paint_stroked(ui, rect, icon, hovered, style),
+        WindowButtonStyle::Aqua => paint_aqua(ui, rect, icon, hovered, style),
+        WindowButtonStyle::Luna => paint_luna(ui, rect, icon, hovered, style),
+    }
+    response.on_hover_text(hint)
+}
 
+/// The app's own look: a glyph on a transparent square, filled on hover.
+fn paint_stroked(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButtons) {
+    let painter = ui.painter();
     // Close gets the conventional red. Worth more than consistency here: it is
     // the one control in the row with an irreversible effect.
-    let danger = Color32::from_rgb(196, 43, 28);
-    let hovered = response.hovered();
+    let danger = style.hover_close.unwrap_or(Color32::from_rgb(196, 43, 28));
     if hovered {
         let fill = if icon == Icon::Close {
             danger
@@ -49,16 +96,26 @@ fn window_button(ui: &mut Ui, icon: Icon, hint: &str) -> Response {
 
     let colour = if hovered && icon == Icon::Close {
         Color32::WHITE
+    } else if let Some(tint) = icon.tint(style) {
+        // A theme that names a colour for this control means it whether or not
+        // the pointer is over it; only the close hover, which paints white on
+        // red, is louder than the theme.
+        tint
     } else if hovered {
         ui.visuals().widgets.hovered.fg_stroke.color
     } else {
-        ui.visuals().widgets.inactive.fg_stroke.color
+        style
+            .icon
+            .unwrap_or_else(|| ui.visuals().widgets.inactive.fg_stroke.color)
     };
     let stroke = Stroke::new(1.0_f32, colour);
 
     // A small box in the middle of the hit area, so the icons come out the same
     // size whatever the row height works out to.
-    let glyph = Rect::from_center_size(rect.center(), Vec2::splat((side * 0.36).round().max(6.0)));
+    let glyph = Rect::from_center_size(
+        rect.center(),
+        Vec2::splat((side_of(rect) * 0.36).round().max(6.0)),
+    );
     match icon {
         Icon::Minimize => {
             painter.line_segment(
@@ -83,8 +140,215 @@ fn window_button(ui: &mut Ui, icon: Icon, hint: &str) -> Response {
             painter.line_segment([glyph.right_top(), glyph.left_bottom()], stroke);
         }
     }
+}
 
-    response.on_hover_text(hint)
+/// Mac OS X's traffic light: a glossy bubble whose glyph appears under the
+/// pointer, greyed out while the window is not the active one.
+///
+/// Four passes, which is what makes it read as a lit object rather than a
+/// coloured disc: the body shaded from a bright spot low down (the light
+/// bouncing back up off the desk), a dark rim, a white gloss over the top half,
+/// and a rim light along the bottom edge.
+fn paint_aqua(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButtons) {
+    let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
+    let painter = ui.painter();
+    let radius = (side_of(rect) * 0.30).clamp(5.0, 7.5);
+    let center = rect.center();
+
+    // Unfocused greys all three at once, which is why it is decided here rather
+    // than left to the theme: it is a state of the window, not of the button.
+    let mut base = match icon.tint(style) {
+        Some(colour) if focused => colour,
+        Some(_) => AQUA_INACTIVE,
+        // Cannot happen for an `aqua` theme, which defaults its three fills,
+        // but a hand-written one could still ask for the style and nothing else.
+        None => ui.visuals().widgets.inactive.bg_fill,
+    };
+    if hovered {
+        base = lighten(base, 0.12);
+    }
+
+    // The body. The bright spot sits below the middle because the strongest
+    // light in an Aqua button is the bounce coming back up into it.
+    radial(
+        painter,
+        center,
+        radius,
+        Vec2::new(0.0, radius * 0.30),
+        lighten(base, 0.30),
+        darken(base, 0.72),
+    );
+    // The bottom rim light, brightest directly under the bubble.
+    radial(
+        painter,
+        center + Vec2::new(0.0, radius * 0.55),
+        radius * 0.62,
+        Vec2::ZERO,
+        white(70),
+        white(0),
+    );
+    painter.circle_stroke(center, radius, Stroke::new(1.0_f32, darken(base, 0.45)));
+    // The gloss: a white cap over the top half, the whole of Aqua's look.
+    gloss(
+        painter,
+        center - Vec2::new(0.0, radius * 0.34),
+        radius * 0.72,
+        radius * 0.50,
+        215,
+    );
+
+    // Tiger showed the marks only under the pointer - x to close, - to
+    // minimize, + to zoom - and hid them the rest of the time.
+    if !hovered {
+        return;
+    }
+    let stroke = Stroke::new(1.4_f32, darken(base, 0.30));
+    let arm = radius * 0.46;
+    match icon {
+        Icon::Close => {
+            let d = arm * 0.78;
+            painter.line_segment(
+                [center + Vec2::new(-d, -d), center + Vec2::new(d, d)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(d, -d), center + Vec2::new(-d, d)],
+                stroke,
+            );
+        }
+        Icon::Minimize => {
+            painter.line_segment(
+                [center - Vec2::new(arm, 0.0), center + Vec2::new(arm, 0.0)],
+                stroke,
+            );
+        }
+        // Zoom is a plus, and coming back down from zoomed is a minus with the
+        // plus's stem taken out - the same mark, one stroke short.
+        Icon::Maximize => {
+            painter.line_segment(
+                [center - Vec2::new(arm, 0.0), center + Vec2::new(arm, 0.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center - Vec2::new(0.0, arm), center + Vec2::new(0.0, arm)],
+                stroke,
+            );
+        }
+        Icon::Restore => {
+            painter.line_segment(
+                [center - Vec2::new(arm, 0.0), center + Vec2::new(arm, 0.0)],
+                stroke,
+            );
+        }
+    }
+}
+
+/// Windows XP's Luna: a rounded, gradient-filled tile with a bevel along its
+/// top edge and a white glyph that is always on.
+///
+/// Unlike Aqua's, these say what they do at rest - Luna drew the X, the dash
+/// and the box whether or not the pointer was anywhere near - so nothing here
+/// is hidden until hover; hover only lifts the colour.
+fn paint_luna(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButtons) {
+    let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
+    let painter = ui.painter();
+    // Slightly wider than tall, and inset from the hit area: Luna's buttons sat
+    // in the title bar with air around them.
+    let tile = Rect::from_center_size(
+        rect.center(),
+        Vec2::new(side_of(rect) * 0.82, side_of(rect) * 0.72),
+    );
+    let rounding = egui::Rounding::same(2.0);
+
+    let mut base = match icon.tint(style) {
+        Some(colour) if focused => colour,
+        Some(colour) => darken(lighten(colour, 0.35), 0.85),
+        None => ui.visuals().widgets.inactive.bg_fill,
+    };
+    if hovered {
+        base = lighten(base, 0.18);
+    }
+
+    // The tile: a dark edge, then the fill, then the highlights on top of it.
+    // Luna's buttons are lit from above and slightly left, with the deepest
+    // tone about two thirds down and a thin bright rim along the very bottom -
+    // that last one is what stops them looking painted on.
+    painter.rect_filled(tile, rounding, darken(base, 0.55));
+    let inner = tile.shrink(1.0);
+    let upper = Rect::from_min_max(
+        inner.left_top(),
+        Pos2::new(inner.right(), inner.top() + inner.height() * 0.52),
+    );
+    let lower = Rect::from_min_max(upper.left_bottom(), inner.right_bottom());
+    gradient(painter, upper, lighten(base, 0.52), lighten(base, 0.06));
+    gradient(painter, lower, darken(base, 0.94), darken(base, 0.70));
+
+    // The gloss over the top half, cut off square the way a Luna button's was.
+    gradient(painter, upper, white(105), white(12));
+    // Bevel: bright inside the top and left edges, and a light rim along the
+    // bottom where the tile catches the desktop behind it.
+    painter.line_segment(
+        [
+            Pos2::new(inner.left() + 1.0, inner.top() + 0.5),
+            Pos2::new(inner.right() - 1.0, inner.top() + 0.5),
+        ],
+        Stroke::new(1.0_f32, white(165)),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(inner.left() + 0.5, inner.top() + 1.5),
+            Pos2::new(inner.left() + 0.5, inner.bottom() - 1.5),
+        ],
+        Stroke::new(1.0_f32, white(70)),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(inner.left() + 1.5, inner.bottom() - 0.5),
+            Pos2::new(inner.right() - 1.5, inner.bottom() - 0.5),
+        ],
+        Stroke::new(1.0_f32, lighten(base, 0.30)),
+    );
+    painter.rect_stroke(tile, rounding, Stroke::new(1.0_f32, darken(base, 0.42)));
+
+    // The glyph, in the theme's colour or the white Luna always used.
+    let colour = style.icon.unwrap_or(Color32::WHITE);
+    let stroke = Stroke::new(1.3_f32, colour);
+    let glyph = Rect::from_center_size(tile.center(), Vec2::splat((side_of(rect) * 0.26).max(5.0)));
+    match icon {
+        Icon::Minimize => {
+            // Luna's minimize sat on the baseline rather than in the middle.
+            let y = glyph.bottom();
+            painter.line_segment(
+                [Pos2::new(glyph.left(), y), Pos2::new(glyph.right(), y)],
+                stroke,
+            );
+        }
+        Icon::Maximize => {
+            painter.rect_stroke(glyph, 0.0, stroke);
+            // The heavier top edge of the little window.
+            painter.line_segment(
+                [
+                    Pos2::new(glyph.left(), glyph.top() + 1.0),
+                    Pos2::new(glyph.right(), glyph.top() + 1.0),
+                ],
+                stroke,
+            );
+        }
+        Icon::Restore => {
+            painter.rect_stroke(glyph.translate(Vec2::new(1.5, -1.5)), 0.0, stroke);
+            painter.rect_filled(glyph, 0.0, darken(base, 0.80));
+            painter.rect_stroke(glyph, 0.0, stroke);
+        }
+        Icon::Close => {
+            painter.line_segment([glyph.left_top(), glyph.right_bottom()], stroke);
+            painter.line_segment([glyph.right_top(), glyph.left_bottom()], stroke);
+        }
+    }
+}
+
+/// The side of a square hit area, which both painters size their glyphs from.
+fn side_of(rect: Rect) -> f32 {
+    rect.height()
 }
 
 /// What the window buttons in the title bar were asked to do.
@@ -95,35 +359,95 @@ pub enum WindowAction {
     Close,
 }
 
+/// Draws the three controls with nothing behind them, for a theme preview.
+///
+/// The clicks are dropped: this is a picture of the buttons, not the buttons.
+/// Under the stroked style the glyph colour still comes from the surrounding
+/// widget colours - that is what the style means - so what a preview shows of
+/// it is whatever the *active* theme says, not the one being edited.
+pub fn sample_buttons(ui: &mut Ui, style: &WindowButtons) {
+    let _ = optional_button(ui, Icon::Close, tr("Close"), style);
+    let _ = optional_button(ui, Icon::Minimize, tr("Minimize"), style);
+    let _ = optional_button(ui, Icon::Maximize, tr("Maximize"), style);
+}
+
+/// The maximize control's icon and tooltip, which depend on where the window is
+/// already.
+fn maximize_icon(ui: &Ui) -> (Icon, &'static str) {
+    if ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false)) {
+        (Icon::Restore, tr("Restore"))
+    } else {
+        (Icon::Maximize, tr("Maximize"))
+    }
+}
+
+/// Draws the three controls at the left-hand end of the row, in Aqua's order.
+///
+/// Called before anything else in the title bar, so they sit where a Mac puts
+/// them; the drag area is still claimed at the end by
+/// [`title_bar_controls`].
+pub fn leading_window_buttons(ui: &mut Ui, style: &WindowButtons) -> Option<WindowAction> {
+    let mut action = None;
+    if clicked(optional_button(ui, Icon::Close, tr("Close"), style)) {
+        action = Some(WindowAction::Close);
+    }
+    if clicked(optional_button(ui, Icon::Minimize, tr("Minimize"), style)) {
+        action = Some(WindowAction::Minimize);
+    }
+    let (icon, hint) = maximize_icon(ui);
+    if clicked(optional_button(ui, icon, hint, style)) {
+        action = Some(WindowAction::ToggleMaximize);
+    }
+    action
+}
+
+/// Whether a control that may not be there was clicked.
+fn clicked(response: Option<Response>) -> bool {
+    response.is_some_and(|r| r.clicked())
+}
+
 /// Draws minimize / maximize / close at the right-hand end of the row, then
 /// makes whatever space is left draggable.
 ///
 /// Buttons first, dragging second: the drag area is the leftover rectangle, so
 /// it cannot swallow the buttons however narrow the window gets.
-pub fn title_bar_controls(ui: &mut Ui) -> Option<WindowAction> {
+///
+/// `buttons` is false when the controls are not wanted here at all - either the
+/// setting has them hidden, or the theme has already had them drawn on the left
+/// by [`leading_window_buttons`]. The drag area is claimed either way: without
+/// it the window could not be moved.
+pub fn title_bar_controls(
+    ui: &mut Ui,
+    style: &WindowButtons,
+    buttons: bool,
+    window: &'static str,
+) -> Option<WindowAction> {
     let mut action = None;
-    let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
 
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if window_button(ui, Icon::Close, "Close").clicked() {
-            action = Some(WindowAction::Close);
-        }
-        let (icon, hint) = if maximized {
-            (Icon::Restore, "Restore")
-        } else {
-            (Icon::Maximize, "Maximize")
-        };
-        if window_button(ui, icon, hint).clicked() {
-            action = Some(WindowAction::ToggleMaximize);
-        }
-        if window_button(ui, Icon::Minimize, "Minimize").clicked() {
-            action = Some(WindowAction::Minimize);
+        if buttons {
+            if clicked(optional_button(ui, Icon::Close, tr("Close"), style)) {
+                action = Some(WindowAction::Close);
+            }
+            let (icon, hint) = maximize_icon(ui);
+            if clicked(optional_button(ui, icon, hint, style)) {
+                action = Some(WindowAction::ToggleMaximize);
+            }
+            if clicked(optional_button(ui, Icon::Minimize, tr("Minimize"), style)) {
+                action = Some(WindowAction::Minimize);
+            }
         }
 
         // The gap between the buttons and the items already placed on the left.
         let rest = ui.available_rect_before_wrap();
         if rest.width() > 0.0 {
-            let drag = ui.interact(rest, Id::new("nit-titlebar-drag"), Sense::click_and_drag());
+            // Keyed by the window that asked for the bar. Three of them draw
+            // one now - the main window and the two dialogs that live in
+            // windows of their own - and a shared id makes them one widget as
+            // far as egui is concerned, so only whichever was drawn last would
+            // answer to the mouse.
+            let id = Id::new(("nit-titlebar-drag", window));
+            let drag = ui.interact(rest, id, Sense::click_and_drag());
             if drag.drag_started() {
                 ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
             }
@@ -149,7 +473,7 @@ pub fn apply(ctx: &Context, action: WindowAction) {
     }
 }
 
-/// Puts a resize grip under the pointer when it is at a window edge.
+/// Puts a resize grip under the pointer when it is at the edge of `window`.
 ///
 /// Only one grip exists, and only while the pointer is actually within
 /// [`RESIZE_GRAB`] of an edge. Eight permanent ones seemed simpler, but a grip
@@ -159,7 +483,7 @@ pub fn apply(ctx: &Context, action: WindowAction) {
 /// every window for hit-testing. That is what stopped the mouse wheel reaching
 /// the Settings scroll area. Existing only under the pointer, at the very edge
 /// of the window, it cannot be in anything's way.
-pub fn resize_grips(ctx: &Context) {
+pub fn resize_grips(ctx: &Context, window: &'static str) {
     // A maximized window has no edges to drag.
     if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
         return;
@@ -172,7 +496,7 @@ pub fn resize_grips(ctx: &Context) {
         return;
     };
 
-    egui::Area::new(Id::new("nit-resize"))
+    egui::Area::new(Id::new(("nit-resize", window)))
         .order(egui::Order::Foreground)
         .fixed_pos(pos - Vec2::splat(RESIZE_GRAB))
         .interactable(true)

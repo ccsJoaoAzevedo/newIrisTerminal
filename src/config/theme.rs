@@ -1,8 +1,9 @@
 //! Colour and font definitions.
 //!
-//! A theme is a plain TOML file under `<config>/themes/`. Dropping a file in
-//! that folder makes it selectable; the built-ins below are written out on
-//! first run so there is always something to copy.
+//! The built-ins below live in the binary and are immutable: the theme manager
+//! duplicates one to give the user something to edit. A duplicate is a plain
+//! TOML file under `<config>/themes/`, and dropping a file in that folder by
+//! hand makes it selectable just the same.
 
 use egui::Color32;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,135 @@ pub fn parse_hex(text: &str) -> Option<Color32> {
 
 pub fn to_hex(color: Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
+}
+
+/// Aqua traffic lights, as Tiger drew them. Used for any slot an `aqua` theme
+/// leaves unspecified, so a theme only has to ask for the style.
+const AQUA_CLOSE: &str = "#ff6058";
+const AQUA_MINIMIZE: &str = "#ffbd2e";
+const AQUA_MAXIMIZE: &str = "#28ca42";
+
+/// The blue of an Aqua scroll handle. Used when an `aqua` theme does not name
+/// one, so a Tiger theme gets the capsule without having to describe it.
+const AQUA_SCROLL: &str = "#4a90d9";
+
+/// The same for Luna: the red of the XP close button, and the blue the other
+/// two were tinted with. The painter shades each into a gradient, so these are
+/// the mid-tone rather than either end of one.
+const LUNA_CLOSE: &str = "#cf4a35";
+const LUNA_BUTTON: &str = "#4b7fc4";
+
+/// How the minimize / maximize / close controls are drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowButtonStyle {
+    /// Hand-stroked glyphs on a transparent square, filled on hover. What the
+    /// app has always drawn, and what a theme that says nothing still gets.
+    #[default]
+    Stroke,
+    /// Three filled circles, glyph only under the pointer.
+    Aqua,
+    /// Windows XP's Luna: rounded gradient tiles with the glyph always on.
+    Luna,
+}
+
+impl WindowButtonStyle {
+    pub const ALL: [WindowButtonStyle; 3] = [
+        WindowButtonStyle::Stroke,
+        WindowButtonStyle::Aqua,
+        WindowButtonStyle::Luna,
+    ];
+
+    /// Empty, or anything unrecognised, means the stroked style: a theme file
+    /// written before this existed has to keep looking the way it did.
+    fn from_name(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "aqua" => WindowButtonStyle::Aqua,
+            "luna" => WindowButtonStyle::Luna,
+            _ => WindowButtonStyle::Stroke,
+        }
+    }
+
+    /// The colour this style paints a control in when the theme names none.
+    ///
+    /// `None` for the stroked style, which fills nothing and leaves the glyph
+    /// to the widget colours.
+    pub fn default_colour(self, slot: WindowButtonSlot) -> Option<Color32> {
+        let hex = match (self, slot) {
+            (WindowButtonStyle::Stroke, _) => return None,
+            (WindowButtonStyle::Aqua, WindowButtonSlot::Close) => AQUA_CLOSE,
+            (WindowButtonStyle::Aqua, WindowButtonSlot::Minimize) => AQUA_MINIMIZE,
+            (WindowButtonStyle::Aqua, WindowButtonSlot::Maximize) => AQUA_MAXIMIZE,
+            (WindowButtonStyle::Luna, WindowButtonSlot::Close) => LUNA_CLOSE,
+            (WindowButtonStyle::Luna, _) => LUNA_BUTTON,
+        };
+        parse_hex(hex)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            WindowButtonStyle::Stroke => "stroke",
+            WindowButtonStyle::Aqua => "aqua",
+            WindowButtonStyle::Luna => "luna",
+        }
+    }
+}
+
+/// Which of the three controls a colour belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowButtonSlot {
+    Close,
+    Minimize,
+    Maximize,
+}
+
+/// Resolved appearance of the three window controls.
+///
+/// Every colour is optional: `None` means "whatever the widget colours say",
+/// which is exactly what the chrome did before a theme could speak about these,
+/// so an old theme file is unchanged. The `aqua` style is the one exception -
+/// it needs three fills to be three traffic lights at all, so it defaults them.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowButtons {
+    pub style: WindowButtonStyle,
+    /// Draw them at the left-hand end of the title bar, as Aqua does.
+    pub left: bool,
+    /// Which of the three are drawn at all.
+    ///
+    /// A window that cannot be closed from its own title bar is a real choice
+    /// some people make - Ctrl+W and Alt+F4 still work - and a terminal that
+    /// nobody wants minimized is another. Hiding one takes it out of the row
+    /// entirely rather than greying it out.
+    pub show_close: bool,
+    pub show_minimize: bool,
+    pub show_maximize: bool,
+    pub close: Option<Color32>,
+    pub minimize: Option<Color32>,
+    pub maximize: Option<Color32>,
+    /// The glyph inside a button.
+    pub icon: Option<Color32>,
+    /// Fill behind the close glyph on hover. The one control with an
+    /// irreversible effect, so it keeps a colour of its own.
+    pub hover_close: Option<Color32>,
+}
+
+/// All three shown, stroked, on the right: what a theme that says nothing about
+/// its window buttons gets.
+impl Default for WindowButtons {
+    fn default() -> Self {
+        WindowButtons {
+            style: WindowButtonStyle::default(),
+            left: false,
+            show_close: true,
+            show_minimize: true,
+            show_maximize: true,
+            close: None,
+            minimize: None,
+            maximize: None,
+            icon: None,
+            hover_close: None,
+        }
+    }
 }
 
 /// One complete set of ObjectScript colours, as hex strings.
@@ -98,6 +228,28 @@ const GREEN_SYNTAX: SyntaxPalette = SyntaxPalette {
     member: "#bef264",
     routine: "#a7f3d0",
     extrinsic: "#7dd3fc",
+};
+
+/// Pinks and their neighbours, for the Hello Kitty theme: the ObjectScript
+/// palette would fight a screen that is deliberately one hue, the same way it
+/// does on the phosphor green.
+const KITTY_SYNTAX: SyntaxPalette = SyntaxPalette {
+    label: "#0f7b5c",
+    command: "#c2185b",
+    string: "#9c6b00",
+    number: "#c2410c",
+    delimiter: "#7b3fa0",
+    operator: "#d81b60",
+    preprocessor: "#b4551d",
+    function: "#8e24aa",
+    global: "#d1104a",
+    system_variable: "#8d6e00",
+    class: "#5b4bc4",
+    method: "#0e7490",
+    attribute: "#4055c8",
+    member: "#c2185b",
+    routine: "#7b3fa0",
+    extrinsic: "#3f6fb5",
 };
 
 /// The same hues darkened until they read on paper white.
@@ -209,6 +361,39 @@ pub struct ThemeFile {
     pub syntax_routine: String,
     #[serde(default)]
     pub syntax_extrinsic: String,
+    /// How the minimize / maximize / close controls are drawn: `"stroke"` (the
+    /// default, and what every theme written before this got) or `"aqua"`.
+    #[serde(default)]
+    pub window_button_style: String,
+    /// Put the controls at the left-hand end of the title bar.
+    #[serde(default)]
+    pub window_buttons_left: bool,
+    /// Which controls the title bar has. All three unless a theme says
+    /// otherwise, which is what every theme written before this said.
+    #[serde(default = "yes")]
+    pub window_button_show_close: bool,
+    #[serde(default = "yes")]
+    pub window_button_show_minimize: bool,
+    #[serde(default = "yes")]
+    pub window_button_show_maximize: bool,
+    /// Colours for the three controls. Empty leaves one to the widget colours,
+    /// except under `aqua`, where an unset slot becomes its traffic light.
+    #[serde(default)]
+    pub window_button_close: String,
+    #[serde(default)]
+    pub window_button_minimize: String,
+    #[serde(default)]
+    pub window_button_maximize: String,
+    #[serde(default)]
+    pub window_button_icon: String,
+    #[serde(default)]
+    pub window_button_hover_close: String,
+    /// The terminal's scroll handle. Empty leaves it derived from the selection
+    /// and foreground colours, which is what every theme did before this - and
+    /// what still happens under the stroked button style, where there is no
+    /// period look to match.
+    #[serde(default)]
+    pub scrollbar_handle: String,
     #[serde(default = "default_font_family")]
     pub font_family: String,
     #[serde(default = "default_font_size")]
@@ -216,15 +401,22 @@ pub struct ThemeFile {
     /// Drives egui's own widget colours so the chrome matches the terminal.
     #[serde(default)]
     pub dark: bool,
-    /// Set on the copies [`crate::config::ensure_config_tree`] writes out, so a
-    /// corrected built-in can replace a stale copy on disk. Clear it (or rename
-    /// the theme) to claim the file as your own and stop it being overwritten.
+    /// Marks a file as a copy of a built-in written by an earlier version of the
+    /// app, which [`crate::config::load_themes`] drops in favour of the built-in
+    /// itself. Themes the app writes now are always the user's, so it writes
+    /// `false`; a built-in is one because it is in the binary, never because a
+    /// file said so.
     #[serde(default)]
     pub builtin: bool,
 }
 
 fn default_font_family() -> String {
     "monospace".to_string()
+}
+
+/// `true`, for the fields whose absence has to mean "yes" rather than "no".
+fn yes() -> bool {
+    true
 }
 
 /// Everything empty and nothing claimed. Only useful as the base of a struct
@@ -256,6 +448,17 @@ impl Default for ThemeFile {
             syntax_member: String::new(),
             syntax_routine: String::new(),
             syntax_extrinsic: String::new(),
+            window_button_style: String::new(),
+            window_buttons_left: false,
+            window_button_show_close: true,
+            window_button_show_minimize: true,
+            window_button_show_maximize: true,
+            window_button_close: String::new(),
+            window_button_minimize: String::new(),
+            window_button_maximize: String::new(),
+            window_button_icon: String::new(),
+            window_button_hover_close: String::new(),
+            scrollbar_handle: String::new(),
             font_family: default_font_family(),
             font_size: default_font_size(),
             dark: true,
@@ -266,6 +469,36 @@ impl Default for ThemeFile {
 
 fn default_font_size() -> f32 {
     14.0
+}
+
+/// A colour the theme did not set stays unset, rather than becoming a hex
+/// string that pins down whatever the widget colours happened to be.
+fn hex_or_empty(color: Option<Color32>) -> String {
+    color.map(to_hex).unwrap_or_default()
+}
+
+/// Resolves the window-control appearance from a theme file.
+fn window_buttons(file: &ThemeFile) -> WindowButtons {
+    let style = WindowButtonStyle::from_name(&file.window_button_style);
+    // Under `aqua` and `luna` a missing fill is a missing button, so each
+    // style supplies its own; the stroked style has nothing to fill and leaves
+    // the slot to the widget colours.
+    let fill = |hex: &str, slot: WindowButtonSlot| match parse_hex(hex) {
+        Some(color) => Some(color),
+        None => style.default_colour(slot),
+    };
+    WindowButtons {
+        style,
+        left: file.window_buttons_left,
+        show_close: file.window_button_show_close,
+        show_minimize: file.window_button_show_minimize,
+        show_maximize: file.window_button_show_maximize,
+        close: fill(&file.window_button_close, WindowButtonSlot::Close),
+        minimize: fill(&file.window_button_minimize, WindowButtonSlot::Minimize),
+        maximize: fill(&file.window_button_maximize, WindowButtonSlot::Maximize),
+        icon: parse_hex(&file.window_button_icon),
+        hover_close: parse_hex(&file.window_button_hover_close),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -294,9 +527,20 @@ pub struct Theme {
     pub syntax_member: Color32,
     pub syntax_routine: Color32,
     pub syntax_extrinsic: Color32,
+    pub window_buttons: WindowButtons,
+    /// Colour of the terminal's scroll handle, when the theme names one or its
+    /// button style implies one.
+    pub scrollbar_handle: Option<Color32>,
     pub font_family: String,
     pub font_size: f32,
     pub dark: bool,
+    /// Shipped with the app, so the theme manager will not let it be edited or
+    /// deleted. Never read from the file: a built-in is one because it came out
+    /// of [`builtin_files`], not because a file claimed to be one.
+    pub builtin: bool,
+    /// The file this theme was read from, when it came from one. What the theme
+    /// manager writes an edit back to, and what deleting it removes.
+    pub path: Option<std::path::PathBuf>,
 }
 
 impl Default for Theme {
@@ -351,10 +595,36 @@ impl Theme {
             syntax_routine: syntax(&file.syntax_routine, DEFAULT_SYNTAX.routine),
             syntax_extrinsic: syntax(&file.syntax_extrinsic, DEFAULT_SYNTAX.extrinsic),
             ansi,
+            window_buttons: window_buttons(file),
+            scrollbar_handle: parse_hex(&file.scrollbar_handle).or_else(|| {
+                // An Aqua theme gets the blue capsule for free: the scroll bar
+                // is as much a part of that look as the traffic lights are.
+                matches!(
+                    WindowButtonStyle::from_name(&file.window_button_style),
+                    WindowButtonStyle::Aqua
+                )
+                .then(|| parse_hex(AQUA_SCROLL))
+                .flatten()
+            }),
             font_family: file.font_family.clone(),
             font_size: file.font_size.clamp(6.0, 48.0),
             dark: file.dark,
+            builtin: false,
+            path: None,
         }
+    }
+
+    /// Marks this theme as one of the app's own, which the theme manager holds
+    /// immutable.
+    pub fn as_builtin(mut self) -> Self {
+        self.builtin = true;
+        self
+    }
+
+    /// Records where the theme was loaded from.
+    pub fn at_path(mut self, path: std::path::PathBuf) -> Self {
+        self.path = Some(path);
+        self
     }
 
     pub fn to_file(&self) -> ThemeFile {
@@ -383,6 +653,17 @@ impl Theme {
             syntax_member: to_hex(self.syntax_member),
             syntax_routine: to_hex(self.syntax_routine),
             syntax_extrinsic: to_hex(self.syntax_extrinsic),
+            window_button_style: self.window_buttons.style.name().to_string(),
+            window_buttons_left: self.window_buttons.left,
+            window_button_show_close: self.window_buttons.show_close,
+            window_button_show_minimize: self.window_buttons.show_minimize,
+            window_button_show_maximize: self.window_buttons.show_maximize,
+            window_button_close: hex_or_empty(self.window_buttons.close),
+            window_button_minimize: hex_or_empty(self.window_buttons.minimize),
+            window_button_maximize: hex_or_empty(self.window_buttons.maximize),
+            window_button_icon: hex_or_empty(self.window_buttons.icon),
+            window_button_hover_close: hex_or_empty(self.window_buttons.hover_close),
+            scrollbar_handle: hex_or_empty(self.scrollbar_handle),
             font_family: self.font_family.clone(),
             font_size: self.font_size,
             dark: self.dark,
@@ -434,6 +715,39 @@ impl Theme {
         v.extreme_bg_color = self.background;
         v.selection.bg_fill = self.selection;
         v.override_text_color = Some(self.ui_foreground);
+
+        // Everything egui fills - a button, a combo box, and above all a
+        // scrollbar's handle - comes from these, and leaving them at the stock
+        // dark/light grey is what made the scrollbars read as belonging to some
+        // other application. Each state is the chrome background lifted a
+        // little further towards the chrome text, so the ladder from resting to
+        // pressed holds in a light theme and a dark one alike.
+        let lift = |t: f32| crate::term::palette::blend(self.ui_background, self.ui_foreground, t);
+        v.widgets.noninteractive.bg_fill = self.ui_background;
+        v.widgets.noninteractive.weak_bg_fill = self.ui_background;
+        v.widgets.noninteractive.bg_stroke.color = lift(0.20);
+        v.widgets.inactive.bg_fill = lift(0.18);
+        v.widgets.inactive.weak_bg_fill = lift(0.10);
+        v.widgets.hovered.bg_fill = lift(0.30);
+        v.widgets.hovered.weak_bg_fill = lift(0.22);
+        v.widgets.hovered.bg_stroke.color = lift(0.40);
+        v.widgets.active.bg_fill = lift(0.42);
+        v.widgets.active.weak_bg_fill = lift(0.34);
+        v.widgets.active.bg_stroke.color = lift(0.55);
+        v.widgets.open.bg_fill = lift(0.24);
+        v.widgets.open.weak_bg_fill = lift(0.16);
+
+        // And the strokes, which are what a scrollbar handle is actually drawn
+        // in: egui paints it with `fg_stroke.color` unless the scroll style
+        // asks for the fill, so theming only the fills left the bars in the
+        // stock grey. These also carry the checkmarks and the fold arrows;
+        // label text does not come through here, since `override_text_color`
+        // has already claimed it.
+        v.widgets.noninteractive.fg_stroke.color = self.ui_foreground;
+        v.widgets.inactive.fg_stroke.color = lift(0.62);
+        v.widgets.hovered.fg_stroke.color = lift(0.82);
+        v.widgets.active.fg_stroke.color = self.ui_foreground;
+        v.widgets.open.fg_stroke.color = lift(0.72);
         v
     }
 }
@@ -508,6 +822,158 @@ pub fn builtin_files() -> Vec<ThemeFile> {
             // and neutral rather than cyan so the chrome is not more terminal.
             ui_foreground: "#c0caf5".into(),
             ui_background: "#16141c".into(),
+            font_family: default_font_family(),
+            font_size: 14.0,
+            dark: true,
+            builtin: true,
+            ..with_syntax(DEFAULT_SYNTAX)
+        },
+        // A pink one, asked for by name. Light: paper white under a strawberry
+        // chrome, with the syntax palette pulled towards the same hues.
+        ThemeFile {
+            name: "Hello Kitty".into(),
+            background: "#fff5f8".into(),
+            foreground: "#3d2b33".into(),
+            cursor: "#e75480".into(),
+            selection: "#ffc9dd".into(),
+            ansi: ansi([
+                "#3d2b33", "#e0245e", "#3f9e5a", "#c98a00", "#3f7fd0", "#b45fc4", "#2f9fa8",
+                "#f2dfe6", "#7a6670", "#ff4d7d", "#4fc07a", "#e3ad2b", "#5aa0ea", "#d47ae0",
+                "#4fc4cd", "#fffafc",
+            ]),
+            ui_foreground: "#5a2233".into(),
+            ui_background: "#ffd7e6".into(),
+            window_button_close: "#e75480".into(),
+            window_button_minimize: "#ffb3c9".into(),
+            window_button_maximize: "#ff8fb1".into(),
+            scrollbar_handle: "#f57fa8".into(),
+            font_family: default_font_family(),
+            font_size: 14.0,
+            dark: false,
+            builtin: true,
+            ..with_syntax(KITTY_SYNTAX)
+        },
+        // And after dark: the same pink over a near-black, where it reads as
+        // neon rather than as sugar.
+        ThemeFile {
+            name: "Hello Kitty Dark".into(),
+            background: "#17111a".into(),
+            foreground: "#f6dbe6".into(),
+            cursor: "#ff5c9e".into(),
+            selection: "#5c2340".into(),
+            ansi: ansi([
+                "#17111a", "#ff4d7d", "#5ce6a1", "#ffd166", "#7aa2f7", "#e56ee5", "#67e8f9",
+                "#f6dbe6", "#4a3b48", "#ff85ad", "#8ff0c0", "#ffe08a", "#a8c4ff", "#f4a4f4",
+                "#a5f3fc", "#fff5f8",
+            ]),
+            ui_foreground: "#ffd7e6".into(),
+            ui_background: "#241a28".into(),
+            window_button_close: "#ff5c9e".into(),
+            window_button_minimize: "#ffa8c8".into(),
+            window_button_maximize: "#ff85ad".into(),
+            scrollbar_handle: "#ff5c9e".into(),
+            font_family: default_font_family(),
+            font_size: 14.0,
+            dark: true,
+            builtin: true,
+            ..with_syntax(DEFAULT_SYNTAX)
+        },
+        // Windows XP: Luna blue chrome around the console black-and-silver,
+        // with the console's own sixteen colours.
+        ThemeFile {
+            name: "Windows XP".into(),
+            background: "#000000".into(),
+            foreground: "#c0c0c0".into(),
+            cursor: "#c0c0c0".into(),
+            // XP's selection blue.
+            selection: "#316ac5".into(),
+            ansi: ansi([
+                "#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080",
+                "#c0c0c0", "#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff",
+                "#00ffff", "#ffffff",
+            ]),
+            ui_foreground: "#ffffff".into(),
+            // The Luna title bar, which is what anyone naming this theme is
+            // asking for.
+            ui_background: "#0a62c8".into(),
+            // The Luna tiles themselves: a red close and two blue ones, each
+            // shaded into a gradient by the painter.
+            window_button_style: "luna".into(),
+            window_button_icon: "#ffffff".into(),
+            font_family: default_font_family(),
+            font_size: 14.0,
+            dark: true,
+            builtin: true,
+            ..with_syntax(DEFAULT_SYNTAX)
+        },
+        // KDE 3's Plastik: grey-blue widgets around a white Konsole, with the
+        // palette Konsole shipped as "Linux colors".
+        ThemeFile {
+            name: "KDE Plastik".into(),
+            background: "#ffffff".into(),
+            foreground: "#1a1a1a".into(),
+            cursor: "#678db2".into(),
+            selection: "#b5cde4".into(),
+            ansi: ansi([
+                "#000000", "#b21818", "#18b218", "#b26818", "#1818b2", "#b218b2", "#18b2b2",
+                "#b2b2b2", "#686868", "#ff5454", "#54ff54", "#ffff54", "#5454ff", "#ff54ff",
+                "#54ffff", "#ffffff",
+            ]),
+            ui_foreground: "#202020".into(),
+            ui_background: "#efefef".into(),
+            window_button_icon: "#303030".into(),
+            window_button_hover_close: "#b04040".into(),
+            font_family: default_font_family(),
+            font_size: 14.0,
+            dark: false,
+            builtin: true,
+            ..with_syntax(LIGHT_SYNTAX)
+        },
+        // Mac OS X 10.4. Aqua traffic lights on the left, the brushed-metal
+        // grey the windows of the era were framed in, and the colours Terminal
+        // itself shipped with for the grid.
+        ThemeFile {
+            name: "Tiger Aqua".into(),
+            background: "#ffffff".into(),
+            foreground: "#1a1a1a".into(),
+            cursor: "#3a6ea5".into(),
+            // Aqua's own highlight blue.
+            selection: "#b4d5fe".into(),
+            ansi: ansi([
+                "#000000", "#c23621", "#25bc24", "#adad27", "#492ee1", "#d338d3", "#33bbc8",
+                "#cbcccd", "#818383", "#fc391f", "#31e722", "#adad27", "#5833ff", "#f935f8",
+                "#14f0f0", "#e9ebeb",
+            ]),
+            ui_foreground: "#2b2b2b".into(),
+            ui_background: "#dcdcdc".into(),
+            window_button_style: "aqua".into(),
+            window_buttons_left: true,
+            font_family: default_font_family(),
+            font_size: 14.0,
+            dark: false,
+            builtin: true,
+            ..with_syntax(LIGHT_SYNTAX)
+        },
+        // The same frame in the graphite appearance, over a grid borrowed from
+        // Tokyo: the Aqua palette has no dark reading of its own, and Tokyo's
+        // is the one this app already renders IRIS output in well.
+        ThemeFile {
+            name: "Tiger Graphite".into(),
+            background: "#0f0e13".into(),
+            foreground: "#c8d3d5".into(),
+            cursor: "#34e2e2".into(),
+            selection: "#2d636f".into(),
+            ansi: ansi([
+                "#0f0e13", "#fc5698", "#7fff00", "#fe8019", "#3465a4", "#2a2436", "#116d61",
+                "#aceeee", "#999988", "#ff3b3b", "#a3ff8c", "#ffe61c", "#0285f9", "#8b5cf6",
+                "#34e2e2", "#eceff4",
+            ]),
+            ui_foreground: "#c0caf5".into(),
+            // Graphite, not brushed steel: the same neutral grey pulled down
+            // until it frames a dark grid instead of a white one.
+            ui_background: "#26262b".into(),
+            window_button_style: "aqua".into(),
+            window_buttons_left: true,
             font_family: default_font_family(),
             font_size: 14.0,
             dark: true,
@@ -657,6 +1123,84 @@ mod tests {
         assert_eq!(back.syntax_command, theme.syntax_command);
         assert_eq!(back.syntax_class, theme.syntax_class);
         assert_eq!(back.ansi, theme.ansi);
+    }
+
+    /// A theme's window-button style has to survive being written out and read
+    /// back, or editing any other colour in the manager would quietly reset the
+    /// buttons to the stroked default.
+    #[test]
+    fn the_window_button_style_round_trips() {
+        for (name, expected) in [
+            ("stroke", WindowButtonStyle::Stroke),
+            ("aqua", WindowButtonStyle::Aqua),
+            ("luna", WindowButtonStyle::Luna),
+            ("LUNA", WindowButtonStyle::Luna),
+            ("", WindowButtonStyle::Stroke),
+            ("nonsense", WindowButtonStyle::Stroke),
+        ] {
+            let file = ThemeFile {
+                name: "T".into(),
+                window_button_style: name.into(),
+                ..ThemeFile::default()
+            };
+            let theme = Theme::from_file(&file);
+            assert_eq!(theme.window_buttons.style, expected, "{name:?}");
+            let back = Theme::from_file(&theme.to_file());
+            assert_eq!(
+                back.window_buttons.style, expected,
+                "{name:?} did not survive"
+            );
+            assert_eq!(back.window_buttons.close, theme.window_buttons.close);
+        }
+    }
+
+    /// Every style that fills its buttons has to supply a colour for all three,
+    /// or one of them is painted in nothing at all.
+    #[test]
+    fn a_filled_style_has_three_colours() {
+        for name in ["aqua", "luna"] {
+            let file = ThemeFile {
+                name: "T".into(),
+                window_button_style: name.into(),
+                ..ThemeFile::default()
+            };
+            let buttons = Theme::from_file(&file).window_buttons;
+            assert!(buttons.close.is_some(), "{name}: no close colour");
+            assert!(buttons.minimize.is_some(), "{name}: no minimize colour");
+            assert!(buttons.maximize.is_some(), "{name}: no maximize colour");
+        }
+        // The stroked style fills nothing, and must not invent a colour that
+        // would then be painted over the chrome.
+        let bare = Theme::from_file(&ThemeFile {
+            name: "T".into(),
+            ..ThemeFile::default()
+        });
+        assert!(bare.window_buttons.close.is_none());
+    }
+
+    /// Hiding a button has to survive the file, and a theme file written
+    /// before the flags existed has to keep all three.
+    #[test]
+    fn hidden_buttons_round_trip_and_default_to_shown() {
+        // A theme file as they were written before the flags existed.
+        let text = r##"
+            name = "Old"
+            background = "#101010"
+            foreground = "#e0e0e0"
+            cursor = "#ffffff"
+            selection = "#003366"
+            ansi = []
+        "##;
+        let old_file: ThemeFile = toml::from_str(text).expect("parse");
+        let old = Theme::from_file(&old_file).window_buttons;
+        assert!(old.show_close && old.show_minimize && old.show_maximize);
+
+        let mut theme = Theme::from_file(&old_file);
+        theme.window_buttons.show_maximize = false;
+        let back = Theme::from_file(&theme.to_file()).window_buttons;
+        assert!(back.show_close);
+        assert!(back.show_minimize);
+        assert!(!back.show_maximize, "the hidden one came back");
     }
 
     #[test]

@@ -9,6 +9,8 @@
 //! Everything here is a pure function from parameters to keystrokes, which is
 //! what makes it testable without a live instance.
 
+use crate::i18n::{tr1, tr2};
+
 /// One field the helper asks for, with the value it starts out holding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Param {
@@ -22,7 +24,8 @@ pub struct Param {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub lines: Vec<String>,
-    /// Shown in the status line once it has been sent.
+    /// Shown in the status line once it has been sent. Already translated:
+    /// it is read, not sent, so unlike `lines` it is not ObjectScript.
     pub summary: String,
 }
 
@@ -99,7 +102,7 @@ impl Native {
                         escape_quotes(&package),
                         escape_quotes(&flag)
                     )],
-                    summary: format!("Compile classes: {package} (flag {flag})"),
+                    summary: tr2("Compile classes: {} (flag {})", &package, &flag),
                 }
             }
 
@@ -107,7 +110,7 @@ impl Native {
                 let target = at(0);
                 Invocation {
                     lines: vec![format!("do ^%CSW1GEN(\"{}\")", escape_quotes(&target))],
-                    summary: format!("Generate interface: {target}"),
+                    summary: tr1("Generate interface: {}", &target),
                 }
             }
         }

@@ -292,20 +292,25 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
                 modifiers,
                 ..
             } => {
-                if recall_here && modifiers.is_none() {
-                    // Not forwarded: IRIS's own recall would answer as well,
-                    // and the two would fight over the line.
-                    match key {
-                        Key::ArrowUp => {
-                            action.recall = Some(Recall::Back);
-                            continue;
-                        }
-                        Key::ArrowDown => {
-                            action.recall = Some(Recall::Forward);
-                            continue;
-                        }
-                        _ => {}
+                // Up and Down over a command line are the app's history, and
+                // nothing else reaches IRIS from them - not the bare arrow, and
+                // not any chord built on it. Forwarding one would reach IRIS's
+                // own recall, which is a list of every line that went through
+                // the prompt, including the ones a macro or an IRIS helper
+                // sent: lines nobody typed and nobody wants offered back.
+                //
+                // Where there is no command line at all - a full-screen routine
+                // such as `^%G` - the arrows still belong to the far side and
+                // are left alone.
+                if matches!(key, Key::ArrowUp | Key::ArrowDown) && ctx.line.is_some() {
+                    if recall_here && modifiers.is_none() {
+                        action.recall = Some(if *key == Key::ArrowUp {
+                            Recall::Back
+                        } else {
+                            Recall::Forward
+                        });
                     }
+                    continue;
                 }
                 // Ctrl+A selects the command being typed. Only where there is
                 // one and it is not empty: elsewhere it stays the control code
@@ -555,6 +560,74 @@ mod tests {
         );
     }
 
+    /// The arrows over a command line never reach IRIS: its own recall lists
+    /// every line that went through the prompt, macros and IRIS helpers
+    /// included, and that list is not the user's command history.
+    #[test]
+    fn the_arrows_at_a_prompt_are_never_forwarded() {
+        let at_prompt = InputContext {
+            line: Some(line()),
+            can_recall: true,
+            ..InputContext::default()
+        };
+        for ctx in [
+            at_prompt,
+            // Nothing to recall, and nothing to forward either: an empty
+            // history must not fall through to IRIS's.
+            InputContext {
+                can_recall: false,
+                ..at_prompt
+            },
+        ] {
+            for key in [Key::ArrowUp, Key::ArrowDown] {
+                for modifiers in [Modifiers::NONE, Modifiers::CTRL] {
+                    let action = translate(&[press_with(key, modifiers)], &ctx);
+                    assert!(
+                        action.bytes.is_empty(),
+                        "{key:?} with {modifiers:?} reached IRIS"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bare arrows are the recall, whatever else is going on: no modifier
+    /// turns it on, and none turns it off.
+    #[test]
+    fn the_bare_arrows_are_the_recall() {
+        let at_prompt = InputContext {
+            line: Some(line()),
+            can_recall: true,
+            ..InputContext::default()
+        };
+
+        assert_eq!(
+            translate(&[press(Key::ArrowUp)], &at_prompt).recall,
+            Some(Recall::Back)
+        );
+        assert_eq!(
+            translate(&[press(Key::ArrowDown)], &at_prompt).recall,
+            Some(Recall::Forward)
+        );
+        // A chord is not a second way in - and it still must not reach IRIS,
+        // whose own recall is the list this keeps out of the way.
+        for modifiers in [Modifiers::CTRL, Modifiers::SHIFT] {
+            let action = translate(&[press_with(Key::ArrowUp, modifiers)], &at_prompt);
+            assert_eq!(action.recall, None, "{modifiers:?} recalled");
+            assert!(action.bytes.is_empty(), "{modifiers:?} reached IRIS");
+        }
+    }
+
+    /// Away from a prompt the arrows are the far side's: a full-screen routine
+    /// reads them itself.
+    #[test]
+    fn the_arrows_still_reach_a_full_screen_routine() {
+        let no_line = InputContext::default();
+        let action = translate(&[press(Key::ArrowUp)], &no_line);
+        assert_eq!(action.bytes, b"\x1b[A".to_vec());
+        assert_eq!(action.recall, None);
+    }
+
     /// Ctrl+A selects what has been typed instead of reaching IRIS as SOH.
     #[test]
     fn ctrl_a_selects_the_command_being_typed() {
@@ -731,16 +804,18 @@ mod tests {
         assert!(down.bytes.is_empty());
     }
 
-    /// With no history, or away from a prompt, the arrows are IRIS's again.
+    /// With nothing to recall the arrow does nothing at all - it used to fall
+    /// through to IRIS, whose own recall is the list this feature exists to
+    /// keep out of the way. Away from a prompt it is still IRIS's key.
     #[test]
-    fn up_reaches_iris_when_there_is_nothing_for_the_app_to_recall() {
+    fn up_does_nothing_when_there_is_nothing_for_the_app_to_recall() {
         let no_history = InputContext {
             line: Some(line()),
             ..InputContext::default()
         };
         let action = translate(&[press(Key::ArrowUp)], &no_history);
         assert_eq!(action.recall, None);
-        assert_eq!(action.bytes, b"\x1b[A".to_vec());
+        assert!(action.bytes.is_empty());
 
         let no_prompt = InputContext {
             can_recall: true,
@@ -751,8 +826,9 @@ mod tests {
         assert_eq!(action.bytes, b"\x1b[A".to_vec());
     }
 
-    /// Mid-line, replacing the line would rub out the wrong characters, so the
-    /// recall is left to IRIS.
+    /// Mid-line, replacing the line would rub out the wrong characters, so
+    /// nothing is recalled - and nothing is forwarded either, since IRIS would
+    /// replace the line itself.
     #[test]
     fn up_is_not_ours_when_the_cursor_is_not_at_the_end_of_the_line() {
         let ctx = InputContext {
@@ -765,7 +841,7 @@ mod tests {
         };
         let action = translate(&[press(Key::ArrowUp)], &ctx);
         assert_eq!(action.recall, None);
-        assert_eq!(action.bytes, b"\x1b[A".to_vec());
+        assert!(action.bytes.is_empty());
     }
 
     #[test]

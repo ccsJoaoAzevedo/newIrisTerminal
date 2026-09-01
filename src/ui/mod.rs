@@ -1,7 +1,10 @@
 pub mod chrome;
+pub mod detach;
 pub mod fonts;
 pub mod input;
 pub mod panels;
+pub mod shading;
 pub mod shortcut;
 pub mod terminal_view;
+pub mod theme_manager;
 pub mod wrap;

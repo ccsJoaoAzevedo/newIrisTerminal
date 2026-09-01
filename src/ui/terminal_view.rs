@@ -7,6 +7,7 @@
 use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 
 use crate::config::{CursorStyle, Theme};
+use crate::i18n::tr;
 use crate::term::cell::{Cell, Color};
 use crate::term::{lineedit, palette, syntax, Attrs, Grid};
 use crate::ui::wrap;
@@ -284,6 +285,8 @@ pub enum ContextAction {
     SelectAll,
     ClearSelection,
     ExportScreen,
+    /// Hand this much of the output to a Claude Code session.
+    Analyze(crate::features::analyze::Scope),
     /// Reset the terminal and drop the scrollback. The same thing Ctrl+Delete
     /// does, put where it can be found.
     ClearTerminal,
@@ -596,36 +599,55 @@ pub fn show(
 
     response.context_menu(|ui| {
         if ui
-            .add_enabled(has_selection, egui::Button::new("Copy"))
+            .add_enabled(has_selection, egui::Button::new(tr("Copy")))
             .clicked()
         {
             context_action = Some(ContextAction::CopySelection);
             ui.close_menu();
         }
-        if ui.button("Paste").clicked() {
+        if ui.button(tr("Paste")).clicked() {
             context_action = Some(ContextAction::Paste);
             ui.close_menu();
         }
         ui.separator();
-        if ui.button("Select all").clicked() {
+        if ui.button(tr("Select all")).clicked() {
             context_action = Some(ContextAction::SelectAll);
             ui.close_menu();
         }
         if ui
-            .add_enabled(has_selection, egui::Button::new("Clear selection"))
+            .add_enabled(has_selection, egui::Button::new(tr("Clear selection")))
             .clicked()
         {
             context_action = Some(ContextAction::ClearSelection);
             ui.close_menu();
         }
         ui.separator();
-        if ui.button("Export screen...").clicked() {
+        if ui.button(tr("Export screen...")).clicked() {
             context_action = Some(ContextAction::ExportScreen);
             ui.close_menu();
         }
+        // A submenu rather than three entries: the scope is the only question
+        // it asks, and asking it in the menu saves a dialog.
+        ui.menu_button(tr("Analyze with Claude"), |ui| {
+            ui.small(tr(
+                "Opens a Claude Code session with the output already in context, in a window of its own.",
+            ));
+            for scope in crate::features::analyze::Scope::ALL {
+                // Asking about the selection needs one, so the entry says as
+                // much rather than opening a session on nothing.
+                let usable = has_selection || !scope.is_selection();
+                if ui
+                    .add_enabled(usable, egui::Button::new(tr(scope.label())))
+                    .clicked()
+                {
+                    context_action = Some(ContextAction::Analyze(scope));
+                    ui.close_menu();
+                }
+            }
+        });
         if ui
-            .button("Clear terminal and scrollback")
-            .on_hover_text("Ctrl+Delete. Unlike IRIS's own clear-screen, this really does throw the history away. At an idle prompt it sends W # so IRIS puts its next prompt back at the top; the echo and the old screen are dropped rather than kept.")
+            .button(tr("Clear terminal and scrollback"))
+            .on_hover_text(tr("Ctrl+Delete. Unlike IRIS's own clear-screen, this really does throw the history away. At an idle prompt it sends W # so IRIS puts its next prompt back at the top; the echo and the old screen are dropped rather than kept."))
             .clicked()
         {
             context_action = Some(ContextAction::ClearTerminal);
@@ -710,12 +732,43 @@ fn h_scrollbar(
         Pos2::new(track.left() + span * progress, track.top() + 1.0),
         Vec2::new(thumb_width, (track.height() - 2.0).max(1.0)),
     );
-    let colour = if response.hovered() || response.dragged() {
-        palette::blend(theme.selection, theme.foreground, 0.35)
-    } else {
-        palette::blend(theme.selection, theme.foreground, 0.1)
-    };
-    painter.rect_filled(thumb, 2.0, colour);
+    paint_thumb(
+        &painter,
+        thumb,
+        theme,
+        response.hovered() || response.dragged(),
+        false,
+    );
+}
+
+/// The handle, in whichever look the theme calls for.
+///
+/// An Aqua theme gets the glass capsule, because a Tiger window with a flat
+/// grey scroll handle reads as two applications in one frame; everything else
+/// keeps the flat bar, which is what a modern theme wants.
+fn paint_thumb(painter: &egui::Painter, thumb: Rect, theme: &Theme, active: bool, vertical: bool) {
+    use crate::config::theme::WindowButtonStyle;
+    use crate::ui::shading;
+
+    match (theme.window_buttons.style, theme.scrollbar_handle) {
+        (WindowButtonStyle::Aqua, Some(base)) => {
+            let base = if active {
+                shading::lighten(base, 0.12)
+            } else {
+                base
+            };
+            shading::aqua_capsule(painter, thumb, base, vertical);
+        }
+        (_, handle) => {
+            let base = handle.unwrap_or(theme.selection);
+            let colour = if active {
+                palette::blend(base, theme.foreground, 0.35)
+            } else {
+                palette::blend(base, theme.foreground, 0.1)
+            };
+            painter.rect_filled(thumb, 2.0, colour);
+        }
+    }
 }
 
 /// Moves the anchor by whole lines and re-pins to the bottom on arrival.
@@ -815,12 +868,13 @@ fn scrollbar(
         Pos2::new(track.left() + 1.0, track.top() + span * progress),
         Vec2::new((track.width() - 2.0).max(1.0), thumb_height),
     );
-    let colour = if response.hovered() || response.dragged() {
-        palette::blend(theme.selection, theme.foreground, 0.35)
-    } else {
-        palette::blend(theme.selection, theme.foreground, 0.1)
-    };
-    painter.rect_filled(thumb, 2.0, colour);
+    paint_thumb(
+        &painter,
+        thumb,
+        theme,
+        response.hovered() || response.dragged(),
+        true,
+    );
 }
 
 /// Whether a blinking cursor is in its visible half right now.
@@ -1044,6 +1098,28 @@ fn handle_mouse(
         let offset = boundary_at(pos.x, rect.left(), cell.x, mode.view_cols);
         resolve(pos, offset, grid.cols)
     };
+
+    // Double-click takes the whole line, the way it does in a text editor -
+    // and the way anyone who has just seen a stack trace go past wants it to.
+    // Checked before the single click, which would otherwise clear it again on
+    // the same frame.
+    if response.double_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let (line, _) = pos_to_cell(pos);
+            // To the last character, not to the width of the terminal: a line
+            // selected out to column 200 pastes as a line with 150 spaces on
+            // the end of it.
+            let width = grid.line(line).map_or(0, |row| row.used_width());
+            if width > 0 {
+                state.selection = Some(Selection::across(line, 0, width - 1));
+                state.drag_anchor = None;
+                if copy_on_select {
+                    outcome.copy_selection = true;
+                }
+            }
+        }
+        return outcome;
+    }
 
     // A plain click clears the selection. This cannot be folded into the
     // `drag_stopped` branch below: egui only reports a drag once the pointer has
