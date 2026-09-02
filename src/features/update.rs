@@ -155,7 +155,7 @@ pub fn system_proxy() -> Option<String> {
                 return Some(rest.to_string());
             }
         }
-        return None;
+        None
     }
     #[cfg(not(windows))]
     None

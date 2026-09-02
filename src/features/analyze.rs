@@ -237,7 +237,7 @@ pub fn launch(path: &Path) -> Result<()> {
         windows_command(path, &dir)
             .spawn()
             .context("starting claude in a new window")?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
