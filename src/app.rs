@@ -7,7 +7,7 @@ use crate::config::{self, ensure_config_tree, load_themes, LogMode, Profile, Set
 use crate::features::analyze;
 use crate::features::autologon::{Autologon, State as AutoState};
 use crate::features::export::{self, Range};
-use crate::features::history::History;
+use crate::features::history::{self, History};
 use crate::features::logging::{self, SessionLog};
 use crate::features::macros::{self, MacroGroup};
 use crate::features::update;
@@ -116,6 +116,80 @@ struct WindowFit {
     centre: Option<egui::Pos2>,
 }
 
+/// Thickness of the divider between two panes, in points. egui's own
+/// separator, which is what draws it.
+const SPLIT_DIVIDER: f32 = 6.0;
+
+/// Which way the second pane sits next to the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitDir {
+    Right,
+    Bottom,
+}
+
+/// A second session inside one tab, and which way it sits.
+///
+/// One split rather than a tree of them: two sessions in one tab is the thing
+/// people actually ask for - a routine running in one and a global inspected in
+/// the other - and a general pane tree would be a window manager inside a
+/// terminal. So a split tab cannot be split again, and the strip entry has only
+/// ever two names to carry.
+pub struct Split {
+    pub dir: SplitDir,
+    /// The session the split opened. Boxed: a [`Tab`] holds one of these, so
+    /// the type would otherwise have no size.
+    pub tab: Box<Tab>,
+}
+
+/// Which of a tab's two sessions.
+///
+/// `First` is the left or top pane and is the only one an unsplit tab has. The
+/// numbers are what the strip entry shows - `1:` and `2:` - so they are the
+/// panes' names as far as the user is concerned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pane {
+    #[default]
+    First,
+    Second,
+}
+
+impl Pane {
+    /// What the strip entry calls this pane.
+    pub fn number(self) -> u8 {
+        match self {
+            Pane::First => 1,
+            Pane::Second => 2,
+        }
+    }
+}
+
+/// One session on screen: the tab it is in, and which of its panes.
+///
+/// Everything that acts on "the session" takes one of these rather than a tab
+/// index, because with a split tab an index no longer names a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct At {
+    tab: usize,
+    pane: Pane,
+}
+
+/// What drawing one pane produced.
+///
+/// `Default` stands for a pane there was nothing to draw in - a tab that went
+/// away between frames. A zero cell size leaves the window geometry alone
+/// rather than dividing by it.
+#[derive(Default)]
+struct PaneMeasure {
+    /// Grid size IRIS should be told about, which is wider than the window -
+    /// see [`terminal_view::TERMINAL_COLS`].
+    grid: (usize, usize),
+    /// Size of the pane in characters, as drawn.
+    view: (usize, usize),
+    cell: egui::Vec2,
+    /// The user clicked into this pane's terminal this frame.
+    clicked: bool,
+}
+
 /// Takes one key press out of this frame's events, matching the modifiers
 /// exactly, and reports whether it was there.
 ///
@@ -148,6 +222,10 @@ fn consume_exact(ctx: &Context, modifiers: Modifiers, key: Key) -> bool {
 struct Renaming {
     tab: usize,
     draft: String,
+    /// The second pane's name, when the tab is split. Two fields because the
+    /// entry names two sessions; the `1:` and `2:` in front of them are the
+    /// panes themselves and not part of either name.
+    second: Option<String>,
     /// Cleared after the field has been given focus once. Without this the
     /// terminal claims the keyboard back - it grabs focus whenever nothing else
     /// holds it - and the new name would be typed into IRIS.
@@ -171,15 +249,33 @@ pub struct Tab {
     pub log: Option<SessionLog>,
     /// User-set name; falls back to the OSC title, then the profile name.
     pub custom_title: Option<String>,
-    /// How far back through the command history this tab has walked, if at
-    /// all. Per tab, so recalling in one does not move another.
-    pub recall_index: Option<usize>,
+    /// Namespace the session was last seen to be in, read off its prompt. The
+    /// tab name carries it when `show_namespace_in_tab` is on, and it follows a
+    /// `ZN` because the prompt does.
+    pub namespace: Option<String>,
+    /// Commands typed at this session's own prompt, oldest last.
+    ///
+    /// What Up offers back first: a tab recalls its own train of thought, not
+    /// the one next to it. Only once these run out does the recall go on to the
+    /// commands inherited from earlier runs - see
+    /// [`crate::features::history::History::recall_list`].
+    pub commands: Vec<String>,
+    /// How far back through the recall this tab has walked, if at all. 0 is the
+    /// newest candidate. Per session, so recalling in one pane does not move
+    /// another.
+    pub recall_step: Option<usize>,
     /// When a clear-screen was asked of IRIS, so a purge that never arrives can
     /// be called off. See [`Tab::request_clear`].
     clear_asked: Option<std::time::Instant>,
     /// Set when the child exits, so the tab explains itself instead of freezing.
     pub ended: bool,
     pub error: Option<String>,
+    /// The second session sharing this tab, once it has been split. Always
+    /// `None` on the second session itself: a split tab cannot be split again.
+    pub split: Option<Split>,
+    /// Which pane has the keyboard. Meaningless until the tab is split, and
+    /// what the strip entry's `1:` or `2:` reports.
+    pub focus: Pane,
 }
 
 /// Source of [`Tab::uid`]. Never reused, so a closed tab's id cannot collide
@@ -199,10 +295,14 @@ impl Tab {
             view: ViewState::default(),
             log,
             custom_title: None,
-            recall_index: None,
+            namespace: None,
+            commands: Vec::new(),
+            recall_step: None,
             clear_asked: None,
             ended: false,
             error: None,
+            split: None,
+            focus: Pane::First,
         };
         tab.start();
         tab
@@ -249,12 +349,23 @@ impl Tab {
         }
     }
 
-    pub fn title(&self) -> String {
-        self.custom_title
+    /// What the tab strip calls this session.
+    ///
+    /// `with_namespace` adds the namespace the session is in to the automatic
+    /// name - `CONSISTEM | RDB76-TR` - which is the one thing two tabs on the
+    /// same instance do not otherwise say. A name the user typed is left
+    /// exactly as they typed it either way.
+    pub fn title(&self, with_namespace: bool) -> String {
+        if let Some(custom) = self.custom_title.clone() {
+            return custom;
+        }
+        // IRIS sets the window title to the executable path, which is useless
+        // as a tab name.
+        let base = self
+            .grid
+            .title
             .clone()
-            // IRIS sets the window title to the executable path, which is
-            // useless as a tab name.
-            .or_else(|| self.grid.title.clone().filter(|t| !t.contains(".exe")))
+            .filter(|t| !t.contains(".exe"))
             .unwrap_or_else(|| {
                 // The instance first: it is what tells two tabs apart, whereas
                 // the profile name is often left at its default and the same on
@@ -264,7 +375,66 @@ impl Tab {
                 } else {
                     self.profile.instance.clone()
                 }
-            })
+            });
+        match self.namespace.as_deref().filter(|_| with_namespace) {
+            // Not when the name already is the namespace, which is what a
+            // server called after its namespace comes out as.
+            Some(namespace) if namespace != base => format!("{base} | {namespace}"),
+            _ => base,
+        }
+    }
+
+    /// What the tab strip calls this tab.
+    ///
+    /// A split tab is two sessions in one entry, so the entry says which of
+    /// them the keyboard is in - `1: CONSISTEM | COMP80` for the left or top
+    /// pane, `2: ...` for the other - and follows the focus as it moves. An
+    /// unsplit tab is one session and needs no number.
+    pub fn strip_label(&self, with_namespace: bool) -> String {
+        if self.split.is_none() {
+            return self.title(with_namespace);
+        }
+        format!(
+            "{}: {}",
+            self.focus.number(),
+            self.focused().title(with_namespace)
+        )
+    }
+
+    /// One of this tab's panes. `Second` is there only while the tab is split.
+    pub fn pane(&self, pane: Pane) -> Option<&Tab> {
+        match pane {
+            Pane::First => Some(self),
+            Pane::Second => self.split.as_ref().map(|split| split.tab.as_ref()),
+        }
+    }
+
+    pub fn pane_mut(&mut self, pane: Pane) -> Option<&mut Tab> {
+        match pane {
+            Pane::First => Some(self),
+            Pane::Second => self.split.as_mut().map(|split| split.tab.as_mut()),
+        }
+    }
+
+    /// The session the keyboard is in, which is this one unless the tab is
+    /// split and the second pane has it.
+    pub fn focused(&self) -> &Tab {
+        self.pane(self.focus).unwrap_or(self)
+    }
+
+    /// Every session this tab holds: itself, and the second pane when split.
+    pub fn sessions(&self) -> impl Iterator<Item = &Tab> {
+        std::iter::once(self).chain(self.split.as_ref().map(|split| split.tab.as_ref()))
+    }
+
+    /// Remembers a command this session ran, for its own recall.
+    pub fn remember_command(&mut self, command: &str) {
+        crate::features::history::push_recent(&mut self.commands, command);
+    }
+
+    /// Process id of the session on this machine, while it is running.
+    pub fn pid(&self) -> Option<u32> {
+        self.session.as_ref()?.process_id()
     }
 
     /// Pulls output, parses it, answers device reports, and runs autologon.
@@ -301,6 +471,14 @@ impl Tab {
             // prompt split across two reads is still recognised.
             if let Some(to_send) = self.autologon.observe(&self.grid) {
                 let _ = session.write(&self.profile.encoding.encode(&to_send));
+            }
+
+            // Read after the parse, from the row the cursor is on: the prompt
+            // is the only place a session says which namespace it is in, and it
+            // says so again after every `ZN`. Kept when the screen moves off a
+            // prompt, so the tab does not lose its name mid-routine.
+            if let Some(namespace) = lineedit::namespace(&self.grid) {
+                self.namespace = Some(namespace);
             }
 
             let still_on_password = self.autologon.state() == AutoState::WaitPassword;
@@ -394,12 +572,16 @@ impl Tab {
 
 /// Arrow keys that walk IRIS's cursor `columns` to the right, or to the left
 /// when negative. Empty for no movement.
-fn cursor_bytes(columns: i64) -> Vec<u8> {
+///
+/// `app_cursor` picks the spelling the far side is expecting - see
+/// [`input::cursor_key`]. Sending the other one is why click-to-position moved
+/// nothing on IRIS 2023.
+fn cursor_bytes(columns: i64, app_cursor: bool) -> Vec<u8> {
     if columns == 0 {
         return Vec::new();
     }
-    let sequence: &[u8] = if columns < 0 { b"\x1b[D" } else { b"\x1b[C" };
-    sequence.repeat(columns.unsigned_abs() as usize)
+    let final_byte = if columns < 0 { b'D' } else { b'C' };
+    input::cursor_key(app_cursor, final_byte).repeat(columns.unsigned_abs() as usize)
 }
 
 /// Columns of the command line covered by the tab's selection.
@@ -479,6 +661,10 @@ pub struct App {
     font_request: String,
     /// Tab whose name is being edited, if any.
     renaming: Option<Renaming>,
+    /// Size and position of the Settings window: restored from the settings
+    /// file at startup, and written back on exit for whichever of the two
+    /// window switches is on.
+    settings_placement: crate::ui::detach::Placement,
     /// Set when a close was intercepted to ask about live sessions.
     confirm_close: bool,
     /// Set once the user has said to close anyway, so the confirmation cannot
@@ -548,6 +734,12 @@ impl App {
                 centre: None,
             });
 
+        // Read before `settings` is moved into the app.
+        let settings_placement = crate::ui::detach::Placement {
+            restore: settings.restored_settings_placement(),
+            seen: crate::ui::detach::Geometry::default(),
+        };
+
         let mut app = App {
             new_tab_profile: default_profile,
             macro_groups: load_macros(&settings).groups,
@@ -572,6 +764,7 @@ impl App {
             font_family: String::new(),
             font_request: String::new(),
             renaming: None,
+            settings_placement,
             confirm_close: false,
             close_confirmed: false,
             fit,
@@ -693,7 +886,13 @@ impl App {
     /// the terminal to say what the screen has already shown; what it does is
     /// on the right-click entry's tooltip instead.
     fn clear_active_terminal(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        self.clear_terminal(self.focused_at());
+    }
+
+    /// [`App::clear_active_terminal`] for one named pane, since with a tab
+    /// split the right-click menu can be opened over either of them.
+    fn clear_terminal(&mut self, at: At) {
+        let Some(tab) = self.pane_mut(at) else {
             return;
         };
         tab.view.clear_selection();
@@ -722,14 +921,17 @@ impl App {
         self.active = self.tabs.len() - 1;
     }
 
+    /// Closes a tab and everything in it - both sessions, when it is split.
     pub fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
         // Ask IRIS to halt so it releases locks; Drop kills anything that
         // ignores the request.
-        if let Some(session) = self.tabs[index].session.as_ref() {
-            session.request_halt();
+        for session in self.tabs[index].sessions() {
+            if let Some(session) = session.session.as_ref() {
+                session.request_halt();
+            }
         }
         self.tabs.remove(index);
         if self.active >= self.tabs.len() {
@@ -737,8 +939,35 @@ impl App {
         }
     }
 
+    /// The session the user is working in: the focused pane of the active tab.
     fn active_tab(&self) -> Option<&Tab> {
-        self.tabs.get(self.active)
+        self.pane(self.focused_at())
+    }
+
+    /// Where that session lives.
+    fn focused_at(&self) -> At {
+        At {
+            tab: self.active,
+            pane: self
+                .tabs
+                .get(self.active)
+                .map_or(Pane::First, |tab| tab.focus),
+        }
+    }
+
+    /// The session at `at`, while both the tab and the pane are still there.
+    fn pane(&self, at: At) -> Option<&Tab> {
+        self.tabs.get(at.tab)?.pane(at.pane)
+    }
+
+    fn pane_mut(&mut self, at: At) -> Option<&mut Tab> {
+        self.tabs.get_mut(at.tab)?.pane_mut(at.pane)
+    }
+
+    /// Every session open, in every tab. What "is anything still connected"
+    /// has to count, since a split tab holds two.
+    fn sessions(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs.iter().flat_map(|tab| tab.sessions())
     }
 
     fn set_status(&mut self, text: impl Into<String>) {
@@ -784,6 +1013,12 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
+        // The macro editor is listening for a chord: Ctrl+T there means "bind
+        // this macro to Ctrl+T", and opening a tab instead would make the app's
+        // own shortcuts the only ones that could never be recorded.
+        if self.panels.capture_shortcut {
+            return;
+        }
         let cmd = Modifiers::COMMAND;
         let new_tab = consume_exact(ctx, cmd, Key::T);
         let close_tab = consume_exact(ctx, cmd, Key::W);
@@ -818,12 +1053,10 @@ impl App {
             self.close_tab(self.active);
         }
         if next_tab && !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
+            self.activate_tab((self.active + 1) % self.tabs.len());
         }
         if let Some(n) = jump {
-            if n < self.tabs.len() {
-                self.active = n;
-            }
+            self.activate_tab(n);
         }
         // Font size drives cell size, which drives grid dimensions, so zooming
         // reflows and resizes the PTY through the ordinary resize path.
@@ -993,7 +1226,14 @@ impl App {
             ui.separator();
             if let Some(tab) = self.active_tab() {
                 let (cols, rows) = self.view_size;
-                ui.weak(format!("{}  {cols}x{rows}", tab.profile.endpoint()));
+                // The instance, then what identifies this session of it, then
+                // how big the window is - in that order because that is how
+                // specific each one is.
+                let pid = match tab.pid().filter(|_| self.settings.show_pid) {
+                    Some(pid) => format!("  PID {pid}"),
+                    None => String::new(),
+                };
+                ui.weak(format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint()));
             }
 
             // Last, so the leftover space it claims for dragging is whatever
@@ -1057,6 +1297,7 @@ impl App {
     /// switches is on. Called as the app exits.
     fn persist_window_geometry(&mut self) {
         let mut changed = false;
+        let settings_seen = self.settings_placement.seen;
         if self.settings.save_terminal_size {
             if self.window_size.is_some() && self.settings.window_size != self.window_size {
                 self.settings.window_size = self.window_size;
@@ -1066,13 +1307,29 @@ impl App {
                 self.settings.window_maximized = self.window_maximized;
                 changed = true;
             }
+            // The Settings window follows the same two switches rather than
+            // having a pair of its own: it is a window of the app's, and one
+            // answer to "remember where my windows were" is enough.
+            if settings_seen.size.is_some()
+                && self.settings.settings_window_size != settings_seen.size
+            {
+                self.settings.settings_window_size = settings_seen.size;
+                changed = true;
+            }
         }
-        if self.settings.save_window_position
-            && self.window_position.is_some()
-            && self.settings.window_position != self.window_position
-        {
-            self.settings.window_position = self.window_position;
-            changed = true;
+        if self.settings.save_window_position {
+            if self.window_position.is_some()
+                && self.settings.window_position != self.window_position
+            {
+                self.settings.window_position = self.window_position;
+                changed = true;
+            }
+            if settings_seen.position.is_some()
+                && self.settings.settings_window_position != settings_seen.position
+            {
+                self.settings.settings_window_position = settings_seen.position;
+                changed = true;
+            }
         }
         if changed {
             if let Err(e) = self.settings.save() {
@@ -1134,7 +1391,7 @@ impl App {
     fn should_confirm_close(&self) -> bool {
         !self.close_confirmed
             && self.settings.confirm_close_with_live_session
-            && self.tabs.iter().any(|t| t.session.is_some())
+            && self.sessions().any(|t| t.session.is_some())
     }
 
     /// Asks before dropping live sessions.
@@ -1148,7 +1405,7 @@ impl App {
             return;
         }
 
-        let live = self.tabs.iter().filter(|t| t.session.is_some()).count();
+        let live = self.sessions().filter(|t| t.session.is_some()).count();
         let mut close_anyway = false;
         let mut cancel = false;
         let mut open = true;
@@ -1187,19 +1444,24 @@ impl App {
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let mut to_close = None;
         let mut to_rename = None;
+        let mut to_split = None;
+        let mut to_unsplit = None;
+        let mut to_activate = None;
+        let with_namespace = self.settings.show_namespace_in_tab;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for index in 0..self.tabs.len() {
                     let selected = index == self.active;
-                    let mut label = self.tabs[index].title();
-                    if self.tabs[index].ended {
+                    let split = self.tabs[index].split.is_some();
+                    let mut label = self.tabs[index].strip_label(with_namespace);
+                    if self.tabs[index].focused().ended {
                         label.push_str(" (ended)");
                     }
                     let response = ui
                         .selectable_label(selected, label)
                         .on_hover_text(tr("Double-click to rename."));
                     if response.clicked() {
-                        self.active = index;
+                        to_activate = Some(index);
                     }
                     if response.double_clicked() {
                         to_rename = Some(index);
@@ -1209,7 +1471,46 @@ impl App {
                             to_rename = Some(index);
                             ui.close_menu();
                         }
-                        if ui.button(tr("Close")).clicked() {
+                        ui.separator();
+                        // A tab already holding two sessions has nowhere to put
+                        // a third, so the only thing offered is the way back.
+                        if split {
+                            if ui
+                                .button(tr("Remove split"))
+                                .on_hover_text(tr(
+                                    "Gives the second session a tab of its own. Nothing is closed.",
+                                ))
+                                .clicked()
+                            {
+                                to_unsplit = Some(index);
+                                ui.close_menu();
+                            }
+                        } else {
+                            if ui
+                                .button(tr("Split to right"))
+                                .on_hover_text(tr(
+                                    "Opens a second session in this tab, beside this one. Click into a pane to type in it.",
+                                ))
+                                .clicked()
+                            {
+                                to_split = Some((index, SplitDir::Right));
+                                ui.close_menu();
+                            }
+                            if ui.button(tr("Split to bottom")).clicked() {
+                                to_split = Some((index, SplitDir::Bottom));
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .button(tr("Close"))
+                            .on_hover_text(if split {
+                                tr("Closes both sessions in this tab.")
+                            } else {
+                                tr("Closes this session.")
+                            })
+                            .clicked()
+                        {
                             to_close = Some(index);
                             ui.close_menu();
                         }
@@ -1222,12 +1523,25 @@ impl App {
             });
         });
 
+        if let Some(index) = to_activate {
+            self.activate_tab(index);
+        }
+        if let Some((index, dir)) = to_split {
+            self.split_tab(index, dir);
+        }
+        if let Some(index) = to_unsplit {
+            self.remove_split(index);
+        }
         if let Some(index) = to_rename {
-            // Seeded with the name on screen, so renaming is an edit rather
+            // Seeded with the names on screen, so renaming is an edit rather
             // than starting from nothing.
+            let tab = &self.tabs[index];
             self.renaming = Some(Renaming {
                 tab: index,
-                draft: self.tabs[index].title(),
+                draft: tab.title(with_namespace),
+                second: tab
+                    .pane(Pane::Second)
+                    .map(|second| second.title(with_namespace)),
                 focus: true,
             });
         }
@@ -1235,6 +1549,54 @@ impl App {
         if let Some(index) = to_close {
             self.close_tab(index);
         }
+    }
+
+    /// Makes a tab the active one, which is the tab drawn and the one every
+    /// other feature works on. Which of its panes is current is the tab's own
+    /// business - see [`Tab::focus`].
+    fn activate_tab(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.active = index;
+        }
+    }
+
+    /// Splits a tab in two, opening a second session in the pane it makes.
+    ///
+    /// The new session goes where the pane appears - to the right, or at the
+    /// bottom - and takes the keyboard, the way a newly opened tab does. A tab
+    /// that is already split is left alone: it has two names to show and no
+    /// room for a third.
+    fn split_tab(&mut self, index: usize, dir: SplitDir) {
+        if self.tabs.get(index).is_none_or(|tab| tab.split.is_some()) {
+            return;
+        }
+        let (cols, rows) = self.terminal_size;
+        let opened = Tab::new(self.new_tab_profile.clone(), &self.settings, cols, rows);
+        self.tabs[index].split = Some(Split {
+            dir,
+            tab: Box::new(opened),
+        });
+        self.tabs[index].focus = Pane::Second;
+        self.active = index;
+    }
+
+    /// Takes a split tab back to one session, and gives the other one a tab of
+    /// its own.
+    ///
+    /// Promoted rather than closed: it is a live IRIS session, and "remove
+    /// split" is a sentence about the layout. Closing the tab is what closes
+    /// both. The keyboard stays with whichever of the two had it.
+    fn remove_split(&mut self, index: usize) {
+        let Some(split) = self.tabs.get_mut(index).and_then(|tab| tab.split.take()) else {
+            return;
+        };
+        let had_focus = std::mem::take(&mut self.tabs[index].focus);
+        self.tabs.insert(index + 1, *split.tab);
+        self.active = if had_focus == Pane::Second {
+            index + 1
+        } else {
+            index
+        };
     }
 
     /// Names one tab.
@@ -1252,7 +1614,6 @@ impl App {
 
         let mut open = true;
         let mut commit = false;
-        let mut clear = false;
         let mut cancel = false;
 
         egui::Window::new(tr("Rename tab"))
@@ -1261,8 +1622,23 @@ impl App {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                let response =
-                    ui.add(egui::TextEdit::singleline(&mut renaming.draft).desired_width(220.0));
+                // A split tab is two sessions under one entry, so it is renamed
+                // two names at a time. The `1:` and `2:` are the panes
+                // themselves and cannot be edited away.
+                let split = renaming.second.is_some();
+                let field = |ui: &mut egui::Ui, label: Option<&str>, text: &mut String| {
+                    let mut response = None;
+                    ui.horizontal(|ui| {
+                        if let Some(label) = label {
+                            ui.label(label);
+                        }
+                        response =
+                            Some(ui.add(egui::TextEdit::singleline(text).desired_width(220.0)));
+                    });
+                    response.expect("the field is always added")
+                };
+
+                let response = field(ui, split.then_some("1:"), &mut renaming.draft);
                 if renaming.focus {
                     response.request_focus();
                     renaming.focus = false;
@@ -1270,15 +1646,21 @@ impl App {
                 if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     commit = true;
                 }
+                if let Some(second) = renaming.second.as_mut() {
+                    let response = field(ui, Some("2:"), second);
+                    if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        commit = true;
+                    }
+                }
 
-                ui.small(tr("Empty goes back to the automatic name."));
+                // The one button there used to be for this is what an empty
+                // field already does, and two ways to say the same thing in a
+                // dialog this small only asks the user which one is real.
+                ui.small(tr("Empty goes back to default."));
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button(tr("Rename")).clicked() {
                         commit = true;
-                    }
-                    if ui.button(tr("Automatic")).clicked() {
-                        clear = true;
                     }
                     if ui.button(tr("Cancel")).clicked() {
                         cancel = true;
@@ -1287,10 +1669,17 @@ impl App {
             });
 
         if commit {
-            let name = renaming.draft.trim().to_string();
-            self.tabs[renaming.tab].custom_title = (!name.is_empty()).then_some(name);
-        } else if clear {
-            self.tabs[renaming.tab].custom_title = None;
+            let named = |text: &str| {
+                let name = text.trim().to_string();
+                (!name.is_empty()).then_some(name)
+            };
+            self.tabs[renaming.tab].custom_title = named(&renaming.draft);
+            if let (Some(text), Some(second)) = (
+                renaming.second.as_deref(),
+                self.tabs[renaming.tab].pane_mut(Pane::Second),
+            ) {
+                second.custom_title = named(text);
+            }
         } else if !(cancel || !open) {
             // Still open, so the draft survives to the next frame.
             self.renaming = Some(renaming);
@@ -1338,20 +1727,6 @@ impl App {
                 );
                 if let Err(e) = self.settings.save() {
                     self.set_status(tr1("Could not save settings: {}", &format!("{e:#}")));
-                }
-            }
-            UiRequest::ReloadMacros => {
-                let report = load_macros(&self.settings);
-                self.macro_groups = report.groups;
-                // Selection and draft are indices into the list that was just
-                // replaced, so they would now address a different macro.
-                self.panels.forget_macro_selection();
-                let count: usize = self.macro_groups.iter().map(|g| g.macros.len()).sum();
-                let reloaded = tr1("Reloaded {} macros.", &count.to_string());
-                if report.problems.is_empty() {
-                    self.set_status(reloaded);
-                } else {
-                    self.set_status(format!("{reloaded} {}", report.problems.join(" ")));
                 }
             }
             UiRequest::OpenFolder(path) => {
@@ -1439,8 +1814,8 @@ impl App {
     /// Two steps rather than one because they fail for different reasons and
     /// the user can act on each: nothing to analyze yet, or no `claude` on the
     /// PATH.
-    fn analyze_with_claude(&mut self, scope: analyze::Scope) {
-        let Some(tab) = self.active_tab() else {
+    fn analyze_with_claude(&mut self, at: At, scope: analyze::Scope) {
+        let Some(tab) = self.pane(at) else {
             self.set_status(tr("No active session."));
             return;
         };
@@ -1543,76 +1918,97 @@ impl App {
     /// since a credential prompt carries no `>` and is never echoed.
     /// `unechoed` is text typed in the same frame as the Enter, which IRIS has
     /// not sent back yet and which the screen therefore does not show.
-    fn record_command(&mut self, tab: usize, unechoed: &str) {
-        let Some(tab) = self.tabs.get_mut(tab) else {
+    fn record_command(&mut self, at: At, unechoed: &str) {
+        let Some(tab) = self.pane_mut(at) else {
             return;
         };
-        tab.recall_index = None;
+        tab.recall_step = None;
         if tab.autologon.state() == AutoState::WaitPassword {
             return;
         }
         let Some(text) = lineedit::typed_text(&tab.grid) else {
             return;
         };
-        self.history.record(&format!("{text}{unechoed}"));
+        let command = format!("{text}{unechoed}");
+        // Twice over, because the two lists answer different questions: this
+        // session's own recall, and what the next start will inherit.
+        tab.remember_command(&command);
+        self.history.record(&command);
     }
 
     /// Replaces the line being typed with the next command from the history.
     ///
     /// IRIS keeps its own recall, but only for as long as the process lives and
-    /// only for what was typed into it; this is the app's, shared by every tab
-    /// and - when the setting allows - by every session that came before.
+    /// only for what was typed into it; this is the app's - this session's own
+    /// commands first, then the ones every session that came before left
+    /// behind, when the setting allows. What another tab has typed while this
+    /// one was open belongs to that tab and is not offered here.
     ///
     /// Done by rubbing the line out and typing the replacement, because IRIS
     /// owns the read buffer and the only way to change it is to send the keys
     /// that would have changed it.
-    fn recall(&mut self, index: usize, direction: input::Recall) {
-        let Some(tab) = self.tabs.get(index) else {
+    ///
+    /// The cursor need not be at the end of the line: rubout erases backwards,
+    /// so it is walked to the end first and the whole replacement goes out as
+    /// one write. Whether Up mid-line recalls at all is
+    /// `settings.recall_mid_line`, decided back in [`input::translate`].
+    fn recall(&mut self, at: At, direction: input::Recall) {
+        let Some(tab) = self.pane(at) else {
             return;
         };
-        // Only ever called at the end of a command line, but the state could
-        // have moved on between the key press and here.
-        let Some(line) = lineedit::current(&tab.grid).filter(|l| l.at_end()) else {
+        // The state could have moved off the command line between the key
+        // press and here.
+        let Some(line) = lineedit::current(&tab.grid) else {
             return;
         };
+        let app_cursor = tab.grid.app_cursor_keys;
+        let encoding = tab.profile.encoding;
+        let walked_to = tab.recall_step;
 
+        let list = self.history.recall_list(&tab.commands);
         let next = match direction {
-            input::Recall::Back => match self.history.back(tab.recall_index) {
-                Some(at) => Some(at),
-                // Already at the oldest command: leave the line alone rather
-                // than clearing it.
+            // Already at the oldest command, or nothing recalled to walk
+            // forward from: leave the line exactly as it is rather than
+            // clearing it.
+            input::Recall::Back => match history::step_back(walked_to, list.len()) {
+                Some(next) => next,
                 None => return,
             },
-            input::Recall::Forward => match self.history.forward(tab.recall_index) {
+            input::Recall::Forward => match history::step_forward(walked_to) {
                 Some(next) => next,
                 None => return,
             },
         };
 
+        // No step left is the line the user started on, which is an empty one.
         let text = next
-            .and_then(|at| self.history.get(at))
+            .and_then(|step| list.get(step))
+            .copied()
             .unwrap_or_default()
             .to_string();
 
-        let mut wire = vec![0x7f; line.len()];
-        wire.extend_from_slice(&self.tabs[index].profile.encoding.encode(&text));
+        let mut wire = cursor_bytes(line.end as i64 - line.cursor as i64, app_cursor);
+        wire.extend(std::iter::repeat_n(0x7f, line.len()));
+        wire.extend_from_slice(&encoding.encode(&text));
         let wire = self.plugins.on_input(&wire);
-        self.tabs[index].send(&wire);
-        self.tabs[index].recall_index = next;
-        self.tabs[index].view.scroll_to_bottom();
+        if let Some(tab) = self.pane_mut(at) {
+            tab.send(&wire);
+            tab.recall_step = next;
+            tab.view.scroll_to_bottom();
+        }
     }
 
     /// Selects the command being typed, so it can be copied or rubbed out in
     /// one gesture. Ctrl+A.
-    fn select_typed_line(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get_mut(index) else {
+    fn select_typed_line(&mut self, at: At) {
+        let Some(tab) = self.pane_mut(at) else {
             return;
         };
         let Some(line) = lineedit::current(&tab.grid).filter(|l| !l.is_empty()) else {
             return;
         };
-        let at = tab.grid.scrollback.len() + tab.grid.cursor.row;
-        tab.view.selection = Some(Selection::across(at, line.start, line.end));
+        let row = tab.grid.scrollback.len() + tab.grid.cursor.row;
+        tab.view.selection = Some(Selection::across(row, line.start, line.end));
     }
 
     /// Drags the loose end of the selection over the command line, the way
@@ -1622,14 +2018,14 @@ impl App {
     /// first time - and only the other end moves, so shift-left and then
     /// shift-right walks back over what was just selected. Nothing is sent:
     /// IRIS's cursor stays put and only the highlight moves.
-    fn extend_selection(&mut self, index: usize, motion: Motion) {
-        let Some(tab) = self.tabs.get_mut(index) else {
+    fn extend_selection(&mut self, at: At, motion: Motion) {
+        let Some(tab) = self.pane_mut(at) else {
             return;
         };
         let Some(line) = lineedit::current(&tab.grid) else {
             return;
         };
-        let at = tab.grid.scrollback.len() + tab.grid.cursor.row;
+        let row = tab.grid.scrollback.len() + tab.grid.cursor.row;
 
         // An existing selection on this line continues; anything else - none at
         // all, or one left over in the scrollback - starts again from the
@@ -1637,7 +2033,7 @@ impl App {
         let (anchor, focus) = tab
             .view
             .selection
-            .filter(|s| s.span_on(at).is_some())
+            .filter(|s| s.span_on(row).is_some())
             .map(|s| (s.start.1, s.end.1))
             .unwrap_or((line.cursor, line.cursor));
         let anchor = anchor.clamp(line.start, line.end);
@@ -1647,8 +2043,8 @@ impl App {
         // no selection at all rather than an empty one - an empty selection
         // would go on quietly claiming Ctrl+C.
         tab.view.selection = (focus != anchor).then_some(Selection {
-            start: (at, anchor),
-            end: (at, focus),
+            start: (row, anchor),
+            end: (row, focus),
         });
     }
 
@@ -1659,16 +2055,19 @@ impl App {
     /// see the line; IRIS is then told in the one language it acts on, which is
     /// arrow keys. The selection goes, exactly as it would in a text field when
     /// the cursor walks away from it.
-    fn move_by(&mut self, index: usize, motion: Motion) {
-        let Some(tab) = self.tabs.get(index) else {
+    fn move_by(&mut self, at: At, motion: Motion) {
+        let Some(tab) = self.pane(at) else {
             return;
         };
         let Some(line) = lineedit::current(&tab.grid) else {
             return;
         };
         let to = lineedit::target(&tab.grid, line, line.cursor, motion);
-        self.tabs[index].view.clear_selection();
-        self.move_cursor(index, to as i64 - line.cursor as i64);
+        let columns = to as i64 - line.cursor as i64;
+        if let Some(tab) = self.pane_mut(at) {
+            tab.view.clear_selection();
+        }
+        self.move_cursor(at, columns);
     }
 
     /// Rubs the selected part of the command line out of IRIS's read buffer.
@@ -1677,8 +2076,8 @@ impl App {
     /// to the end of the selection first and the whole thing goes out as one
     /// write - a half-applied erase would leave the line in a state neither
     /// side agrees on.
-    fn erase_selection(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get(index) else {
+    fn erase_selection(&mut self, at: At) {
+        let Some(tab) = self.pane(at) else {
             return;
         };
         let Some(line) = lineedit::current(&tab.grid) else {
@@ -1688,29 +2087,43 @@ impl App {
             return;
         };
 
-        let mut wire = cursor_bytes(to as i64 - line.cursor as i64);
+        let mut wire = cursor_bytes(to as i64 - line.cursor as i64, tab.grid.app_cursor_keys);
         wire.extend(std::iter::repeat_n(0x7f, to - from));
         let wire = self.plugins.on_input(&wire);
-        self.tabs[index].send(&wire);
-        self.tabs[index].view.clear_selection();
-        self.tabs[index].recall_index = None;
+        if let Some(tab) = self.pane_mut(at) {
+            tab.send(&wire);
+            tab.view.clear_selection();
+            tab.recall_step = None;
+        }
     }
 
     /// Walks IRIS's cursor `columns` to the right, or to the left when
     /// negative, with the arrow keys it does act on.
-    fn move_cursor(&mut self, index: usize, columns: i64) {
-        let wire = cursor_bytes(columns);
+    fn move_cursor(&mut self, at: At, columns: i64) {
+        let app_cursor = self.pane(at).is_some_and(|tab| tab.grid.app_cursor_keys);
+        let wire = cursor_bytes(columns, app_cursor);
         if wire.is_empty() {
             return;
         }
         let wire = self.plugins.on_input(&wire);
-        if let Some(tab) = self.tabs.get(index) {
+        if let Some(tab) = self.pane(at) {
             tab.send(&wire);
         }
     }
 
+    /// Puts one pane's selection on the clipboard, if it has one.
+    fn copy_selection(&self, ctx: &Context, at: At) {
+        let Some(tab) = self.pane(at) else {
+            return;
+        };
+        if let Some(text) = tab.view.selected_text(&tab.grid) {
+            ctx.copy_text(text);
+        }
+    }
+
     fn send_lines_to_active(&mut self, lines: &[String]) {
-        let Some(tab) = self.tabs.get(self.active) else {
+        let at = self.focused_at();
+        let Some(tab) = self.pane(at) else {
             self.set_status(tr("No active session."));
             return;
         };
@@ -1718,7 +2131,260 @@ impl App {
             self.set_status(tr("That session has ended."));
             return;
         }
-        tab.send_lines(lines);
+        // Whatever was half-typed goes first. A macro is a whole command, and
+        // appended to the tail of an unfinished one it is not the command
+        // either of them was: IRIS would read `write 1ZWRITE ^CSW1`.
+        self.clear_typed_line(at);
+        if let Some(tab) = self.pane(at) {
+            tab.send_lines(lines);
+        }
+    }
+
+    /// Rubs out whatever is sitting on a pane's prompt line, so something else
+    /// can be sent to it.
+    ///
+    /// The same mechanics as [`App::recall`]: the cursor is walked to the end
+    /// of the line first, because rubout erases backwards, and the whole thing
+    /// goes out as one write. Does nothing off a command line - a routine
+    /// reading a line of its own owns those keys.
+    fn clear_typed_line(&mut self, at: At) {
+        let Some(tab) = self.pane(at) else {
+            return;
+        };
+        let Some(line) = lineedit::current(&tab.grid).filter(|line| !line.is_empty()) else {
+            return;
+        };
+        let mut wire = cursor_bytes(
+            line.end as i64 - line.cursor as i64,
+            tab.grid.app_cursor_keys,
+        );
+        wire.extend(std::iter::repeat_n(0x7f, line.len()));
+        let wire = self.plugins.on_input(&wire);
+        if let Some(tab) = self.pane_mut(at) {
+            tab.send(&wire);
+            tab.recall_step = None;
+        }
+    }
+
+    /// Draws one pane - a tab's own notes and its terminal - and carries out
+    /// everything the mouse and the keyboard did in it.
+    ///
+    /// `focused` marks the pane the keyboard is in - the focused pane of the
+    /// active tab, and the only one drawn when a tab is not split. It is the
+    /// one that takes the keyboard back when no other widget wants it; the
+    /// other pane takes it when it is clicked into, which is also what moves
+    /// the tab's focus there.
+    fn terminal_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &Context,
+        theme: &Theme,
+        at: At,
+        focused: bool,
+    ) -> PaneMeasure {
+        let opts = self.render_opts();
+        let uid = match self.pane(at) {
+            Some(tab) => tab.uid,
+            // Nothing there to draw: a tab that went away between frames.
+            None => return PaneMeasure::default(),
+        };
+        // Only the focused pane follows the active session, and only it claims
+        // the keyboard when nothing else holds it. Two panes both claiming it
+        // would take it from each other every frame.
+        let take_focus = focused && self.focused_tab != Some(uid);
+        if focused {
+            self.focused_tab = Some(uid);
+        }
+
+        let (result, has_selection) = {
+            let Some(tab) = self.pane_mut(at) else {
+                return PaneMeasure::default();
+            };
+            let has_selection = tab.view.selection.map(|s| !s.is_empty()).unwrap_or(false);
+            let result = draw_pane(ui, tab, theme, &opts, take_focus, focused);
+            (result, has_selection)
+        };
+
+        // This pane's own session, sized to this pane: a pane is a window onto
+        // one session, and telling IRIS about the whole split area would
+        // truncate its output at a width nothing is drawn at.
+        if let Some(tab) = self.pane_mut(at) {
+            tab.resize(result.cols, result.rows);
+        }
+        let measure = PaneMeasure {
+            grid: (result.cols, result.rows),
+            view: (result.view_cols, result.view_rows),
+            cell: result.cell,
+            clicked: result.response.clicked(),
+        };
+
+        // Right-click menu actions reuse the same paths as the keyboard
+        // shortcuts and the Export dialog. Copy-on-select: a finished drag goes
+        // straight to the clipboard, without waiting for Ctrl+C.
+        if result.copy_selection {
+            self.copy_selection(ctx, at);
+        }
+        if let Some(columns) = result.cursor_move {
+            self.move_cursor(at, columns);
+        }
+
+        if let Some(action) = result.context_action {
+            use terminal_view::ContextAction;
+            match action {
+                ContextAction::CopySelection => self.copy_selection(ctx, at),
+                ContextAction::Paste => {
+                    // The clipboard is only readable through egui's paste
+                    // event, so ask for one rather than reaching for the OS
+                    // clipboard behind egui's back.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                }
+                ContextAction::SelectAll => {
+                    if let Some(tab) = self.pane_mut(at) {
+                        let grid = &tab.grid;
+                        tab.view.select_all(grid);
+                    }
+                }
+                ContextAction::ClearSelection => {
+                    if let Some(tab) = self.pane_mut(at) {
+                        tab.view.clear_selection();
+                    }
+                }
+                ContextAction::ExportScreen => self.panels.show_export = true,
+                ContextAction::Analyze(scope) => self.analyze_with_claude(at, scope),
+                ContextAction::ClearTerminal => self.clear_terminal(at),
+            }
+        }
+
+        // Only the focused terminal consumes keystrokes.
+        if result.response.clicked() {
+            result.response.request_focus();
+        }
+        // While the macro editor is listening for a chord, the keys belong to
+        // the shortcut being recorded. The editor is drawn after this and takes
+        // them out of the frame's events itself, but that is too late to stop
+        // them reaching IRIS from here - and a recorded Ctrl+D would otherwise
+        // have ended the session it was recorded in.
+        if !result.response.has_focus() || self.panels.capture_shortcut {
+            return measure;
+        }
+
+        let events = ui.input(|i| i.events.clone());
+        let (insert_down, delete_down) = input::chord_keys_down();
+        let (input_ctx, encoding) = {
+            let Some(tab) = self.pane(at) else {
+                return measure;
+            };
+            let line = lineedit::current(&tab.grid);
+            let input_ctx = input::InputContext {
+                has_selection,
+                line,
+                app_cursor_keys: tab.grid.app_cursor_keys,
+                recall_mid_line: self.settings.recall_mid_line,
+                // This session's own commands, or anything an earlier run
+                // left behind. Not what another tab has typed since.
+                can_recall: !tab.commands.is_empty() || !self.history.earlier().is_empty(),
+                selected_span: line.and_then(|line| selection_in_line(tab, line)),
+                insert_down,
+                delete_down,
+            };
+            (input_ctx, tab.profile.encoding)
+        };
+        let mut action = input::translate(&events, &input_ctx);
+
+        if action.select_line {
+            self.select_typed_line(at);
+        }
+        if let Some(motion) = action.extend_selection {
+            self.extend_selection(at, motion);
+        }
+        if let Some(motion) = action.move_cursor {
+            self.move_by(at, motion);
+        }
+        if action.collapse_selection {
+            if let Some(tab) = self.pane_mut(at) {
+                tab.view.clear_selection();
+            }
+        }
+        // A selection inside the command line behaves the way one in a text
+        // field does: an erase key takes it out, and so does typing or pasting
+        // over it, before the new text goes in behind it.
+        let replaced = input_ctx.selected_span.is_some() && !action.select_line && {
+            !action.text.is_empty() || action.paste.is_some()
+        };
+        if action.erase_selection || replaced {
+            self.erase_selection(at);
+        }
+
+        // Recorded before the Enter reaches IRIS, while the line is still on
+        // screen to be read.
+        if let Some(unechoed) = action.submitted.as_deref() {
+            // Submitting ends the selection with the line it was on, rather
+            // than leaving it highlighted in the scrollback.
+            if let Some(tab) = self.pane_mut(at) {
+                tab.view.clear_selection();
+            }
+            self.record_command(at, unechoed);
+        }
+        if let Some(direction) = action.recall {
+            self.recall(at, direction);
+        }
+        // Typing abandons wherever the recall had walked to.
+        if !action.text.is_empty() {
+            if let Some(tab) = self.pane_mut(at) {
+                tab.recall_step = None;
+            }
+        }
+
+        if action.copy {
+            self.copy_selection(ctx, at);
+        }
+        if let Some(text) = action.paste.take() {
+            let text = input::sanitize_paste(&text);
+            let encoded = self.plugins.on_input(&encoding.encode(&text));
+            if let Some(tab) = self.pane_mut(at) {
+                // A paste rewrites the line, so wherever the recall had walked
+                // to is no longer where the line came from.
+                tab.recall_step = None;
+                tab.send(&encoded);
+            }
+        }
+        // IRIS never reports its insert/replace state, so the keystroke is the
+        // only signal there is. Display only - see `Grid::insert_mode`.
+        if action.toggle_insert {
+            if let Some(tab) = self.pane_mut(at) {
+                tab.grid.insert_mode = !tab.grid.insert_mode;
+            }
+        }
+        if !action.is_empty() {
+            let mut wire = encoding.encode(&action.text);
+            wire.extend_from_slice(&action.bytes);
+            let wire = self.plugins.on_input(&wire);
+            if let Some(tab) = self.pane_mut(at) {
+                // Typing always returns the view to the live output.
+                tab.view.scroll_to_bottom();
+                tab.send(&wire);
+            }
+        }
+
+        measure
+    }
+
+    /// [`App::terminal_pane`] in a box of a given size, for one half of a
+    /// split.
+    fn sized_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &Context,
+        theme: &Theme,
+        at: At,
+        focused: bool,
+        size: egui::Vec2,
+    ) -> PaneMeasure {
+        ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_size(size);
+            self.terminal_pane(ui, ctx, theme, at, focused)
+        })
+        .inner
     }
 
     fn export(&mut self, range: Range, format: export::Format) {
@@ -1739,6 +2405,52 @@ impl App {
             Err(e) => self.set_status(tr1("Export failed: {}", &format!("{e:#}"))),
         }
     }
+}
+
+/// Draws one session: the notes above its terminal, and the terminal.
+///
+/// A free function rather than a method because it needs the session and
+/// nothing else of the app, which is what keeps the pane's own drawing out of
+/// the way of everything [`App::terminal_pane`] then does with the result.
+fn draw_pane(
+    ui: &mut egui::Ui,
+    tab: &mut Tab,
+    theme: &Theme,
+    opts: &RenderOpts,
+    take_focus: bool,
+    claim_idle: bool,
+) -> terminal_view::RenderResult {
+    // Autologon status belongs next to the terminal it applies to.
+    if let Some(note) = tab.autologon.status_note() {
+        ui.label(note);
+    }
+    if let Some(error) = tab.error.clone() {
+        ui.colored_label(theme.ansi[9], error);
+    }
+    if tab.ended && tab.error.is_none() {
+        let mut reconnect = false;
+        ui.horizontal(|ui| {
+            ui.label(tr("Session ended."));
+            if ui.button(tr("Reconnect")).clicked() {
+                reconnect = true;
+            }
+        });
+        if reconnect {
+            tab.start();
+        }
+    }
+
+    let uid = tab.uid;
+    terminal_view::show(
+        ui,
+        &tab.grid,
+        &mut tab.view,
+        theme,
+        opts,
+        uid,
+        take_focus,
+        claim_idle,
+    )
 }
 
 /// Loads the organisation file (if configured) and the personal one, and
@@ -1784,6 +2496,11 @@ impl eframe::App for App {
 
         for tab in &mut self.tabs {
             tab.pump(&mut self.plugins);
+            // A split tab holds a second session, and one that is not drained
+            // would stop reading its PTY and eventually block IRIS.
+            if let Some(split) = tab.split.as_mut() {
+                split.tab.pump(&mut self.plugins);
+            }
         }
 
         // Plugins may have asked for things while transforming output.
@@ -1878,190 +2595,115 @@ impl eframe::App for App {
                     return;
                 }
 
-                let active = self.active.min(self.tabs.len() - 1);
-                let opts = self.render_opts();
-
-                // Autologon status belongs next to the terminal it applies to.
-                if let Some(note) = self.tabs[active].autologon.status_note() {
-                    ui.label(note);
-                }
-                if let Some(error) = self.tabs[active].error.clone() {
-                    ui.colored_label(theme.ansi[9], error);
-                }
-                if self.tabs[active].ended && self.tabs[active].error.is_none() {
-                    ui.horizontal(|ui| {
-                        ui.label(tr("Session ended."));
-                        if ui.button(tr("Reconnect")).clicked() {
-                            self.tabs[active].start();
-                        }
-                    });
-                }
-
-                let has_selection = self.tabs[active]
-                    .view
-                    .selection
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
-
-                let uid = self.tabs[active].uid;
-                let take_focus = self.focused_tab != Some(uid);
-                self.focused_tab = Some(uid);
-
-                let result = {
-                    let tab = &mut self.tabs[active];
-                    terminal_view::show(
-                        ui,
-                        &tab.grid,
-                        &mut tab.view,
-                        &theme,
-                        &opts,
-                        uid,
-                        take_focus,
-                    )
+                self.active = self.active.min(self.tabs.len() - 1);
+                let active = self.active;
+                let focus = self.tabs[active].focus;
+                let first = At {
+                    tab: active,
+                    pane: Pane::First,
+                };
+                let second = At {
+                    tab: active,
+                    pane: Pane::Second,
                 };
 
-                // Every tab, not just the visible one: a background session
-                // left at the old width would keep truncating its output at
-                // that width until it was next looked at.
-                self.terminal_size = (result.cols as u16, result.rows as u16);
-                self.view_size = (result.view_cols, result.view_rows);
-                fit = Some((result.view_cols, result.view_rows, result.cell));
-                for tab in &mut self.tabs {
-                    tab.resize(result.cols, result.rows);
-                }
-
-                // Right-click menu actions reuse the same paths as the
-                // keyboard shortcuts and the Export dialog.
-                // Copy-on-select: a finished drag goes straight to the
-                // clipboard, without waiting for Ctrl+C.
-                if result.copy_selection {
-                    let tab = &self.tabs[active];
-                    if let Some(text) = tab.view.selected_text(&tab.grid) {
-                        ctx.copy_text(text);
+                // `geometry` is the first pane's, which is what the window is
+                // fitted from and what a new session opens at; `shown` is the
+                // focused pane's, which is the size worth reporting because it
+                // is the one being typed in.
+                let (geometry, shown) = match self.tabs[active].split.as_ref().map(|s| s.dir) {
+                    None => {
+                        let measure = self.terminal_pane(ui, ctx, &theme, first, true);
+                        let view = measure.view;
+                        (measure, view)
                     }
-                }
-                if let Some(columns) = result.cursor_move {
-                    self.move_cursor(active, columns);
-                }
-
-                if let Some(action) = result.context_action {
-                    use terminal_view::ContextAction;
-                    match action {
-                        ContextAction::CopySelection => {
-                            let tab = &self.tabs[active];
-                            if let Some(text) = tab.view.selected_text(&tab.grid) {
-                                ctx.copy_text(text);
+                    Some(dir) => {
+                        let room = ui.available_size();
+                        let mut top = PaneMeasure::default();
+                        let mut bottom = PaneMeasure::default();
+                        match dir {
+                            SplitDir::Right => {
+                                // Half each, less what the divider and the
+                                // spacing around it take: the panes are given
+                                // exact sizes, and a share that did not fit
+                                // would be clipped at the window edge.
+                                let gap = ui.spacing().item_spacing.x * 2.0 + SPLIT_DIVIDER;
+                                let half = egui::Vec2::new((room.x - gap) / 2.0, room.y);
+                                ui.horizontal(|ui| {
+                                    top = self.sized_pane(
+                                        ui,
+                                        ctx,
+                                        &theme,
+                                        first,
+                                        focus == Pane::First,
+                                        half,
+                                    );
+                                    ui.separator();
+                                    bottom = self.sized_pane(
+                                        ui,
+                                        ctx,
+                                        &theme,
+                                        second,
+                                        focus == Pane::Second,
+                                        half,
+                                    );
+                                });
+                            }
+                            SplitDir::Bottom => {
+                                let gap = ui.spacing().item_spacing.y * 2.0 + SPLIT_DIVIDER;
+                                let half = egui::Vec2::new(room.x, (room.y - gap) / 2.0);
+                                top = self.sized_pane(
+                                    ui,
+                                    ctx,
+                                    &theme,
+                                    first,
+                                    focus == Pane::First,
+                                    half,
+                                );
+                                ui.separator();
+                                bottom = self.sized_pane(
+                                    ui,
+                                    ctx,
+                                    &theme,
+                                    second,
+                                    focus == Pane::Second,
+                                    half,
+                                );
                             }
                         }
-                        ContextAction::Paste => {
-                            // The clipboard is only readable through egui's
-                            // paste event, so ask for one rather than reaching
-                            // for the OS clipboard behind egui's back.
-                            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                        // Clicking a pane is how the keyboard is moved into it,
+                        // and the strip entry says which one has it - `1:` or
+                        // `2:` in front of that session's name.
+                        if top.clicked {
+                            self.tabs[active].focus = Pane::First;
                         }
-                        ContextAction::SelectAll => {
-                            let tab = &mut self.tabs[active];
-                            let grid = &tab.grid;
-                            tab.view.select_all(grid);
+                        if bottom.clicked {
+                            self.tabs[active].focus = Pane::Second;
                         }
-                        ContextAction::ClearSelection => {
-                            self.tabs[active].view.clear_selection();
-                        }
-                        ContextAction::ExportScreen => self.panels.show_export = true,
-                        ContextAction::Analyze(scope) => self.analyze_with_claude(scope),
-                        ContextAction::ClearTerminal => self.clear_active_terminal(),
+                        let shown = if focus == Pane::Second {
+                            bottom.view
+                        } else {
+                            top.view
+                        };
+                        (top, shown)
                     }
-                }
+                };
 
-                // Only the focused terminal consumes keystrokes.
-                if result.response.clicked() {
-                    result.response.request_focus();
-                }
-                if result.response.has_focus() {
-                    let events = ui.input(|i| i.events.clone());
-                    let (insert_down, delete_down) = input::chord_keys_down();
-                    let line = lineedit::current(&self.tabs[active].grid);
-                    let input_ctx = input::InputContext {
-                        has_selection,
-                        line,
-                        can_recall: !self.history.is_empty(),
-                        selected_span: line
-                            .and_then(|line| selection_in_line(&self.tabs[active], line)),
-                        insert_down,
-                        delete_down,
-                    };
-                    let mut action = input::translate(&events, &input_ctx);
-
-                    if action.select_line {
-                        self.select_typed_line(active);
+                // A pane sizes its own session; every session that is not on
+                // screen follows the first pane, because one left at an old
+                // width would keep truncating its output at that width until it
+                // was next looked at.
+                self.terminal_size = (geometry.grid.0 as u16, geometry.grid.1 as u16);
+                self.view_size = shown;
+                fit = Some((geometry.view.0, geometry.view.1, geometry.cell));
+                let (cols, rows) = geometry.grid;
+                for (index, tab) in self.tabs.iter_mut().enumerate() {
+                    if index == active {
+                        continue;
                     }
-                    if let Some(motion) = action.extend_selection {
-                        self.extend_selection(active, motion);
-                    }
-                    if let Some(motion) = action.move_cursor {
-                        self.move_by(active, motion);
-                    }
-                    if action.collapse_selection {
-                        self.tabs[active].view.clear_selection();
-                    }
-                    // A selection inside the command line behaves the way one
-                    // in a text field does: an erase key takes it out, and so
-                    // does typing or pasting over it, before the new text goes
-                    // in behind it.
-                    let replaced = input_ctx.selected_span.is_some() && !action.select_line && {
-                        !action.text.is_empty() || action.paste.is_some()
-                    };
-                    if action.erase_selection || replaced {
-                        self.erase_selection(active);
-                    }
-
-                    // Recorded before the Enter reaches IRIS, while the line is
-                    // still on screen to be read.
-                    if let Some(unechoed) = action.submitted.as_deref() {
-                        // Submitting ends the selection with the line it was
-                        // on, rather than leaving it highlighted in the
-                        // scrollback.
-                        self.tabs[active].view.clear_selection();
-                        self.record_command(active, unechoed);
-                    }
-                    if let Some(direction) = action.recall {
-                        self.recall(active, direction);
-                    }
-                    // Typing abandons wherever the recall had walked to.
-                    if !action.text.is_empty() {
-                        self.tabs[active].recall_index = None;
-                    }
-
-                    if action.copy {
-                        let tab = &self.tabs[active];
-                        if let Some(text) = tab.view.selected_text(&tab.grid) {
-                            ctx.copy_text(text);
-                        }
-                    }
-                    if let Some(text) = action.paste.take() {
-                        // A paste rewrites the line, so wherever the recall had
-                        // walked to is no longer where the line came from.
-                        self.tabs[active].recall_index = None;
-                        let text = input::sanitize_paste(&text);
-                        let encoded = self.tabs[active].profile.encoding.encode(&text);
-                        let encoded = self.plugins.on_input(&encoded);
-                        self.tabs[active].send(&encoded);
-                    }
-                    // IRIS never reports its insert/replace state, so the
-                    // keystroke is the only signal there is. Display only - see
-                    // `Grid::insert_mode`.
-                    if action.toggle_insert {
-                        let grid = &mut self.tabs[active].grid;
-                        grid.insert_mode = !grid.insert_mode;
-                    }
-                    if !action.is_empty() {
-                        // Typing always returns the view to the live output.
-                        self.tabs[active].view.scroll_to_bottom();
-
-                        let mut wire = self.tabs[active].profile.encoding.encode(&action.text);
-                        wire.extend_from_slice(&action.bytes);
-                        let wire = self.plugins.on_input(&wire);
-                        self.tabs[active].send(&wire);
+                    tab.resize(cols, rows);
+                    if let Some(split) = tab.split.as_mut() {
+                        split.tab.resize(cols, rows);
                     }
                 }
             });
@@ -2095,6 +2737,8 @@ impl eframe::App for App {
             &self.themes,
             &mut self.panels,
             &self.instances,
+            &self.servers,
+            &mut self.settings_placement,
             &theme.window_buttons,
         ) {
             requests.push(request);
@@ -2139,15 +2783,24 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for tab in &mut self.tabs {
-            if let Some(session) = tab.session.as_ref() {
-                session.request_halt();
-            }
-            if let Some(log) = tab.log.as_mut() {
-                let _ = log.write_note("application closed");
-                let _ = log.flush();
+            close_down(tab);
+            if let Some(split) = tab.split.as_mut() {
+                close_down(&mut split.tab);
             }
         }
         self.persist_window_geometry();
+    }
+}
+
+/// Asks one session to halt and closes its transcript. Called for every
+/// session there is as the app exits, panes included.
+fn close_down(tab: &mut Tab) {
+    if let Some(session) = tab.session.as_ref() {
+        session.request_halt();
+    }
+    if let Some(log) = tab.log.as_mut() {
+        let _ = log.write_note("application closed");
+        let _ = log.flush();
     }
 }
 

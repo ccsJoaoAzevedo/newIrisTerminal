@@ -19,6 +19,30 @@ use egui::{Context, Pos2, Ui, Vec2, ViewportClass};
 use crate::config::theme::WindowButtons;
 use crate::ui::chrome::{self, WindowAction};
 
+/// Size and position of a detached window, as saved and as observed.
+///
+/// `None` in either field means "nothing saved": the window opens at the size
+/// the caller asked for, and in the middle of the main window.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Geometry {
+    pub size: Option<[f32; 2]>,
+    pub position: Option<[f32; 2]>,
+}
+
+/// A detached window's geometry across runs: what to reopen at, and what it is
+/// at now.
+///
+/// The caller owns this - it is the one that knows whether the user asked for
+/// either to be remembered, and it is the one that writes settings.toml - so
+/// `shell` only reads `restore` and fills in `seen`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Placement {
+    /// Geometry the window should open at, from the settings file.
+    pub restore: Geometry,
+    /// Geometry the window is at now, refreshed on every frame it is drawn.
+    pub seen: Geometry,
+}
+
 /// Draws `contents` in a window of its own.
 ///
 /// `open` is cleared when the window is closed, whichever way it was closed, so
@@ -28,8 +52,11 @@ use crate::ui::chrome::{self, WindowAction};
 /// is framed like the main one; `native_decorations` is the same setting the
 /// main window follows, and hands the frame back to the system when it is on.
 ///
-/// The window opens in the middle of the main one, and after that wherever it
-/// was last dragged to - see [`opening_position`].
+/// The window opens at whatever `placement` restores, then in the middle of the
+/// main one, and after that wherever it was last dragged to - see
+/// [`opening_position`]. A caller with nothing to remember passes `None` and
+/// gets the last two.
+#[allow(clippy::too_many_arguments)]
 pub fn shell(
     ctx: &Context,
     id: &'static str,
@@ -38,13 +65,18 @@ pub fn shell(
     size: [f32; 2],
     buttons: &WindowButtons,
     native_decorations: bool,
+    mut placement: Option<&mut Placement>,
     contents: impl FnOnce(&mut Ui),
 ) {
     if !*open {
         return;
     }
     let mut closed = false;
-    let position = opening_position(ctx, id, size);
+    let restore = placement.as_ref().map(|p| p.restore).unwrap_or_default();
+    let position = opening_position(ctx, id, size, restore.position);
+    // A saved size is exact, so it is used as it stands; the caller's `size` is
+    // the default for a window that has never been closed anywhere.
+    let size = restore.size.unwrap_or(size);
 
     let mut builder = egui::ViewportBuilder::default()
         .with_title(title)
@@ -99,6 +131,15 @@ pub fn shell(
             chrome::resize_grips(ctx, id);
         }
         remember_position(ctx, id);
+        if let Some(placement) = placement.as_mut() {
+            // Field by field: a frame that could report only one of the two -
+            // a window on its way to being minimized - must not blank the
+            // other one out from under the caller.
+            if let Some(seen) = observed_geometry(ctx) {
+                placement.seen.size = seen.size.or(placement.seen.size);
+                placement.seen.position = seen.position.or(placement.seen.position);
+            }
+        }
         // The taskbar, Alt+F4, or the system menu.
         if ctx.input(|i| i.viewport().close_requested()) {
             closed = true;
@@ -122,7 +163,12 @@ pub fn shell(
 /// into the viewport builder, and egui turns any change there into a command to
 /// move the window - which, sent every frame, would drag the window back out of
 /// the hand moving it.
-fn opening_position(ctx: &Context, id: &'static str, size: [f32; 2]) -> Option<Pos2> {
+fn opening_position(
+    ctx: &Context,
+    id: &'static str,
+    size: [f32; 2],
+    restore: Option<[f32; 2]>,
+) -> Option<Pos2> {
     // Whether this is the frame it opened on, taken from the gap in the frames
     // it was drawn on. A flag set when it closes would not do: the callers
     // return before reaching here once their dialog is put away.
@@ -138,6 +184,11 @@ fn opening_position(ctx: &Context, id: &'static str, size: [f32; 2]) -> Option<P
 
     if let Some(left_at) = ctx.data_mut(|d| d.get_temp::<Pos2>(position_id(id))) {
         return Some(left_at);
+    }
+
+    // Where it was when the app was last closed, for a caller that saves it.
+    if let Some([x, y]) = restore {
+        return Some(Pos2::new(x, y));
     }
 
     // The centre of the main window, less half of what this window will
@@ -170,6 +221,28 @@ fn remember_position(ctx: &Context, id: &'static str) {
         return;
     };
     ctx.data_mut(|d| d.insert_temp(position_id(id), rect.min));
+}
+
+/// The window's own size and position, read from inside its viewport.
+///
+/// `None` while the window is minimized or parked off-screen on its way
+/// somewhere, which is not a geometry anybody chose to reopen at.
+fn observed_geometry(ctx: &Context) -> Option<Geometry> {
+    ctx.input(|i| {
+        let viewport = i.viewport();
+        if viewport.minimized.unwrap_or(false) {
+            return None;
+        }
+        let size = viewport
+            .inner_rect
+            .filter(|rect| rect.is_finite() && rect.width() >= 1.0 && rect.height() >= 1.0)
+            .map(|rect| [rect.width(), rect.height()]);
+        let position = viewport
+            .outer_rect
+            .filter(|rect| rect.is_finite() && rect.min.x > -30_000.0)
+            .map(|rect| [rect.min.x, rect.min.y]);
+        (size.is_some() || position.is_some()).then_some(Geometry { size, position })
+    })
 }
 
 fn position_id(id: &'static str) -> egui::Id {

@@ -169,12 +169,32 @@ pub struct Settings {
     /// without waiting for Ctrl+C — the way the native IrisTerm and PuTTY
     /// behave.
     pub copy_on_select: bool,
+    /// Let Up and Down replace the line with a command from the history even
+    /// when the cursor is not at the end of it, the way the native IRIS
+    /// terminal does.
+    ///
+    /// Off, the arrows only recall from the end of the line and do nothing
+    /// mid-line - which is what to turn off if the cursor being back in the
+    /// middle of a line means you were editing it rather than done with it.
+    pub recall_mid_line: bool,
     /// Keep the commands typed at an IRIS prompt in a file, so Up recalls what
     /// was typed in earlier sessions and not only in this one.
     ///
     /// Recall itself is not optional; this decides only whether it outlives the
-    /// session. Off also means nothing is written to disk.
+    /// session. Off also means nothing is written to disk, and each session
+    /// then recalls only its own commands. Which order the two lists come in is
+    /// not a setting - see
+    /// [`crate::features::history::History::recall_list`].
     pub save_command_history: bool,
+    /// Show the session's process id beside the instance name and the window
+    /// size in the menu bar. A local session only: a remote one runs its IRIS
+    /// process on the far side, where this machine has no id for it.
+    pub show_pid: bool,
+    /// Add the namespace the session is currently in to the tab's own name -
+    /// `CONSISTEM | RDB76-TR`. Read off the prompt, so it follows a `ZN` as it
+    /// happens; a tab that has been renamed by hand keeps the name it was
+    /// given.
+    pub show_namespace_in_tab: bool,
     pub log_dir: PathBuf,
     /// Applied to any profile whose own mode is `Off`.
     pub default_log_mode: LogMode,
@@ -227,6 +247,13 @@ pub struct Settings {
     /// the size, because the alternative is a window the size of the screen
     /// that the restore button cannot shrink.
     pub window_maximized: bool,
+    /// Size and position of the Settings window, as last closed. It is a real
+    /// operating-system window, so it follows the same two switches the main
+    /// one does rather than having a pair of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_window_size: Option<[f32; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_window_position: Option<[f32; 2]>,
     pub enable_plugins: bool,
     /// Ask GitHub at startup whether a newer build has been released.
     ///
@@ -250,7 +277,10 @@ impl Default for Settings {
             scrollback_limit: 10_000,
             status_timeout_secs: 8,
             copy_on_select: true,
+            recall_mid_line: true,
             save_command_history: true,
+            show_pid: true,
+            show_namespace_in_tab: true,
             log_dir: default_log_dir(),
             default_log_mode: LogMode::Off,
             log_retention_days: 30,
@@ -268,6 +298,8 @@ impl Default for Settings {
             window_size: None,
             window_position: None,
             window_maximized: false,
+            settings_window_size: None,
+            settings_window_position: None,
             enable_plugins: false,
             check_for_updates: true,
         }
@@ -351,6 +383,23 @@ impl Settings {
     /// can ask for.
     pub fn restored_maximized(&self) -> bool {
         self.save_terminal_size && self.window_maximized
+    }
+
+    /// Where the Settings window should reopen, for whichever of the two
+    /// switches is on. The same rule as the main window: its size follows
+    /// `save_terminal_size` and its position `save_window_position`.
+    pub fn restored_settings_placement(&self) -> crate::ui::detach::Geometry {
+        crate::ui::detach::Geometry {
+            size: self
+                .save_terminal_size
+                .then_some(self.settings_window_size)
+                .flatten(),
+            position: self
+                .save_window_position
+                .then_some(self.settings_window_position)
+                .flatten()
+                .filter(|[x, y]| x.is_finite() && y.is_finite()),
+        }
     }
 
     /// Effective log mode for a profile, applying the global default.

@@ -184,6 +184,27 @@ pub fn current(grid: &Grid) -> Option<LineEdit> {
     Some(LineEdit { start, cursor, end })
 }
 
+/// Namespace named by the prompt the cursor is on, if there is one.
+///
+/// `USER>` is the namespace on its own, and a transaction or an instance
+/// prefixes it - `TL1:USER>`, `IRIS:USER>` - so the last colon-separated piece
+/// is the namespace in every spelling of the prompt IRIS uses. `None` off a
+/// prompt row, which is what keeps a full-screen routine from being read as
+/// one.
+pub fn namespace(grid: &Grid) -> Option<String> {
+    let row = grid.screen.get(grid.cursor.row)?;
+    let end = syntax::prompt_end_of(&row.cells)?;
+    // `end` is just past the `>`, which is not part of the name.
+    let text: String = row
+        .cells
+        .get(..end.saturating_sub(1))?
+        .iter()
+        .map(|c| c.ch)
+        .collect();
+    let name = text.rsplit(':').next().unwrap_or_default().trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Text typed at the prompt the cursor is on, trailing blanks trimmed.
 ///
 /// This is what a command is recorded from. Reading it back off the screen
@@ -349,6 +370,23 @@ mod tests {
         let line = current(&grid_with("USER>write 1 ", 13)).expect("a command line");
         assert_eq!(line.end, 13);
         assert!(line.at_end());
+    }
+
+    /// The tab name can carry the namespace, which is read off the prompt: the
+    /// only place the session says which one it is in.
+    #[test]
+    fn the_namespace_is_read_off_the_prompt() {
+        assert_eq!(
+            namespace(&grid_with("RDB76-TR>write 1", 16)).as_deref(),
+            Some("RDB76-TR")
+        );
+        assert_eq!(
+            namespace(&grid_with("TL1:USER>", 9)).as_deref(),
+            Some("USER"),
+            "a transaction prefix is not part of the namespace"
+        );
+        // Not a prompt row, so nothing to read.
+        assert_eq!(namespace(&grid_with("Global ^CSW1 selected", 8)), None);
     }
 
     #[test]

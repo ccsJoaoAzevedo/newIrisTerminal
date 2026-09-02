@@ -144,6 +144,11 @@ impl PtySession {
         (self.cols, self.rows)
     }
 
+    /// Operating-system process id of the session, while it is running.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     pub fn is_alive(&mut self) -> bool {
         if self.closed.load(Ordering::Relaxed) {
             return false;
@@ -260,6 +265,16 @@ impl Session {
         match self {
             Session::Pty(s) => s.size(),
             Session::Telnet(s) => s.size(),
+        }
+    }
+
+    /// Process id of the session on this machine, when there is a process here
+    /// to have one. A remote server is reached over Telnet, so its IRIS process
+    /// runs on the far side and nothing local stands for it.
+    pub fn process_id(&self) -> Option<u32> {
+        match self {
+            Session::Pty(s) => s.process_id(),
+            Session::Telnet(_) => None,
         }
     }
 

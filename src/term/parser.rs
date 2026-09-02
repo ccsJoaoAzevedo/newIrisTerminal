@@ -150,6 +150,11 @@ impl Perform for Performer<'_> {
             b'7' => self.grid.save_cursor(),
             b'8' => self.grid.restore_cursor(),
             b'D' => self.grid.line_feed(),
+            // DECKPAM / DECKPNM. terminfo's `smkx` sends this together with
+            // DECCKM (`ESC [ ? 1 h ESC =`), and either half on its own is the
+            // far side asking for the application spelling of the arrow keys.
+            b'=' => self.grid.app_cursor_keys = true,
+            b'>' => self.grid.app_cursor_keys = false,
             b'E' => {
                 self.grid.line_feed();
                 self.grid.carriage_return();
@@ -196,12 +201,17 @@ impl Performer<'_> {
 
     fn set_dec_mode(&mut self, params: &Params, enable: bool) {
         for p in params.iter() {
-            // DECTCEM (25) is the only private mode that changes what we draw.
-            // The rest — bracketed paste, mouse reporting, alt-screen — are
-            // accepted silently so the remote side does not keep retrying.
-            if p.first().copied() == Some(25) {
-                self.grid.cursor.visible = enable;
-                self.grid.touch();
+            // DECTCEM (25) is the only private mode that changes what we draw;
+            // DECCKM (1) changes what we *send*. The rest — bracketed paste,
+            // mouse reporting, alt-screen — are accepted silently so the
+            // remote side does not keep retrying.
+            match p.first().copied() {
+                Some(25) => {
+                    self.grid.cursor.visible = enable;
+                    self.grid.touch();
+                }
+                Some(1) => self.grid.app_cursor_keys = enable,
+                _ => {}
             }
         }
     }
@@ -303,6 +313,22 @@ mod tests {
         let mut parser = vte::Parser::new();
         advance(&mut parser, &mut grid, input);
         grid
+    }
+
+    /// terminfo's `smkx` is `ESC [ ? 1 h ESC =`, and it is the far side saying
+    /// it wants `ESC O A` back rather than `ESC [ A`. IRIS 2023 sends it, which
+    /// is why the arrow keys stopped moving its cursor.
+    #[test]
+    fn application_cursor_keys_are_tracked() {
+        assert!(run(20, 5, b"\x1b[?1h").app_cursor_keys);
+        assert!(!run(20, 5, b"\x1b[?1h\x1b[?1l").app_cursor_keys);
+        // Either half of the pair on its own means the same thing.
+        assert!(run(20, 5, b"\x1b=").app_cursor_keys);
+        assert!(!run(20, 5, b"\x1b=\x1b>").app_cursor_keys);
+        // A reset is the far side forgetting its own modes.
+        assert!(!run(20, 5, b"\x1b[?1h\x1bc").app_cursor_keys);
+        // And the mode nothing here reads is still accepted quietly.
+        assert!(!run(20, 5, b"\x1b[?2004h").app_cursor_keys);
     }
 
     #[test]

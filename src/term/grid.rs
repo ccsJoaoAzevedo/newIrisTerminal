@@ -125,6 +125,15 @@ pub struct Grid {
     /// nothing else, so a flag that has drifted out of step with IRIS cannot
     /// corrupt what is on screen.
     pub insert_mode: bool,
+    /// The far side has asked for application cursor keys: DECCKM (`ESC [ ?
+    /// 1 h`) or the keypad application mode (`ESC =`) that terminfo's `smkx`
+    /// sends alongside it.
+    ///
+    /// It decides which of the two spellings of an arrow key IRIS is expecting
+    /// back - `ESC O A` rather than `ESC [ A` - and IRIS 2023 is the first
+    /// version to ask, which is why the arrow keys and click-to-position had
+    /// stopped moving its cursor there. See [`crate::ui::input::key_bytes`].
+    pub app_cursor_keys: bool,
     /// Widest line ever printed, in columns. Drives how far the view may be
     /// scrolled sideways when lines are clipped rather than wrapped.
     ///
@@ -169,6 +178,7 @@ impl Grid {
             title: None,
             saved_cursor: None,
             insert_mode: false,
+            app_cursor_keys: false,
             widest: 0,
             pending_wrap: false,
             clear: None,
@@ -682,6 +692,11 @@ impl Grid {
         self.cancel_clear();
         self.archive_screen();
         self.blank_everything();
+        // RIS is the far side saying it has forgotten its own modes, so the
+        // keys it expects go back to the ANSI spelling. Not done by
+        // `blank_everything`: `hard_reset` is the *user* clearing the screen,
+        // and IRIS's idea of the mode is untouched by that.
+        self.app_cursor_keys = false;
     }
 
     /// Reset *and* forget the history: the deliberate "give me a clean

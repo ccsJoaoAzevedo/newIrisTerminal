@@ -28,6 +28,10 @@ pub struct InputContext {
     /// There is a command to recall, so Up and Down at the prompt belong to the
     /// app's history rather than to IRIS's.
     pub can_recall: bool,
+    /// Recall from anywhere on the line, not only from the end of it -
+    /// `settings.recall_mid_line`. Off, a cursor left in the middle of a line
+    /// means the line is being edited, and the arrows leave it alone.
+    pub recall_mid_line: bool,
     /// Columns of the command line that are selected, when the whole selection
     /// sits inside it. That is the only selection Backspace and Delete can rub
     /// out of IRIS's read buffer; one in the scrollback is just highlighted
@@ -38,6 +42,9 @@ pub struct InputContext {
     pub insert_down: bool,
     /// Delete is physically down, so a cut event is Shift+Delete.
     pub delete_down: bool,
+    /// The session has asked for application cursor keys, so an arrow goes out
+    /// as `ESC O A` rather than `ESC [ A`. See [`cursor_key`].
+    pub app_cursor_keys: bool,
 }
 
 /// Which way through the command history a key press asked to go.
@@ -93,7 +100,16 @@ fn motion_for(key: &Key, modifiers: &Modifiers) -> Option<(Motion, bool)> {
 /// `line` is the command line under the cursor, when there is one; Home and End
 /// are built out of arrow keys against it, because IRIS does the line editing
 /// and does not act on the Home/End sequences a VT terminal sends.
-pub fn key_bytes(key: Key, modifiers: &Modifiers, line: Option<LineEdit>) -> Option<Vec<u8>> {
+///
+/// `app_cursor` is DECCKM: with it set the far side expects `ESC O A` where it
+/// would otherwise expect `ESC [ A`, and the wrong one is not misread but
+/// ignored. See [`cursor_key`].
+pub fn key_bytes(
+    key: Key,
+    modifiers: &Modifiers,
+    line: Option<LineEdit>,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
     // Application shortcuts are handled by the caller, not sent to IRIS.
     let ctrl = modifiers.ctrl;
 
@@ -111,19 +127,21 @@ pub fn key_bytes(key: Key, modifiers: &Modifiers, line: Option<LineEdit>) -> Opt
         // ends. `\x1b[H` and `\x1b[F` are kept for the case we cannot: they are
         // what a VT terminal sends, and a full-screen routine may act on them.
         Key::Home => match line {
-            Some(line) => repeat(b"\x1b[D", line.cursor.saturating_sub(line.start)),
-            None => b"\x1b[H".to_vec(),
+            Some(line) => {
+                cursor_key(app_cursor, b'D').repeat(line.cursor.saturating_sub(line.start))
+            }
+            None => cursor_key(app_cursor, b'H'),
         },
         Key::End => match line {
-            Some(line) => repeat(b"\x1b[C", line.end.saturating_sub(line.cursor)),
-            None => b"\x1b[F".to_vec(),
+            Some(line) => cursor_key(app_cursor, b'C').repeat(line.end.saturating_sub(line.cursor)),
+            None => cursor_key(app_cursor, b'F'),
         },
         Key::PageUp => b"\x1b[5~".to_vec(),
         Key::PageDown => b"\x1b[6~".to_vec(),
-        Key::ArrowUp => b"\x1b[A".to_vec(),
-        Key::ArrowDown => b"\x1b[B".to_vec(),
-        Key::ArrowRight => b"\x1b[C".to_vec(),
-        Key::ArrowLeft => b"\x1b[D".to_vec(),
+        Key::ArrowUp => cursor_key(app_cursor, b'A'),
+        Key::ArrowDown => cursor_key(app_cursor, b'B'),
+        Key::ArrowRight => cursor_key(app_cursor, b'C'),
+        Key::ArrowLeft => cursor_key(app_cursor, b'D'),
         Key::F1 => b"\x1bOP".to_vec(),
         Key::F2 => b"\x1bOQ".to_vec(),
         Key::F3 => b"\x1bOR".to_vec(),
@@ -150,9 +168,16 @@ pub fn key_bytes(key: Key, modifiers: &Modifiers, line: Option<LineEdit>) -> Opt
     Some(bytes)
 }
 
-/// `sequence`, `n` times over.
-fn repeat(sequence: &[u8], n: usize) -> Vec<u8> {
-    sequence.repeat(n)
+/// One cursor-key sequence, in whichever of its two spellings the far side is
+/// expecting.
+///
+/// `ESC [ A` is the ANSI form and `ESC O A` the application one, chosen by
+/// DECCKM. A terminal that sends the wrong one is not misunderstood, it is
+/// ignored - which is why the arrow keys, and clicking to put the cursor
+/// somewhere (built out of the same bytes), moved nothing on IRIS 2023: it
+/// turns the mode on where earlier versions left it off.
+pub fn cursor_key(app_cursor: bool, final_byte: u8) -> Vec<u8> {
+    vec![0x1b, if app_cursor { b'O' } else { b'[' }, final_byte]
 }
 
 /// Maps a key to its ASCII control code, covering the letters plus the handful
@@ -275,9 +300,15 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
         erase_selection: false,
     };
 
-    // Recall replaces the line, so it only makes sense where a rubout would
-    // erase the last character typed rather than one in the middle.
-    let recall_here = ctx.can_recall && ctx.line.is_some_and(LineEdit::at_end);
+    // Anywhere on a command line when the setting allows it: the native IRIS
+    // terminal swaps the line whatever column the cursor sits in, and the
+    // caller walks the cursor to the end before rubbing the line out - see
+    // `App::recall`. Otherwise only from the end, where a rubout erases the
+    // last character typed rather than one in the middle.
+    let recall_here = ctx.can_recall
+        && ctx
+            .line
+            .is_some_and(|line| ctx.recall_mid_line || line.at_end());
 
     for event in events {
         match event {
@@ -363,7 +394,7 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
                 if *key == Key::Enter {
                     action.submitted = Some(action.text.clone());
                 }
-                if let Some(bytes) = key_bytes(*key, modifiers, ctx.line) {
+                if let Some(bytes) = key_bytes(*key, modifiers, ctx.line, ctx.app_cursor_keys) {
                     action.bytes.extend_from_slice(&bytes);
                 }
             }
@@ -437,7 +468,7 @@ mod tests {
     #[test]
     fn enter_sends_carriage_return_not_line_feed() {
         assert_eq!(
-            key_bytes(Key::Enter, &Modifiers::NONE, None),
+            key_bytes(Key::Enter, &Modifiers::NONE, None, false),
             Some(vec![b'\r'])
         );
     }
@@ -445,7 +476,7 @@ mod tests {
     #[test]
     fn backspace_sends_del() {
         assert_eq!(
-            key_bytes(Key::Backspace, &Modifiers::NONE, None),
+            key_bytes(Key::Backspace, &Modifiers::NONE, None, false),
             Some(vec![0x7f])
         );
     }
@@ -453,7 +484,7 @@ mod tests {
     #[test]
     fn arrows_send_csi_sequences() {
         assert_eq!(
-            key_bytes(Key::ArrowUp, &Modifiers::NONE, None),
+            key_bytes(Key::ArrowUp, &Modifiers::NONE, None, false),
             Some(b"\x1b[A".to_vec())
         );
     }
@@ -464,9 +495,9 @@ mod tests {
             ctrl: true,
             ..Modifiers::NONE
         };
-        assert_eq!(key_bytes(Key::C, &ctrl, None), Some(vec![0x03]));
-        assert_eq!(key_bytes(Key::A, &ctrl, None), Some(vec![0x01]));
-        assert_eq!(key_bytes(Key::Z, &ctrl, None), Some(vec![0x1a]));
+        assert_eq!(key_bytes(Key::C, &ctrl, None, false), Some(vec![0x03]));
+        assert_eq!(key_bytes(Key::A, &ctrl, None, false), Some(vec![0x01]));
+        assert_eq!(key_bytes(Key::Z, &ctrl, None, false), Some(vec![0x1a]));
     }
 
     /// IRIS does not act on the Home/End sequences, so they are walked with the
@@ -474,7 +505,7 @@ mod tests {
     #[test]
     fn home_walks_left_to_the_start_of_the_typed_line() {
         assert_eq!(
-            key_bytes(Key::Home, &Modifiers::NONE, Some(line())),
+            key_bytes(Key::Home, &Modifiers::NONE, Some(line()), false),
             Some(b"\x1b[D".repeat(7))
         );
     }
@@ -486,7 +517,7 @@ mod tests {
             ..line()
         };
         assert_eq!(
-            key_bytes(Key::End, &Modifiers::NONE, Some(mid)),
+            key_bytes(Key::End, &Modifiers::NONE, Some(mid), false),
             Some(b"\x1b[C".repeat(4))
         );
     }
@@ -499,11 +530,11 @@ mod tests {
             ..line()
         };
         assert_eq!(
-            key_bytes(Key::Home, &Modifiers::NONE, Some(start)),
+            key_bytes(Key::Home, &Modifiers::NONE, Some(start), false),
             Some(Vec::new())
         );
         assert_eq!(
-            key_bytes(Key::End, &Modifiers::NONE, Some(line())),
+            key_bytes(Key::End, &Modifiers::NONE, Some(line()), false),
             Some(Vec::new())
         );
     }
@@ -513,11 +544,11 @@ mod tests {
     #[test]
     fn home_and_end_fall_back_to_the_vt_sequences_off_a_command_line() {
         assert_eq!(
-            key_bytes(Key::Home, &Modifiers::NONE, None),
+            key_bytes(Key::Home, &Modifiers::NONE, None, false),
             Some(b"\x1b[H".to_vec())
         );
         assert_eq!(
-            key_bytes(Key::End, &Modifiers::NONE, None),
+            key_bytes(Key::End, &Modifiers::NONE, None, false),
             Some(b"\x1b[F".to_vec())
         );
     }
@@ -826,22 +857,74 @@ mod tests {
         assert_eq!(action.bytes, b"\x1b[A".to_vec());
     }
 
-    /// Mid-line, replacing the line would rub out the wrong characters, so
-    /// nothing is recalled - and nothing is forwarded either, since IRIS would
-    /// replace the line itself.
+    /// Mid-line, when the setting allows it: the native IRIS terminal replaces
+    /// the whole line wherever the cursor happens to be, and so does this - the
+    /// caller walks the cursor to the end before rubbing the line out. With the
+    /// setting off the line is left alone. Nothing is forwarded to IRIS either
+    /// way, since its own recall is the list this feature exists to avoid.
     #[test]
-    fn up_is_not_ours_when_the_cursor_is_not_at_the_end_of_the_line() {
-        let ctx = InputContext {
+    fn recall_mid_line_is_what_decides_whether_up_takes_the_line() {
+        let mid_line = InputContext {
             line: Some(LineEdit {
                 cursor: 8,
                 ..line()
             }),
             can_recall: true,
+            recall_mid_line: true,
             ..InputContext::default()
         };
-        let action = translate(&[press(Key::ArrowUp)], &ctx);
-        assert_eq!(action.recall, None);
+        let action = translate(&[press(Key::ArrowUp)], &mid_line);
+        assert_eq!(action.recall, Some(Recall::Back));
         assert!(action.bytes.is_empty());
+
+        let action = translate(
+            &[press(Key::ArrowUp)],
+            &InputContext {
+                recall_mid_line: false,
+                ..mid_line
+            },
+        );
+        assert_eq!(action.recall, None);
+        assert!(action.bytes.is_empty(), "IRIS must not recall either");
+
+        // The end of the line is the recall whichever way the setting is set.
+        let action = translate(
+            &[press(Key::ArrowUp)],
+            &InputContext {
+                line: Some(line()),
+                recall_mid_line: false,
+                ..mid_line
+            },
+        );
+        assert_eq!(action.recall, Some(Recall::Back));
+    }
+
+    /// With the mode on, the arrows change shape: `ESC O D` instead of
+    /// `ESC [ D`. IRIS 2023 asks for it, and an arrow in the wrong spelling
+    /// moves its cursor nowhere at all.
+    #[test]
+    fn application_cursor_keys_change_the_spelling_of_an_arrow() {
+        let app = InputContext {
+            app_cursor_keys: true,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            translate(&[press(Key::ArrowLeft)], &app).bytes,
+            cursor_key(true, b'D')
+        );
+        assert_eq!(cursor_key(true, b'D'), b"\x1bOD".to_vec());
+        assert_eq!(cursor_key(false, b'D'), b"\x1b[D".to_vec());
+
+        // Home is walked with arrows, so it follows the same spelling.
+        let at_prompt = InputContext {
+            line: Some(line()),
+            app_cursor_keys: true,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            translate(&[press(Key::Home)], &at_prompt).bytes,
+            b"\x1bOD".repeat(7)
+        );
     }
 
     #[test]

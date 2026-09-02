@@ -199,6 +199,10 @@ pub fn theme_manager(
         [1240.0, 700.0],
         buttons,
         native_decorations,
+        // Nothing to remember across runs: the theme manager is opened to make
+        // one change and closed again, and it opens over the terminal it is
+        // changing either way.
+        None,
         |ui| {
             let showing = state.showing(themes, active);
             // Resolved once, out here: the editor edits by index and the

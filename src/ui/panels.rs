@@ -8,6 +8,8 @@
 
 use egui::{Context, Ui};
 
+use crate::config::profile::Remote;
+use crate::config::servers::{Server, ServerList, Target};
 use crate::config::{profile::LogMode, CursorStyle, Profile, Settings, Theme};
 use crate::features::macros::{Macro, MacroGroup, Origin, Param};
 use crate::features::natives::Native;
@@ -35,7 +37,6 @@ pub enum UiRequest {
     ExportHtml(crate::features::export::Range),
     CopyRange(crate::features::export::Range),
     SettingsChanged,
-    ReloadMacros,
     /// Write the personal macro file back to disk.
     SavePersonalMacros,
     /// Show a folder in the platform's file manager.
@@ -68,6 +69,11 @@ pub struct PanelState {
     pub editing: Option<(usize, usize)>,
     /// Draft being edited, kept separate so Cancel is a real cancel.
     pub draft: Option<Macro>,
+    /// The editor is waiting for a key combination to be pressed, so that it
+    /// can be read off the keyboard instead of typed out. Public because the
+    /// app has to stop claiming shortcuts for itself while it is set, or Ctrl+T
+    /// would open a tab rather than be recorded.
+    pub capture_shortcut: bool,
     /// Whether a hidden body is currently shown in the editor. Deliberately not
     /// persisted and cleared every time the editor closes, so opening a macro
     /// never starts by putting its password on screen.
@@ -101,17 +107,7 @@ impl PanelState {
         self.editing = Some(at);
         self.draft = Some(draft);
         self.reveal_body = false;
-    }
-
-    /// Forgets which macro is selected or being edited.
-    ///
-    /// Called when the macro list is replaced: both are indices into it, and
-    /// after a reload they would address a different macro.
-    pub fn forget_macro_selection(&mut self) {
-        self.selected = None;
-        self.editing = None;
-        self.draft = None;
-        self.reveal_body = false;
+        self.capture_shortcut = false;
     }
 }
 
@@ -157,12 +153,25 @@ pub fn macros_panel(
 ) -> Option<UiRequest> {
     let mut request = None;
 
+    // The panel says what it is and offers the way out. Clicking Macros in the
+    // menu bar again still closes it - this is the same gesture put where a
+    // panel is normally closed from, since nothing on screen said that the
+    // toggle in the bar was the only way back.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(tr("Macros")).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("x")
+                .on_hover_text(tr("Close this panel"))
+                .clicked()
+            {
+                state.show_macros = false;
+            }
+        });
+    });
     ui.horizontal(|ui| {
         ui.label(tr("Filter"));
         ui.text_edit_singleline(&mut state.macro_filter);
-        if ui.button(tr("Reload")).clicked() {
-            request = Some(UiRequest::ReloadMacros);
-        }
     });
     ui.separator();
 
@@ -435,6 +444,7 @@ pub fn macro_editor_dialog(
     let mut close = false;
     let mut open = true;
     let mut reveal = state.reveal_body;
+    let mut capture = state.capture_shortcut;
 
     egui::Window::new(tr("Edit macro"))
         .id(egui::Id::new("nit-macro-editor"))
@@ -471,7 +481,40 @@ pub fn macro_editor_dialog(
                     let key = key.trim().to_string();
                     draft.key = (!key.is_empty()).then_some(key);
                 }
+                // Typing the name of a chord is fiddly and easy to get subtly
+                // wrong - `Num7` against `7`, `Option` against `Alt` - so the
+                // other way in is to press it. What lands in the field is what
+                // the parser produced, which is the value that will fire.
+                let label = if capture {
+                    tr("Press the keys...")
+                } else {
+                    tr("Detect")
+                };
+                if ui
+                    .selectable_label(capture, label)
+                    .on_hover_text(tr(
+                        "Press the combination and it is filled in here. Esc cancels, Backspace clears it.",
+                    ))
+                    .clicked()
+                {
+                    capture = !capture;
+                }
             });
+            if capture {
+                match captured_shortcut(ui) {
+                    Capture::Waiting => {}
+                    Capture::Cancelled => capture = false,
+                    Capture::Cleared => {
+                        draft.key = None;
+                        capture = false;
+                    }
+                    Capture::Chord(text) => {
+                        draft.key = Some(text);
+                        capture = false;
+                    }
+                }
+                ui.small(tr("A modifier is required: Ctrl, Alt, or both, with or without Shift."));
+            }
             // Reported rather than rejected: this field is also edited by hand
             // in the shared XML, and a value we do not understand has to
             // survive a round trip through here instead of being erased.
@@ -574,13 +617,63 @@ pub fn macro_editor_dialog(
         });
 
     state.reveal_body = reveal;
+    state.capture_shortcut = capture;
 
     if close || !open {
         state.editing = None;
         state.draft = None;
         state.reveal_body = false;
+        state.capture_shortcut = false;
     }
     request
+}
+
+/// What a frame of key presses meant while the editor was listening for a
+/// shortcut.
+enum Capture {
+    /// Nothing usable yet, so keep listening.
+    Waiting,
+    /// Escape: leave the binding as it was.
+    Cancelled,
+    /// Backspace or Delete: no shortcut at all.
+    Cleared,
+    /// A chord, in the parser's own spelling.
+    Chord(String),
+}
+
+/// Takes the pressed chord out of this frame's events.
+///
+/// Every key press is consumed while listening, and so is the text they would
+/// have produced: a key pressed here is the shortcut being named, not typing,
+/// and leaving it in the stream would put a letter in the name field or fire
+/// the very shortcut being recorded. A chord without Ctrl or Alt is ignored
+/// rather than accepted - a bare letter, or Shift plus one, would fire while
+/// the user was typing at the prompt.
+fn captured_shortcut(ui: &Ui) -> Capture {
+    ui.input_mut(|input| {
+        let mut result = Capture::Waiting;
+        input.events.retain(|event| match event {
+            egui::Event::Text(_) => false,
+            egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } => {
+                match key {
+                    egui::Key::Escape => result = Capture::Cancelled,
+                    egui::Key::Backspace | egui::Key::Delete => result = Capture::Cleared,
+                    key if modifiers.ctrl || modifiers.alt || modifiers.command => {
+                        result = Capture::Chord(shortcut::format(*modifiers, *key));
+                    }
+                    _ => {}
+                }
+                false
+            }
+            _ => true,
+        });
+        result
+    })
 }
 
 /// Parameter-fill and confirmation dialog for a pending macro.
@@ -844,12 +937,15 @@ fn section(ui: &mut Ui, title: &str) {
 }
 
 /// Settings: theme, font, scrollback, logging, and profiles.
+#[allow(clippy::too_many_arguments)]
 pub fn settings_dialog(
     ctx: &Context,
     settings: &mut Settings,
     themes: &[Theme],
     state: &mut PanelState,
     instances: &[String],
+    servers: &ServerList,
+    placement: &mut crate::ui::detach::Placement,
     buttons: &crate::config::theme::WindowButtons,
 ) -> Option<UiRequest> {
     if !state.show_settings {
@@ -872,6 +968,9 @@ pub fn settings_dialog(
         [560.0, 680.0],
         buttons,
         native_decorations,
+        // A window of its own, so it reopens where and how it was left for
+        // whichever of the two switches below is on.
+        Some(placement),
         |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // Roomier than egui's default. A settings window is read down
@@ -1073,12 +1172,46 @@ pub fn settings_dialog(
                 }
                 if ui
                     .checkbox(
+                        &mut settings.recall_mid_line,
+                        tr("Up and Down recall from anywhere on the line"),
+                    )
+                    .on_hover_text(tr(
+                        "On: Up replaces the line with an earlier command wherever the cursor is, the way the native IRIS terminal does. Off: only at the end of the line, so a cursor left in the middle means the line is being edited and the arrows leave it alone.",
+                    ))
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(
                         &mut settings.save_command_history,
                         tr("Remember commands from earlier sessions"),
                     )
                     .on_hover_text(
-                        tr("Keeps the commands typed at an IRIS prompt in history.txt, so Up reaches back past the session that is open now. Off keeps recall working within the session and writes nothing to disk. Either way, Up and Down are the recall, and lines sent by a macro or an IRIS helper are never offered back."),
+                        tr("Keeps the commands typed at an IRIS prompt in history.txt, so Up reaches back past the sessions open now. Off keeps recall working inside each session and writes nothing to disk. Either way a tab offers back its own commands first and the inherited ones after them, and lines sent by a macro or an IRIS helper are never offered back at all."),
                     )
+                    .changed()
+                {
+                    changed = true;
+                }
+
+                if ui
+                    .checkbox(
+                        &mut settings.show_namespace_in_tab,
+                        tr("Show the namespace in the tab name"),
+                    )
+                    .on_hover_text(tr(
+                        "Adds the namespace the session is in to the tab's name - CONSISTEM | RDB76-TR. Read off the prompt, so it follows a ZN as it happens; a tab renamed by hand keeps the name it was given.",
+                    ))
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(&mut settings.show_pid, tr("Show the process id"))
+                    .on_hover_text(tr(
+                        "Puts the session's process id next to the instance name and the window size in the menu bar. A local session only: a remote one runs its process on the far side.",
+                    ))
                     .changed()
                 {
                     changed = true;
@@ -1194,7 +1327,9 @@ pub fn settings_dialog(
                 {
                     changed = true;
                 }
-                ui.small(tr("Takes effect the next time the app starts."));
+                ui.small(tr(
+                    "Takes effect the next time the app starts, and covers this window as well as the main one.",
+                ));
 
                 section(ui, tr("Updates"));
                 if ui
@@ -1274,7 +1409,7 @@ pub fn settings_dialog(
                 ui.small(tr1("Logs: {}", &settings.log_dir.display().to_string()));
 
                 section(ui, tr("Profiles"));
-                if profiles_editor(ui, settings, instances) {
+                if profiles_editor(ui, settings, instances, servers) {
                     changed = true;
                 }
             });
@@ -1288,7 +1423,12 @@ pub fn settings_dialog(
 }
 
 /// Returns true when anything changed.
-fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -> bool {
+fn profiles_editor(
+    ui: &mut Ui,
+    settings: &mut Settings,
+    instances: &[String],
+    servers: &ServerList,
+) -> bool {
     let mut changed = false;
     let mut remove = None;
 
@@ -1304,26 +1444,26 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
 
             ui.horizontal(|ui| {
                 ui.label(tr("Instance"));
-                if instances.is_empty() {
+                if servers.is_empty() && instances.is_empty() {
+                    // Nothing was discovered - no launcher, or a machine this
+                    // app cannot read the list on - so the name is typed.
                     changed |= ui.text_edit_singleline(&mut profile.instance).changed();
                 } else {
                     egui::ComboBox::from_id_source(("instance", index))
-                        .selected_text(profile.instance.clone())
+                        .selected_text(instance_label(profile))
                         .show_ui(ui, |ui| {
-                            for name in instances {
-                                if ui
-                                    .selectable_label(*name == profile.instance, name)
-                                    .clicked()
-                                {
-                                    profile.instance = name.clone();
-                                    changed = true;
-                                }
-                            }
+                            changed |= instance_menu(ui, profile, instances, servers);
                         });
                 }
             });
-
-            changed |= labelled_edit(ui, "Namespace", &mut profile.namespace);
+            // Where the session actually goes, since a server entry can be a
+            // Telnet login rather than an instance on this machine.
+            if let Some(remote) = profile.remote.as_ref() {
+                ui.small(tr1(
+                    "Telnet login to {}",
+                    &format!("{}:{}", remote.address, remote.port),
+                ));
+            }
 
             ui.horizontal(|ui| {
                 ui.label(tr("Encoding"));
@@ -1344,18 +1484,6 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
             ui.small(tr(
                 "Leave as UTF-8 unless accented characters come out wrong.",
             ));
-
-            ui.separator();
-            changed |= ui
-                .checkbox(&mut profile.autologon, tr("Log in automatically"))
-                .changed();
-            if profile.autologon {
-                changed |= labelled_edit(ui, "Username", &mut profile.username);
-                password_editor(ui, profile, index);
-                if profile.username.is_empty() {
-                    ui.colored_label(WARNING, tr("Autologon needs a username."));
-                }
-            }
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -1422,35 +1550,88 @@ fn profiles_editor(ui: &mut Ui, settings: &mut Settings, instances: &[String]) -
     changed
 }
 
-/// Password field. The value is never held in the settings struct — it goes
-/// straight to the OS credential store — so this widget keeps its own buffer
-/// in egui's temporary memory and clears it once saved.
-fn password_editor(ui: &mut Ui, profile: &Profile, index: usize) {
-    let id = egui::Id::new(("password-buffer", index));
-    let mut buffer: String = ui.memory_mut(|m| m.data.get_temp(id).unwrap_or_default());
+/// What the instance picker shows when it is closed.
+///
+/// The endpoint rather than the bare name when the two differ: a profile
+/// pointing at a remote server names the server in `instance`, and the address
+/// is the part that says it is not the local instance of the same name.
+fn instance_label(profile: &Profile) -> String {
+    match profile.remote.as_ref() {
+        Some(remote) => format!("{}  ({})", profile.instance, remote.address),
+        None if profile.instance.is_empty() => tr("Choose...").to_string(),
+        None => profile.instance.clone(),
+    }
+}
 
-    let stored = profile.password().is_some();
-    ui.horizontal(|ui| {
-        ui.label(tr("Password"));
-        ui.add(egui::TextEdit::singleline(&mut buffer).password(true));
+/// The instance picker's contents: the same list the `+` button's right-click
+/// menu offers, because it is the same question - which server or instance does
+/// this profile connect to.
+///
+/// Returns true when a choice was made.
+fn instance_menu(
+    ui: &mut Ui,
+    profile: &mut Profile,
+    instances: &[String],
+    servers: &ServerList,
+) -> bool {
+    let mut changed = false;
 
-        if ui.button(tr("Save")).clicked() {
-            match profile.set_password(&buffer) {
-                Ok(()) => buffer.clear(),
-                Err(e) => log::error!("could not store the password: {e:#}"),
+    if !servers.is_empty() {
+        ui.weak(tr("IRIS servers"));
+        for server in &servers.servers {
+            let selected = profile.instance.eq_ignore_ascii_case(&server.name);
+            let entry = ui.selectable_label(selected, server.menu_label());
+            // What the entry does, since a local server opens an instance and
+            // a remote one is a Telnet login.
+            let hint = match server.target(instances) {
+                Target::Local { instance } => tr1("Local session on instance {}", &instance),
+                Target::Telnet { address, port } => {
+                    tr1("Telnet login to {}", &format!("{address}:{port}"))
+                }
+            };
+            if entry.on_hover_text(hint).clicked() {
+                point_at(profile, server, instances);
+                changed = true;
             }
         }
-        if stored && ui.button(tr("Forget")).clicked() {
-            profile.clear_password();
+        let loose = instances
+            .iter()
+            .any(|name| !servers.covers_instance(instances, name));
+        if loose {
+            ui.separator();
         }
-    });
-    ui.small(if stored {
-        "A password is stored in the OS credential manager."
-    } else {
-        "No password stored; autologon will stop at the password prompt."
-    });
+    }
 
-    ui.memory_mut(|m| m.data.insert_temp(id, buffer));
+    for name in instances {
+        // Skipped when a server entry already opens it: the same session under
+        // two names is not a choice.
+        if servers.covers_instance(instances, name) {
+            continue;
+        }
+        let selected = profile.remote.is_none() && &profile.instance == name;
+        if ui.selectable_label(selected, name).clicked() {
+            point_at(profile, &Server::for_instance(name), instances);
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+/// Points a profile at one of the launcher's servers, exactly as the `+` menu
+/// does: the name is what the tab will say, and the target decides whether the
+/// session starts locally or logs in over Telnet.
+fn point_at(profile: &mut Profile, server: &Server, instances: &[String]) {
+    match server.target(instances) {
+        Target::Local { instance } => {
+            profile.instance = instance;
+            profile.remote = None;
+        }
+        Target::Telnet { address, port } => {
+            profile.instance = server.name.clone();
+            profile.remote = Some(Remote { address, port });
+        }
+    }
 }
 
 fn labelled_edit(ui: &mut Ui, label: &'static str, value: &mut String) -> bool {

@@ -11,7 +11,15 @@ Portuguese.
 
 * **Tabs** — one IRIS session per tab, each with its own scrollback and log.
   `+` (Ctrl+T) connects on the last-used server; right-click it for every
-  profile, server and discovered instance.
+  profile, server and discovered instance. A tab is named after its instance
+  and, if you like, the namespace the session is in — `CONSISTEM | RDB76-TR`,
+  following every `ZN`.
+* **Two sessions in one tab** — right-click a tab and *Split to right* or
+  *Split to bottom*, and a second session opens in the pane it makes. The strip
+  entry names whichever pane the keyboard is in — `1: CONSISTEM | COMP80`,
+  `2: ...` — and renaming the tab asks for both names. Each pane sizes its own
+  session, so neither is truncated at a width it is not drawn at. *Remove split*
+  gives the second session a tab of its own without closing anything.
 * **Its own window frame** — the tab strip sits where the title bar would be.
   Drag, double-click to maximize, resize from any edge. The buttons come from
   the theme, can be moved to either end, hidden one at a time, or switched off
@@ -25,11 +33,15 @@ Portuguese.
 * **Line editing at the prompt** — Home/End, Ctrl+Left/Right by word, click to
   place the cursor, Ctrl+A to select the line, Shift to drag a selection out of
   it, double-click to take a word and triple-click a whole line. Built entirely
-  from keys IRIS acts on, since IRIS owns the read buffer.
-* **Command history that outlives the session** — every command typed at a
-  prompt is remembered, and Up/Down walk it. Lines a macro or an IRIS helper
-  sent are never offered back, and IRIS's own recall — which is full of them —
-  is never reachable.
+  from keys IRIS acts on, since IRIS owns the read buffer — in whichever of the
+  two spellings of an arrow key the session asks for, which is what IRIS 2023
+  changed. Dragging a selection past the top or bottom edge scrolls, the way it
+  does in an editor.
+* **Command history that outlives the session** — Up offers a tab the commands
+  typed at *its* own prompt first, and only then the ones earlier runs left
+  behind; what another tab has typed while this one was open stays with that
+  tab. Lines a macro or an IRIS helper sent are never offered back, and IRIS's
+  own recall — which is full of them — is never reachable.
 * **Themes you can edit in the app** — ten built-in and immutable; duplicate one
   and every colour is yours, including the sixteen ANSI slots and the sixteen
   ObjectScript ones, with a live sample beside the editor.
@@ -39,8 +51,10 @@ Portuguese.
   scopes: all output, the last 10 commands, the last 5, or just the selection.
   Needs `claude` on the PATH.
 * **Macros from XML** — `{{param}}` substitution, `confirm="true"` for anything
-  that writes, a keyboard shortcut per macro, `hide_command="true"` for a
-  command line carrying a password.
+  that writes, a keyboard shortcut per macro — typed out or recorded by pressing
+  it — and `hide_command="true"` for a command line carrying a password.
+  Whatever is half-typed at the prompt is rubbed out first, so a macro is the
+  command it says it is.
 * **IRIS utilities** — fill in the fields and the exact line is composed and
   sent: compile a package, generate an interface.
 * **Export** — screen or full scrollback, as text or colour-preserving HTML.

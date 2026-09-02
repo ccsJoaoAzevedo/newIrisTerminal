@@ -327,7 +327,11 @@ pub struct RenderResult {
 /// the terminal unable to receive keys at all.
 ///
 /// `take_focus` is set by the caller when the active tab changed, so focus
-/// follows the tab the user is looking at.
+/// follows the tab the user is looking at. `claim_idle` is what makes the
+/// terminal take the keyboard back whenever no other widget wants it; with the
+/// view split in two only one of the panes may do that, or the two would take
+/// it from each other every frame.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     grid: &Grid,
@@ -336,6 +340,7 @@ pub fn show(
     opts: &RenderOpts,
     tab_uid: u64,
     take_focus: bool,
+    claim_idle: bool,
 ) -> RenderResult {
     let font = terminal_font(&opts.font_family, opts.font_size);
     let cell = cell_size(ui, &font);
@@ -389,7 +394,7 @@ pub fn show(
     // chrome (a tab button, say) silently steals typing away again. Claim
     // focus when nothing else wants it, or when the caller says the active tab
     // just changed — but never off a dialog or text field that is in use.
-    if take_focus || ui.memory(|m| m.focused().is_none()) {
+    if take_focus || (claim_idle && ui.memory(|m| m.focused().is_none())) {
         response.request_focus();
     }
 
@@ -768,6 +773,25 @@ fn paint_thumb(painter: &egui::Painter, thumb: Rect, theme: &Theme, active: bool
             };
             painter.rect_filled(thumb, 2.0, colour);
         }
+    }
+}
+
+/// Lines to scroll for a pointer `over` points past the edge of the view,
+/// positive being downwards.
+///
+/// One line per cell of overshoot, so the further out the pointer is dragged
+/// the faster the selection grows, and always at least one so that resting a
+/// pixel past the edge still moves. Capped: a pointer flung to the far side of
+/// the screen should not clear the whole scrollback in three frames.
+fn autoscroll_lines(over: f32, cell_y: f32) -> i64 {
+    const MAX: f32 = 8.0;
+    let lines = (over / cell_y.max(1.0)).abs().ceil().clamp(1.0, MAX) as i64;
+    // `scroll_lines` counts a positive `lines` as scrolling *back*, the way a
+    // wheel does, and dragging below the bottom edge goes forwards.
+    if over < 0.0 {
+        lines
+    } else {
+        -lines
     }
 }
 
@@ -1180,6 +1204,25 @@ fn handle_mouse(
     } else if response.dragged() {
         if let (Some(pos), Some(anchor)) = (response.interact_pointer_pos(), state.drag_anchor) {
             state.selection = Some(Selection::over(anchor, pos_to_cell(pos)));
+            // Dragging past the top or bottom edge keeps going: the view
+            // follows the pointer a line at a time, the way selecting past the
+            // edge of a text editor does. `resolve` has already clamped the
+            // pointer to the first or last row on screen, so each line the view
+            // moves is one more line taken into the selection.
+            let over = if pos.y < rect.top() {
+                pos.y - rect.top()
+            } else if pos.y > rect.bottom() {
+                pos.y - rect.bottom()
+            } else {
+                0.0
+            };
+            if over != 0.0 {
+                let lines = autoscroll_lines(over, cell.y);
+                scroll_lines(state, top_line, lines, max_top);
+                // An idle terminal draws no frame of its own, and without one
+                // the scroll would stop the moment the pointer stopped moving.
+                ui.ctx().request_repaint();
+            }
         }
     } else if response.drag_stopped() {
         state.drag_anchor = None;
@@ -1197,6 +1240,21 @@ fn handle_mouse(
 mod tests {
     use super::*;
     use crate::term::Grid;
+
+    /// Dragging a selection past the edge of the view scrolls it, the way it
+    /// does in a text editor: away from the edge the pointer is past, faster
+    /// the further out it is dragged, and never nothing at all.
+    #[test]
+    fn dragging_past_an_edge_scrolls_towards_it() {
+        // Above the top edge: back through the scrollback, which is the
+        // direction a positive count means to `scroll_lines`.
+        assert_eq!(autoscroll_lines(-1.0, 14.0), 1, "a pixel past the top");
+        assert_eq!(autoscroll_lines(-30.0, 14.0), 3);
+        // Below the bottom edge: forwards.
+        assert_eq!(autoscroll_lines(1.0, 14.0), -1, "a pixel past the bottom");
+        assert_eq!(autoscroll_lines(-1000.0, 14.0), 8, "and capped");
+        assert_eq!(autoscroll_lines(1000.0, 14.0), -8);
+    }
 
     /// The span is what decides whether an erase key can act on a selection, so
     /// a selection that reaches off the line must not produce one.
