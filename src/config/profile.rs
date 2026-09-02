@@ -31,8 +31,10 @@ pub struct Profile {
     /// Non-standard install path, when discovery cannot find the binary.
     #[serde(default)]
     pub binary_override: Option<PathBuf>,
-    /// Character set IRIS speaks on this instance. Wrong values show up as
-    /// mangled accented characters, not as an error, so it is per-profile.
+    /// How the bytes to and from this session have to be translated. Wrong
+    /// values show up as mangled accented characters, not as an error, so it is
+    /// per-profile: a local session goes through the Windows console, which
+    /// translates in both directions, and a Telnet one does not.
     #[serde(default)]
     pub encoding: crate::term::Encoding,
     #[serde(default)]
@@ -126,7 +128,14 @@ impl Profile {
         };
         match server.target(instances) {
             Target::Local { instance } => profile.instance = instance,
-            Target::Telnet { address, port } => profile.remote = Some(Remote { address, port }),
+            Target::Telnet { address, port } => {
+                profile.remote = Some(Remote { address, port });
+                // Nothing translates the bytes on the way to a Telnet server:
+                // the Windows console that mangles a local session in both
+                // directions is not in this path, so undoing it would be the
+                // only thing mangling them. See [`crate::term::Encoding`].
+                profile.encoding = crate::term::Encoding::Utf8;
+            }
         }
         profile
     }

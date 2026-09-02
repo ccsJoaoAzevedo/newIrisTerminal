@@ -28,18 +28,24 @@ pub enum Encoding {
     Cp1252,
     /// ISO 8859-1.
     Latin1,
-    /// Repairs text that IRIS encoded twice.
+    /// Undoes the codepage translation a Windows pseudo-console puts in the
+    /// way, in both directions.
     ///
-    /// Some instances translate their output to UTF-8 and then run the result
-    /// through a CP850 -> UTF-8 translation a second time. Each byte of the
-    /// first encoding is reinterpreted as a CP850 glyph, so `Nó` (`c3 b3`)
-    /// arrives as the box-drawing characters `├│`. Undoing it means mapping
-    /// each character back to its CP850 byte and decoding those bytes as
-    /// UTF-8 — which is exactly what the local instance needs.
+    /// The instance speaks UTF-8, but the console between it and this terminal
+    /// does not: it reads the instance's bytes as CP850 and re-encodes them,
+    /// so `Nó` (`c3 b3`) arrives as the box-drawing characters `├│`. Undoing it
+    /// means mapping each character back to its CP850 byte and reading those
+    /// bytes as UTF-8.
     ///
-    /// This is the default: the guards in `repair_double_encoding` make it
-    /// a no-op on a correctly-configured instance, while fixing a mangled
-    /// one.
+    /// Typing travels the same road in reverse. The console takes what this
+    /// terminal writes and converts it to the codepage before IRIS reads it, so
+    /// a `ó` sent as plain UTF-8 reaches IRIS as `?` — character 63, which is
+    /// what a probe of the live instance reports. Sending the CP850 glyph for
+    /// each byte IRIS should receive is what gets `ó` there intact.
+    ///
+    /// This is the default: the guards in `repair_double_encoding` make the
+    /// output half a no-op on a console that is not translating, and a session
+    /// reached without one — Telnet — is opened as [`Encoding::Utf8`].
     #[default]
     Cp850Doubled,
 }
@@ -59,7 +65,7 @@ impl Encoding {
             Encoding::Cp850 => "CP850 (DOS Western)",
             Encoding::Cp1252 => "Windows-1252",
             Encoding::Latin1 => "ISO 8859-1",
-            Encoding::Cp850Doubled => "UTF-8 double-encoded via CP850 (repair)",
+            Encoding::Cp850Doubled => "Windows console (CP850 round trip)",
         }
     }
 
@@ -98,11 +104,31 @@ impl Encoding {
         }
     }
 
+    /// [`Encoding::decode`] for a stream that arrives one PTY read at a time.
+    ///
+    /// The repair reads a whole run of characters at a time, and a read can end
+    /// in the middle of one: `carry` holds the few bytes that are waiting for
+    /// the rest of it. Without this, a boundary landing inside `Nó` - which
+    /// travels as `├│` - leaves the box-drawing characters on screen instead of
+    /// the accent. Rare, and exactly the sort of thing that only shows up on a
+    /// long screen of output. Every other encoding here is single-byte and
+    /// cannot be split, so it passes straight through.
+    pub fn decode_chunk(self, bytes: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
+        if self != Encoding::Cp850Doubled {
+            return self.decode(bytes);
+        }
+        let mut buffered = std::mem::take(carry);
+        buffered.extend_from_slice(bytes);
+        let split = buffered.len() - held_back(&buffered);
+        carry.extend_from_slice(&buffered[split..]);
+        self.decode(&buffered[..split])
+    }
+
     /// Converts incoming bytes to UTF-8 for the parser.
     ///
     /// Single-byte encodings have no multi-byte sequences, so a chunk boundary
-    /// can never split a character — the caller may pass whatever the PTY read
-    /// returned without buffering.
+    /// can never split a character. The one that can is the repair, which reads
+    /// UTF-8 — see [`Encoding::decode_chunk`] for the streaming form.
     pub fn decode(self, bytes: &[u8]) -> Vec<u8> {
         // Pure ASCII is identical in every encoding here, and is the
         // overwhelming majority of output.
@@ -133,8 +159,9 @@ impl Encoding {
     /// A character with no representation in the target codepage becomes `?`,
     /// matching what a real terminal does rather than dropping it silently.
     pub fn encode(self, text: &str) -> Vec<u8> {
-        // Input is never double-encoded: we type what IRIS should receive, and
-        // the mangling happens on its output path only.
+        if self == Encoding::Cp850Doubled {
+            return double_encode(text);
+        }
         if !self.is_single_byte() {
             return text.as_bytes().to_vec();
         }
@@ -149,6 +176,101 @@ impl Encoding {
         }
         out
     }
+}
+
+/// Each byte IRIS should receive, carried as the CP850 glyph the console will
+/// turn back into that byte.
+///
+/// The mirror image of [`repair_double_encoding`]: the console converts what it
+/// is given to its codepage before IRIS reads it, so the way to hand IRIS the
+/// UTF-8 byte `c3` is to send the character CP850 keeps at `c3`. ASCII is
+/// already itself in both, which is what leaves every escape sequence and
+/// control code alone.
+fn double_encode(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut buf = [0u8; 4];
+    for &byte in text.as_bytes() {
+        if byte < 0x80 {
+            out.push(byte);
+        } else {
+            let ch = CP850_HIGH[(byte - 0x80) as usize];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// How many bytes at the end of `bytes` have to wait for the next read.
+///
+/// Two things can be cut in half by a read boundary. The UTF-8 encoding of a
+/// character is one. The other is the run of characters that carries a repaired
+/// one: `├` is a whole character and a whole run, but the byte it stands for -
+/// `c3` - is only the first half of `ó`, so it has to wait for the `│` that
+/// finishes it.
+///
+/// At most a character and three of those, since the widest thing being
+/// reassembled is four bytes.
+fn held_back(bytes: &[u8]) -> usize {
+    let partial = incomplete_tail(bytes);
+    let text = String::from_utf8_lossy(&bytes[..bytes.len() - partial]);
+
+    // The trailing run of non-ASCII characters, in order, at most three.
+    let mut tail: Vec<char> = Vec::new();
+    for ch in text.chars().rev() {
+        if (ch as u32) < 0x80 || tail.len() == 3 {
+            break;
+        }
+        tail.push(ch);
+    }
+    tail.reverse();
+
+    // The bytes they stand for. A character with no CP850 byte - a replacement
+    // character, or genuine box drawing this is not going to repair - means
+    // there is nothing here waiting to be finished.
+    let mapped: Option<Vec<u8>> = tail
+        .iter()
+        .map(|ch| {
+            CP850_HIGH
+                .iter()
+                .position(|c| c == ch)
+                .map(|i| 0x80 + i as u8)
+        })
+        .collect();
+    let keep = mapped.map_or(0, |bytes| incomplete_tail(&bytes));
+
+    let held: usize = tail[tail.len() - keep..]
+        .iter()
+        .map(|ch| ch.len_utf8())
+        .sum();
+    partial + held
+}
+
+/// How many bytes at the end of `bytes` are the start of a UTF-8 sequence that
+/// has not all arrived yet.
+///
+/// At most three: a sequence is four bytes at the widest. Anything that is not
+/// a truncated sequence counts as nothing to hold back, so malformed input is
+/// handed to the decoder rather than accumulating here forever.
+fn incomplete_tail(bytes: &[u8]) -> usize {
+    for back in 1..=3.min(bytes.len()) {
+        let byte = bytes[bytes.len() - back];
+        // Continuation bytes are 10xxxxxx; anything else is a lead byte and
+        // decides how long its sequence is.
+        if byte & 0b1100_0000 == 0b1000_0000 {
+            continue;
+        }
+        let width = match byte {
+            0x00..=0x7f => 1,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            // A stray continuation or an invalid lead: not a truncated
+            // sequence, so there is nothing to wait for.
+            _ => return 0,
+        };
+        return if back < width { back } else { 0 };
+    }
+    0
 }
 
 /// Undoes one extra CP850 -> UTF-8 translation layer.
@@ -354,13 +476,84 @@ mod tests {
         }
     }
 
-    /// Typing is unaffected: only IRIS's output path is mangled.
+    /// Typing travels the same road as the output, in reverse. A probe of the
+    /// live instance settled it: `ó` sent as plain UTF-8 arrives as character
+    /// 63 (`?`), and sent as the CP850 glyphs for its two UTF-8 bytes arrives
+    /// as character 243, which is `ó`.
     #[test]
-    fn repair_mode_sends_input_as_plain_utf8() {
+    fn typing_is_encoded_the_way_the_console_will_read_it() {
+        // `ó` is c3 b3 in UTF-8; CP850 keeps `├` at c3 and `│` at b3.
+        assert_eq!(Encoding::Cp850Doubled.encode("ó"), "├│".as_bytes().to_vec());
+        // ASCII is itself, so commands and escape sequences are untouched.
         assert_eq!(
-            Encoding::Cp850Doubled.encode("Instância"),
-            "Instância".as_bytes().to_vec()
+            Encoding::Cp850Doubled.encode("write 1\r"),
+            b"write 1\r".to_vec()
         );
+    }
+
+    /// The two halves are one channel: what the terminal sends comes back the
+    /// way it went out.
+    #[test]
+    fn the_console_round_trip_returns_what_was_typed() {
+        for text in ["Instância", "não", "Configuração", "ó", "ASCII only"] {
+            let sent = Encoding::Cp850Doubled.encode(text);
+            let back = Encoding::Cp850Doubled.decode(&sent);
+            assert_eq!(String::from_utf8_lossy(&back), text, "round trip of {text}");
+        }
+    }
+
+    /// Every byte has exactly one glyph to travel as, or the round trip would
+    /// be ambiguous.
+    #[test]
+    fn the_cp850_table_maps_each_byte_to_a_character_of_its_own() {
+        let mut seen: Vec<char> = CP850_HIGH.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), CP850_HIGH.len(), "two bytes share a character");
+    }
+
+    /// A PTY read can end anywhere, including inside the three bytes of `├`.
+    /// The repair reads whole characters, so the tail waits for the rest.
+    #[test]
+    fn a_character_split_across_two_reads_survives() {
+        let whole = "N├│: ok".as_bytes();
+        for split in 1..whole.len() {
+            let mut carry = Vec::new();
+            let mut out = Encoding::Cp850Doubled.decode_chunk(&whole[..split], &mut carry);
+            out.extend(Encoding::Cp850Doubled.decode_chunk(&whole[split..], &mut carry));
+            assert!(carry.is_empty(), "bytes left behind at split {split}");
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                "Nó: ok",
+                "split after {split} bytes"
+            );
+        }
+    }
+
+    /// Malformed input must not sit in the carry buffer waiting for a
+    /// continuation that is never coming.
+    #[test]
+    fn a_stray_byte_is_never_held_back() {
+        let mut carry = Vec::new();
+        let out = Encoding::Cp850Doubled.decode_chunk(&[b'a', 0xff], &mut carry);
+        assert!(carry.is_empty());
+        assert_eq!(out.first(), Some(&b'a'));
+    }
+
+    /// Nor may a run that is already complete: output that ends on an accent
+    /// has to reach the screen without waiting for whatever comes next.
+    #[test]
+    fn a_finished_run_is_not_held_back() {
+        let mut carry = Vec::new();
+        let out = Encoding::Cp850Doubled.decode_chunk("N├│".as_bytes(), &mut carry);
+        assert!(carry.is_empty(), "the accent was left waiting");
+        assert_eq!(String::from_utf8_lossy(&out), "Nó");
+
+        // Genuine box drawing is not half of anything either.
+        let mut carry = Vec::new();
+        let out = Encoding::Cp850Doubled.decode_chunk("┌──┐".as_bytes(), &mut carry);
+        assert!(carry.is_empty());
+        assert_eq!(String::from_utf8_lossy(&out), "┌──┐");
     }
 
     #[test]

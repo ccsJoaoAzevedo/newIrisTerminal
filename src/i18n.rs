@@ -327,7 +327,7 @@ const PT_BR: &[(&str, &str)] = &[
     // Encodings. The name of a codepage is not language; what the label says
     // about it is.
     ("CP850 (DOS Western)", "CP850 (DOS Ocidental)"),
-    ("UTF-8 double-encoded via CP850 (repair)", "UTF-8 codificado em dobro via CP850 (correção)"),
+    ("Windows console (CP850 round trip)", "Console do Windows (ida e volta por CP850)"),
     ("Class", "Classe"),
 
     // Export.

@@ -264,6 +264,9 @@ pub struct Tab {
     /// newest candidate. Per session, so recalling in one pane does not move
     /// another.
     pub recall_step: Option<usize>,
+    /// Bytes of an incomplete character held back from the last PTY read. See
+    /// [`crate::term::Encoding::decode_chunk`].
+    decode_carry: Vec<u8>,
     /// When a clear-screen was asked of IRIS, so a purge that never arrives can
     /// be called off. See [`Tab::request_clear`].
     clear_asked: Option<std::time::Instant>,
@@ -298,6 +301,7 @@ impl Tab {
             namespace: None,
             commands: Vec::new(),
             recall_step: None,
+            decode_carry: Vec::new(),
             clear_asked: None,
             ended: false,
             error: None,
@@ -460,8 +464,12 @@ impl Tab {
             }
 
             // IRIS speaks a configurable codepage; transcode before the parser,
-            // which assumes UTF-8. Escape sequences are ASCII either way.
-            let decoded = self.profile.encoding.decode(&bytes);
+            // which assumes UTF-8. Escape sequences are ASCII either way. Read
+            // by read, because a character can be split across two of them.
+            let decoded = self
+                .profile
+                .encoding
+                .decode_chunk(&bytes, &mut self.decode_carry);
             let replies = crate::term::parser::advance(&mut self.parser, &mut self.grid, &decoded);
             if !replies.is_empty() {
                 let _ = session.write(&replies);
