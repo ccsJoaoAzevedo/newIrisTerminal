@@ -253,7 +253,7 @@ pub fn launch(path: &Path) -> Result<()> {
             .args(["-e", &script])
             .spawn()
             .context("starting claude in Terminal.app")?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
