@@ -253,6 +253,25 @@ mod windows {
         }
     }
 
+    /// One argument, safe to put in a command line `cmd` will parse.
+    ///
+    /// `^` is the character cmd escapes with, and an IRIS routine name starts
+    /// with one: a profile set to run `^MYROUTINE` would otherwise have the
+    /// caret eaten on the way through. Quoting is not the alternative it looks
+    /// like - the command builder escapes a quote in a way cmd does not
+    /// understand - so every character cmd would act on gets a caret of its
+    /// own.
+    fn escape_for_cmd(arg: &str) -> String {
+        let mut out = String::with_capacity(arg.len());
+        for ch in arg.chars() {
+            if matches!(ch, '^' | '&' | '|' | '<' | '>' | '(' | ')' | '"') {
+                out.push('^');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     /// The command that opens a session, with the console put into UTF-8
     /// first.
     ///
@@ -281,6 +300,7 @@ mod windows {
 
         let args = std::iter::once(spec.instance.clone())
             .chain(session_args(spec))
+            .map(|arg| escape_for_cmd(&arg))
             .collect::<Vec<_>>()
             .join(" ");
         let mut cmd = CommandBuilder::new("cmd.exe");
@@ -325,6 +345,16 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A routine name is the reason the escaping exists: `^MYROUTINE`
+        /// reaches IRIS whole only if the caret survives cmd's own parsing.
+        #[test]
+        fn cmd_metacharacters_are_escaped_in_a_session_argument() {
+            assert_eq!(escape_for_cmd("^MYROUTINE"), "^^MYROUTINE");
+            assert_eq!(escape_for_cmd("^%CSW1GEN"), "^^%CSW1GEN");
+            assert_eq!(escape_for_cmd("CONSISTEM"), "CONSISTEM");
+            assert_eq!(escape_for_cmd("a&b|c>d"), "a^&b^|c^>d");
+        }
 
         #[test]
         fn parses_instance_names_from_iris_list() {
