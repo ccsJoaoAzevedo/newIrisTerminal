@@ -91,21 +91,21 @@ fn identify_the_encoding_that_renders_portuguese_correctly() {
     );
 }
 
-/// What IRIS actually receives when the terminal types an accented character.
+/// Everything a session has to get right about accented text, end to end,
+/// through the app's own launch path.
 ///
-/// The output half of this is understood - the banner arrives double-encoded,
-/// because the pseudo-console converts the instance's UTF-8 to the console
-/// codepage and back. The input half has to travel the same road in reverse,
-/// and this is the probe that says which spelling comes out the other end as
-/// the character the user pressed.
-///
-/// `$L` and `$A` are the evidence: for a correctly received `ó`, IRIS reports a
-/// length of 1 and character code 243. Two characters, or 195, means it got the
-/// raw UTF-8 bytes instead.
+/// This is the test that would have caught all three faces of one bug. A
+/// Windows pseudo-console starts on the machine's OEM codepage and re-encodes
+/// whatever crosses it: the banner arrived as `N├│`, a typed `ó` reached IRIS
+/// as `?`, and the accent cost a column that only IRIS counted - so every
+/// repaint of a recalled line landed one column to the right and left a
+/// character of the old line behind, stacking up an `s` per visit. Opening the
+/// session with the console in UTF-8 settles all three at once.
 #[test]
 #[ignore = "needs a local IRIS instance"]
-fn report_what_iris_receives_for_a_typed_accent() {
+fn a_session_speaks_utf8_end_to_end() {
     use new_iris_terminal::pty::Session;
+    use new_iris_terminal::term::lineedit;
 
     let instance = std::env::var("IRIS_TEST_INSTANCE")
         .ok()
@@ -121,73 +121,95 @@ fn report_what_iris_receives_for_a_typed_accent() {
 
     let mut grid = Grid::new(80, 24, 500);
     let mut vte = vte::Parser::new();
-    let pump = |session: &mut Session, grid: &mut Grid, vte: &mut vte::Parser, ms: u64| {
-        let deadline = Instant::now() + Duration::from_millis(ms);
-        while Instant::now() < deadline {
-            let (bytes, _) = session.drain();
-            if !bytes.is_empty() {
-                let replies = parser::advance(vte, grid, &Encoding::Cp850Doubled.decode(&bytes));
-                if !replies.is_empty() {
-                    let _ = session.write(&replies);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
-    pump(&mut session, &mut grid, &mut vte, 4000);
+    let mut raw: Vec<u8> = Vec::new();
 
-    // `ó` on its own: one character IRIS can report the code of.
-    let text = "ó";
-    let candidates: [(&str, Vec<u8>); 4] = [
-        // What the app itself now sends.
-        ("app encode", Encoding::Cp850Doubled.encode(text)),
-        ("plain UTF-8", text.as_bytes().to_vec()),
-        // Each byte IRIS should receive, carried as the CP850 glyph the
-        // pseudo-console will turn back into that byte.
-        ("CP850-doubled", Encoding::Cp850.decode(text.as_bytes())),
-        ("raw CP850", Encoding::Cp850.encode(text)),
-    ];
-    assert_eq!(
-        Encoding::Cp850Doubled.encode(text),
-        Encoding::Cp850.decode(text.as_bytes()),
-        "the app's encode is the mirror of the repair"
+    macro_rules! pump {
+        ($ms:expr) => {{
+            let deadline = Instant::now() + Duration::from_millis($ms);
+            while Instant::now() < deadline {
+                let (bytes, _) = session.drain();
+                if !bytes.is_empty() {
+                    raw.extend_from_slice(&bytes);
+                    // The default encoding, which is no transcoding at all.
+                    let decoded = Encoding::default().decode(&bytes);
+                    let replies = parser::advance(&mut vte, &mut grid, &decoded);
+                    if !replies.is_empty() {
+                        let _ = session.write(&replies);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }};
+    }
+    let row = |grid: &Grid| grid.screen_text()[grid.cursor.row].trim_end().to_string();
+    let send = |session: &Session, text: &str| {
+        let _ = session.write(&Encoding::default().encode(text));
+    };
+
+    pump!(9000);
+    let screen = grid.screen_text().join("\n");
+    assert!(
+        screen.contains("Nó:") && screen.contains("Configuração:"),
+        "the banner did not arrive as Portuguese:\n{screen}"
+    );
+    assert!(
+        !raw.windows(3).any(|w| w == [0xe2, 0x94, 0x9c]),
+        "the console is still re-encoding: the banner carries box-drawing debris"
     );
 
-    for (name, bytes) in candidates {
-        // Read-only: a length and a character code, nothing written anywhere.
-        let _ = session.write(b"s x=\"");
-        let _ = session.write(&bytes);
-        let _ = session.write(b"\" w \"len=\",$L(x),\" code=\",$A(x,1),!\r");
-        pump(&mut session, &mut grid, &mut vte, 1500);
-        let line = grid
-            .screen_text()
-            .into_iter()
-            .rev()
-            .find(|l| l.contains("len="))
-            .unwrap_or_default();
-        println!("{name:>14}: {}", line.trim());
+    // The process reported is the session, not the shell that set the codepage.
+    if let Session::Pty(pty) = &session {
+        let pid = pty.process_id().expect("a process id");
+        assert!(pid > 0);
     }
 
-    // A whole word, through the same path the keyboard and a paste take: what
-    // IRIS writes back has to read as what was typed.
-    let word = "Configuração não";
-    let _ = session.write(b"w \"");
-    let _ = session.write(&Encoding::Cp850Doubled.encode(word));
-    let _ = session.write(b"\",!\r");
-    pump(&mut session, &mut grid, &mut vte, 1500);
-    let echoed = grid
+    // A typed accent reaches IRIS as one character, and as the right one.
+    send(
+        &session,
+        "s x=\"ó\" w \"len=\",$L(x),\" code=\",$A(x,1),!\r",
+    );
+    pump!(1500);
+    let reported = grid
         .screen_text()
         .into_iter()
         .rev()
-        .find(|l| l.trim().starts_with(word))
+        .find(|l| l.contains("len="))
         .unwrap_or_default();
-    println!("{:>14}: {}", "written back", echoed.trim());
+    assert!(
+        reported.contains("len=1") && reported.contains("code=243"),
+        "IRIS did not receive the accent: {reported:?}"
+    );
 
-    println!("\n--- screen ---");
-    for line in grid.screen_text() {
-        if !line.trim().is_empty() {
-            println!("{}", line.trim_end());
+    // And a recall over an accented line replaces it exactly, however many
+    // times it is walked past. The wire is the one `App::recall` builds.
+    let accented = r#"set a="nó""#;
+    send(&session, accented);
+    send(&session, "\r");
+    pump!(900);
+    send(&session, "set b=1");
+    send(&session, "\r");
+    pump!(900);
+
+    for round in 1..=3 {
+        for command in [accented, "set b=1"] {
+            let line = lineedit::current(&grid).expect("a command line");
+            let mut wire: Vec<u8> = Vec::new();
+            wire.extend(std::iter::repeat_n(0x7f, line.len()));
+            wire.extend_from_slice(&Encoding::default().encode(command));
+            let _ = session.write(&wire);
+            pump!(700);
+            let shown = row(&grid);
+            assert!(
+                shown.ends_with(command) && !shown.contains(&format!("s{command}")),
+                "round {round}: recalling {command:?} left {shown:?}"
+            );
         }
     }
+
+    // Leave the prompt as it was found.
+    for _ in 0..60 {
+        let _ = session.write(&[0x7f]);
+    }
+    pump!(400);
     session.request_halt();
 }

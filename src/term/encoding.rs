@@ -4,6 +4,15 @@
 //! local 2025.1 instance (`tests/encoding_probe.rs`) confirmed the session
 //! stream is valid UTF-8 end to end, so [`Encoding::Utf8`] is the default.
 //!
+//! It is the default again, rather than for the first time. A Windows
+//! pseudo-console starts on the machine's OEM codepage and re-encodes
+//! everything that crosses it, which turned `Nó` into `├│` and a typed `ó` into
+//! `?`; [`Encoding::Cp850Doubled`] was the answer to that. Sessions are now
+//! opened with the console put into UTF-8 instead - see
+//! `crate::pty::launcher` - which is the better answer, because the re-encoding
+//! also cost a column per accent that only the far side counted, and no repair
+//! on this side could put that back.
+//!
 //! The single-byte codepages remain because older Caché and IRIS instances,
 //! and instances with a non-UTF-8 I/O translation table configured, do emit
 //! CP850 or Windows-1252. Getting this wrong is not an error — it silently
@@ -18,8 +27,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Encoding {
-    /// Pass bytes through untouched and let `vte` decode them. Correct for an
-    /// instance whose output translation is configured properly.
+    /// Pass bytes through untouched and let `vte` decode them. What a session
+    /// speaks once the console is out of the way, and the default.
+    #[default]
     Utf8,
     /// Western European DOS codepage, as emitted by older Caché/IRIS instances
     /// on Windows in Latin-script locales.
@@ -43,10 +53,9 @@ pub enum Encoding {
     /// what a probe of the live instance reports. Sending the CP850 glyph for
     /// each byte IRIS should receive is what gets `ó` there intact.
     ///
-    /// This is the default: the guards in `repair_double_encoding` make the
-    /// output half a no-op on a console that is not translating, and a session
-    /// reached without one — Telnet — is opened as [`Encoding::Utf8`].
-    #[default]
+    /// For a session that reaches a console this app did not open, or one
+    /// where `chcp` did not take: nothing here needs it otherwise, and it can
+    /// undo the characters the re-encoding costs but not the column.
     Cp850Doubled,
 }
 

@@ -32,6 +32,14 @@ pub struct PtySession {
     /// Set once the reader observes EOF, so `is_alive` does not have to poll
     /// the child on every frame.
     closed: Arc<AtomicBool>,
+    /// The session was started through a shell that puts the console into
+    /// UTF-8 first, so the child owned here is that shell and the process worth
+    /// reporting is the one under it. See `launcher::windows::session_command`.
+    wrapped: bool,
+    /// That process, once it has been found. Looked up lazily and remembered:
+    /// it does not exist yet when the shell is spawned, and the menu bar asks
+    /// for it every frame.
+    session_pid: std::cell::Cell<Option<u32>>,
     cols: u16,
     rows: u16,
 }
@@ -60,6 +68,17 @@ impl PtySession {
             .context("opening a pseudo-terminal")?;
 
         let cmd = launcher.command(spec)?;
+        // Whether the command is the session itself or a shell in front of it.
+        let wrapped = cmd
+            .get_argv()
+            .first()
+            .map(|program| {
+                program
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .ends_with("cmd.exe")
+            })
+            .unwrap_or(false);
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -85,6 +104,8 @@ impl PtySession {
             child,
             events: rx,
             closed,
+            wrapped,
+            session_pid: std::cell::Cell::new(None),
             cols,
             rows,
         })
@@ -145,8 +166,23 @@ impl PtySession {
     }
 
     /// Operating-system process id of the session, while it is running.
+    ///
+    /// The process the user means, which is not always the child this owns: a
+    /// session opened through a shell that sets the console codepage is the
+    /// shell's child, and the shell's own id would say nothing.
     pub fn process_id(&self) -> Option<u32> {
-        self.child.process_id()
+        let own = self.child.process_id()?;
+        if !self.wrapped {
+            return Some(own);
+        }
+        if let Some(known) = self.session_pid.get() {
+            return Some(known);
+        }
+        let found = session_under(own);
+        self.session_pid.set(found);
+        // Nothing under the shell yet: it is still starting, and saying
+        // nothing is better than naming the shell.
+        found
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -298,6 +334,70 @@ impl Session {
             Session::Telnet(s) => s.kill(),
         }
     }
+}
+
+/// The process a shell started, on the platforms where sessions are opened
+/// through one.
+#[cfg(windows)]
+fn session_under(shell: u32) -> Option<u32> {
+    /// `PROCESSENTRY32W`, field for field.
+    #[repr(C)]
+    struct ProcessEntry {
+        size: u32,
+        usage: u32,
+        pid: u32,
+        default_heap: usize,
+        module: u32,
+        threads: u32,
+        parent: u32,
+        priority: i32,
+        flags: u32,
+        exe: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+        fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry) -> i32;
+        fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const SNAP_PROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE: isize = -1;
+
+    // Safety: the snapshot is closed on every path out, and the entry is a
+    // plain struct the API only ever writes into.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(SNAP_PROCESS, 0);
+        if snapshot == INVALID_HANDLE {
+            return None;
+        }
+        let mut entry: ProcessEntry = std::mem::zeroed();
+        entry.size = std::mem::size_of::<ProcessEntry>() as u32;
+        let mut found = None;
+        let mut more = Process32FirstW(snapshot, &mut entry);
+        while more != 0 {
+            if entry.parent == shell {
+                let end = entry.exe.iter().position(|c| *c == 0).unwrap_or(0);
+                let name = String::from_utf16_lossy(&entry.exe[..end]).to_lowercase();
+                // The session itself, rather than anything else the shell may
+                // have run on its way there.
+                if name.starts_with("irissession") || name.starts_with("csession") {
+                    found = Some(entry.pid);
+                    break;
+                }
+                found.get_or_insert(entry.pid);
+            }
+            more = Process32NextW(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+#[cfg(not(windows))]
+fn session_under(_shell: u32) -> Option<u32> {
+    None
 }
 
 fn spawn_reader(

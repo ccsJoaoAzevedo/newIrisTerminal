@@ -141,13 +141,19 @@ organisation entries first, and saving only ever writes the personal file.
 
 ### Encoding
 
-Defaults to **UTF-8 double-encoded via CP850 (repair)**, because that is what
-the instances here need: some IRIS configurations translate output to UTF-8 and
-then run the result through CP850 → UTF-8 again, so `Configuração` arrives as
-`Configura├º├úo`. The repair only converts a run of non-ASCII bytes that both
-form valid UTF-8 and decode to ordinary Latin text, so genuine box drawing
-passes through untouched. Plain UTF-8, CP850, Windows-1252 and ISO 8859-1 are
-selectable per profile.
+Defaults to **UTF-8**, because a session is opened with the console put into
+UTF-8 first. That matters more than it sounds: a Windows pseudo-console starts
+on the machine's OEM codepage and re-encodes everything crossing it, so
+`Configuração` arrived as `Configura├º├úo`, a typed `ó` reached IRIS as `?`, and
+each accent cost a column that only IRIS counted → which left a character of
+the old line behind every time it repainted a recalled command. `chcp 65001` in
+front of the session settles all three.
+
+**Windows console (CP850 round trip)** is the repair for a session that reaches
+a console this app did not open: it maps each character back to the byte it
+stood for, in both directions, and only converts a run that decodes to ordinary
+Latin text so genuine box drawing passes through untouched. Plain UTF-8, CP850,
+Windows-1252 and ISO 8859-1 are selectable per profile.
 
 To see which one your instance needs:
 

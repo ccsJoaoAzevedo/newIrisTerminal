@@ -90,20 +90,26 @@ pub fn launcher() -> Box<dyn IrisLauncher + Send + Sync> {
     }
 }
 
-/// Applies the settings every platform shares: namespace, routine, and the
-/// environment a well-behaved terminal is expected to advertise.
-fn finish(mut cmd: CommandBuilder, spec: &LaunchSpec) -> CommandBuilder {
+/// The arguments a session takes after the instance name: the namespace to
+/// open in, and a routine to run instead of the prompt.
+fn session_args(spec: &LaunchSpec) -> Vec<String> {
+    let mut args = Vec::new();
     if let Some(ns) = spec.namespace.as_deref().filter(|s| !s.is_empty()) {
-        cmd.arg("-U");
-        cmd.arg(ns);
+        args.push("-U".to_string());
+        args.push(ns.to_string());
     }
     if let Some(routine) = spec.routine.as_deref().filter(|s| !s.is_empty()) {
-        cmd.arg(routine);
+        args.push(routine.to_string());
     }
-    // We implement a VT102-compatible subset; claiming xterm would invite
-    // sequences (mouse, alt-screen) the grid does not model.
+    args
+}
+
+/// The environment a well-behaved terminal is expected to advertise.
+///
+/// We implement a VT102-compatible subset; claiming xterm would invite
+/// sequences (mouse, alt-screen) the grid does not model.
+fn announce_terminal(cmd: &mut CommandBuilder) {
     cmd.env("TERM", "vt100");
-    cmd
 }
 
 /// Locates a binary by trying an explicit override, then a list of candidate
@@ -239,10 +245,59 @@ mod windows {
             )
             .context("locating irissession.exe")?;
 
+            // The arguments are already inside the command line `cmd` runs,
+            // so only the environment is left to apply.
+            let mut cmd = session_command(&exe, spec);
+            announce_terminal(&mut cmd);
+            Ok(cmd)
+        }
+    }
+
+    /// The command that opens a session, with the console put into UTF-8
+    /// first.
+    ///
+    /// A pseudo-console starts on the machine's OEM codepage, and IRIS speaks
+    /// UTF-8: the console reads the instance's bytes as CP850 and re-encodes
+    /// them, so `Nó` arrives as `├│`, a typed `ó` reaches IRIS as `?`, and the
+    /// accent costs a column that only one side of the connection knows about -
+    /// which is what left a character behind every time IRIS repainted a
+    /// recalled line by absolute position. `chcp 65001` in front of the session
+    /// settles all three: the bytes pass through untouched and both sides count
+    /// the same columns.
+    ///
+    /// `cmd` is the only way to run two commands in one console, and it takes
+    /// the program name unquoted - the escaping a command builder applies to a
+    /// quoted path is not something `cmd` understands. So the name is bare and
+    /// the directory it lives in goes on PATH, which works whatever spaces the
+    /// path has.
+    fn session_command(exe: &Path, spec: &LaunchSpec) -> CommandBuilder {
+        let (Some(name), Some(dir)) = (exe.file_name(), exe.parent()) else {
+            // Nothing to put on PATH, so there is nothing to wrap: start it
+            // directly and let the repair encoding cope.
             let mut cmd = CommandBuilder::new(exe);
             cmd.arg(&spec.instance);
-            Ok(finish(cmd, spec))
-        }
+            return cmd;
+        };
+
+        let args = std::iter::once(spec.instance.clone())
+            .chain(session_args(spec))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        // `/s` keeps cmd from applying its own quoting rules to what follows,
+        // and `>nul` keeps `chcp`'s "Active code page" line off the screen.
+        cmd.arg("/s");
+        cmd.arg("/c");
+        cmd.arg(format!(
+            "chcp 65001>nul & {} {args}",
+            name.to_string_lossy()
+        ));
+        let path = match std::env::var("PATH") {
+            Ok(existing) => format!("{};{existing}", dir.display()),
+            Err(_) => dir.display().to_string(),
+        };
+        cmd.env("PATH", path);
+        cmd
     }
 
     /// `iris list` prints one stanza per instance, headed by a quoted name.
@@ -374,7 +429,11 @@ mod unix {
                 cmd.arg("session");
             }
             cmd.arg(&spec.instance);
-            Ok(finish(cmd, spec))
+            for arg in session_args(spec) {
+                cmd.arg(arg);
+            }
+            announce_terminal(&mut cmd);
+            Ok(cmd)
         }
     }
 
