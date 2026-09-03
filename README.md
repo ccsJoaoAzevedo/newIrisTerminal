@@ -141,24 +141,34 @@ organisation entries first, and saving only ever writes the personal file.
 
 ### Encoding
 
-Defaults to **UTF-8**, because a session is opened with the console put into
-UTF-8 first. That matters more than it sounds: a Windows pseudo-console starts
-on the machine's OEM codepage and re-encodes everything crossing it, so
-`Configuração` arrived as `Configura├º├úo`, a typed `ó` reached IRIS as `?`, and
-each accent cost a column that only IRIS counted → which left a character of
-the old line behind every time it repainted a recalled command. `chcp 65001` in
-front of the session settles all three.
+A session has one character set, used to decode what arrives and to encode what
+is typed, and nothing translates a second time in between — the same rule PuTTY
+and IRISTerm keep. It has to hold in both directions: the terminal builds
+recall, Home, End and rubbing out a selection by counting the columns on screen
+and sending IRIS that many keys, so a character that costs IRIS two and the
+screen one puts every one of those gestures out by one per accent.
 
-**Windows console (CP850 round trip)** is the repair for a session that reaches
-a console this app did not open: it maps each character back to the byte it
-stood for, in both directions, and only converts a run that decodes to ordinary
-Latin text so genuine box drawing passes through untouched. Plain UTF-8, CP850,
-Windows-1252 and ISO 8859-1 are selectable per profile.
+**A local session is UTF-8, and there is nothing to choose.** It runs inside a
+Windows pseudo-console, which decodes the instance's bytes with its own codepage
+and re-encodes them as UTF-8 for the terminal — so the wire is UTF-8 whatever
+codepage the console is on, and nothing this side decodes could change that.
+What the codepage does decide is whether the bytes survive: on the machine's
+OEM codepage `Configuração` arrived as `Configura├º├úo` and a typed `ó` reached
+IRIS as `?`. Sessions are opened with `chcp 65001` in front of them, which is
+the only configuration in which accented text works in both directions.
 
-To see which one your instance needs:
+**A Telnet session is where the codepages are real**, because no console stands
+in the path and the socket carries the instance's own bytes. UTF-8, CP850,
+Windows-1252 and ISO 8859-1 are selectable per remote profile; an older Caché or
+IRIS, or one with a non-UTF-8 I/O translation table configured, needs one of the
+others. The setting only appears for a profile that opens a server.
+
+To see what your instance sends, and what the console does to it:
 
 ```sh
-cargo test --test live_charset -- --ignored --nocapture
+cargo test --test live_charset  -- --ignored --nocapture
+cargo test --test live_codepage -- --ignored --nocapture
+cargo test --test live_accents  -- --ignored --nocapture
 ```
 
 ## Versioning

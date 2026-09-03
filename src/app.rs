@@ -264,9 +264,6 @@ pub struct Tab {
     /// newest candidate. Per session, so recalling in one pane does not move
     /// another.
     pub recall_step: Option<usize>,
-    /// Bytes of an incomplete character held back from the last PTY read. See
-    /// [`crate::term::Encoding::decode_chunk`].
-    decode_carry: Vec<u8>,
     /// When a clear-screen was asked of IRIS, so a purge that never arrives can
     /// be called off. See [`Tab::request_clear`].
     clear_asked: Option<std::time::Instant>,
@@ -301,7 +298,6 @@ impl Tab {
             namespace: None,
             commands: Vec::new(),
             recall_step: None,
-            decode_carry: Vec::new(),
             clear_asked: None,
             ended: false,
             error: None,
@@ -463,13 +459,11 @@ impl Tab {
                 let _ = log.write_raw(&bytes);
             }
 
-            // IRIS speaks a configurable codepage; transcode before the parser,
-            // which assumes UTF-8. Escape sequences are ASCII either way. Read
-            // by read, because a character can be split across two of them.
-            let decoded = self
-                .profile
-                .encoding
-                .decode_chunk(&bytes, &mut self.decode_carry);
+            // A Telnet session can speak a codepage of its own; transcode
+            // before the parser, which assumes UTF-8. Escape sequences are
+            // ASCII either way, and a local session needs no transcoding at
+            // all - see `Profile::wire_encoding`.
+            let decoded = self.profile.wire_encoding().decode(&bytes);
             let replies = crate::term::parser::advance(&mut self.parser, &mut self.grid, &decoded);
             if !replies.is_empty() {
                 let _ = session.write(&replies);
@@ -478,7 +472,7 @@ impl Tab {
             // Autologon reads the decoded screen rather than raw bytes, so a
             // prompt split across two reads is still recognised.
             if let Some(to_send) = self.autologon.observe(&self.grid) {
-                let _ = session.write(&self.profile.encoding.encode(&to_send));
+                let _ = session.write(&self.profile.wire_encoding().encode(&to_send));
             }
 
             // Read after the parse, from the row the cursor is on: the prompt
@@ -532,7 +526,7 @@ impl Tab {
     /// Sends typed or pasted text, encoded into the instance's codepage.
     pub fn send_text(&self, text: &str) {
         if let Some(session) = self.session.as_ref() {
-            let _ = session.write(&self.profile.encoding.encode(text));
+            let _ = session.write(&self.profile.wire_encoding().encode(text));
         }
     }
 
@@ -1970,7 +1964,7 @@ impl App {
             return;
         };
         let app_cursor = tab.grid.app_cursor_keys;
-        let encoding = tab.profile.encoding;
+        let encoding = tab.profile.wire_encoding();
         let walked_to = tab.recall_step;
 
         let list = self.history.recall_list(&tab.commands);
@@ -2295,7 +2289,7 @@ impl App {
                 insert_down,
                 delete_down,
             };
-            (input_ctx, tab.profile.encoding)
+            (input_ctx, tab.profile.wire_encoding())
         };
         let mut action = input::translate(&events, &input_ctx);
 

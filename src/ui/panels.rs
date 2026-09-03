@@ -1465,25 +1465,34 @@ fn profiles_editor(
                 ));
             }
 
-            ui.horizontal(|ui| {
-                ui.label(tr("Encoding"));
-                egui::ComboBox::from_id_source(("encoding", index))
-                    .selected_text(tr(profile.encoding.label()))
-                    .show_ui(ui, |ui| {
-                        for enc in Encoding::ALL {
-                            if ui
-                                .selectable_label(profile.encoding == enc, tr(enc.label()))
-                                .clicked()
-                            {
-                                profile.encoding = enc;
-                                changed = true;
+            // Only a Telnet session has a charset to choose. A local one runs
+            // inside a pseudo-console, which hands the terminal UTF-8 whatever
+            // codepage it is on, so there is nothing here that could change it -
+            // offering the choice only invited a setting that costs a column
+            // per accent. See `Profile::wire_encoding`.
+            if profile.remote.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label(tr("Encoding"));
+                    egui::ComboBox::from_id_source(("encoding", index))
+                        .selected_text(tr(profile.encoding.label()))
+                        .show_ui(ui, |ui| {
+                            for enc in Encoding::ALL {
+                                if ui
+                                    .selectable_label(profile.encoding == enc, tr(enc.label()))
+                                    .clicked()
+                                {
+                                    profile.encoding = enc;
+                                    changed = true;
+                                }
                             }
-                        }
-                    });
-            });
-            ui.small(tr(
-                "Leave as UTF-8 unless accented characters come out wrong.",
-            ));
+                        });
+                });
+                ui.small(tr(
+                    "Leave as UTF-8 unless accented characters come out wrong.",
+                ));
+            } else {
+                ui.small(tr("A local session speaks UTF-8."));
+            }
 
             ui.separator();
             ui.horizontal(|ui| {

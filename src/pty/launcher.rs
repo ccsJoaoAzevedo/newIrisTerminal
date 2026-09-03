@@ -292,7 +292,11 @@ mod windows {
     fn session_command(exe: &Path, spec: &LaunchSpec) -> CommandBuilder {
         let (Some(name), Some(dir)) = (exe.file_name(), exe.parent()) else {
             // Nothing to put on PATH, so there is nothing to wrap: start it
-            // directly and let the repair encoding cope.
+            // directly and leave the console on whatever codepage it opened on.
+            // Accented text will not survive that, in either direction, and no
+            // decoding on this side can rescue it - see `crate::term::encoding`.
+            // Reachable only for a binary with neither a file name nor a
+            // parent directory, which is to say never.
             let mut cmd = CommandBuilder::new(exe);
             cmd.arg(&spec.instance);
             return cmd;

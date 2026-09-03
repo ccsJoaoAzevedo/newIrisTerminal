@@ -31,9 +31,12 @@ pub struct Profile {
     /// Non-standard install path, when discovery cannot find the binary.
     #[serde(default)]
     pub binary_override: Option<PathBuf>,
-    /// Character set IRIS speaks on this session. Wrong values show up as
-    /// mangled accented characters, not as an error, so it is per-profile
+    /// Character set IRIS speaks over Telnet on this session. Wrong values show
+    /// up as mangled accented characters, not as an error, so it is per-profile
     /// rather than guessed at.
+    ///
+    /// Only consulted for a remote profile — see [`Profile::wire_encoding`],
+    /// which is what the session actually reads and writes through.
     #[serde(default)]
     pub encoding: crate::term::Encoding,
     #[serde(default)]
@@ -130,6 +133,26 @@ impl Profile {
             Target::Telnet { address, port } => profile.remote = Some(Remote { address, port }),
         }
         profile
+    }
+
+    /// The character set of the bytes actually on this session's wire.
+    ///
+    /// A remote profile speaks whatever [`Profile::encoding`] says: the socket
+    /// carries the instance's own bytes and nothing translates them on the way.
+    /// A local one is UTF-8 whatever the profile says, because a pseudo-console
+    /// stands in the path and always hands the terminal UTF-8 — see
+    /// [`crate::term::encoding`], which measures that against a live instance.
+    ///
+    /// Reading it here rather than at each call site is what keeps a stale
+    /// value harmless. A profile that was remote and became local carries its
+    /// old codepage across, and a profile written by an earlier build carries
+    /// whatever that build put there; either would otherwise transcode a local
+    /// session that needs no transcoding, and cost a column per accent.
+    pub fn wire_encoding(&self) -> crate::term::Encoding {
+        match self.remote {
+            Some(_) => self.encoding,
+            None => crate::term::Encoding::Utf8,
+        }
     }
 
     /// Where this profile's session goes, in one line, for a tooltip or the
@@ -263,5 +286,48 @@ mod tests {
         assert_eq!(profile.logging, LogMode::Clean);
         assert_eq!(profile.username, "");
         assert!(!profile.autologon);
+    }
+
+    /// The bug this exists to make impossible: a codepage left over on a local
+    /// profile transcoded a session that needs no transcoding, and cost a
+    /// column per accent - which put recall, End and every rubout out by one.
+    /// A local session is UTF-8 whatever the profile carries.
+    #[test]
+    fn a_local_session_is_utf8_whatever_the_profile_says() {
+        use crate::term::Encoding;
+
+        // The case above is exactly how one gets here: preferences carry over
+        // from a Telnet base onto a local target.
+        let local = Profile::for_server(
+            &Server::for_instance("CONSISTEM"),
+            &instances(),
+            &telnet_base(),
+        );
+        assert!(local.remote.is_none());
+        assert_eq!(
+            local.encoding,
+            Encoding::Cp850,
+            "the setting is still there"
+        );
+        assert_eq!(
+            local.wire_encoding(),
+            Encoding::Utf8,
+            "but it must not reach the wire"
+        );
+
+        // A remote profile speaks what it is set to: the socket carries the
+        // instance's own bytes, with no console to have re-encoded them.
+        let remote = telnet_base();
+        assert!(remote.remote.is_some());
+        assert_eq!(remote.wire_encoding(), Encoding::Cp850);
+
+        // And every codepage, both ways, so this cannot rot into "Cp850 only".
+        for enc in Encoding::ALL {
+            let mut profile = telnet_base();
+            profile.encoding = enc;
+            assert_eq!(profile.wire_encoding(), enc, "remote {enc:?}");
+            profile.remote = None;
+            assert_eq!(profile.wire_encoding(), Encoding::Utf8, "local {enc:?}");
+        }
     }
 }
