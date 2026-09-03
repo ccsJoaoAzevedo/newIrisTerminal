@@ -301,26 +301,59 @@ pub fn prompt_end_of(cells: &[Cell]) -> Option<usize> {
     prompt_end_by(cells.len(), |i| cells[i].ch)
 }
 
-/// One forward pass: the head must be entirely made of prompt characters and
-/// end on an alphanumeric, both of which can be carried along as it goes.
-///
-/// The first `>` decides the row either way. `>` is not itself a prompt
-/// character, so a head that fails here still contains whatever spoiled it when
-/// a later `>` looks back over the same columns.
+/// The first `>` decides the row either way: everything before it is the
+/// prompt's head, which is a namespace and — once the process is stopped inside
+/// something — the program stack level IRIS appends to it.
 fn prompt_end_by(len: usize, at: impl Fn(usize) -> char) -> Option<usize> {
-    let mut prev_alphanumeric = false;
-    for i in 0..len {
-        let ch = at(i);
-        // `USER>`, `%SYS>`, and the `TL1:USER>` a transaction adds.
-        if ch == '>' {
-            return prev_alphanumeric.then_some(i + 1);
+    let close = (0..len).find(|&i| at(i) == '>')?;
+    // The one space a prompt may contain is the one before the stack level, so
+    // the head splits there: `COMP80 10f0>` is a namespace and a level, and
+    // `USER>` is a namespace on its own. A row with two spaces in its head
+    // fails below, because a space is not a namespace character.
+    match (0..close).rfind(|&i| at(i) == ' ') {
+        Some(space) => {
+            (is_namespace(space, &at) && is_stack_level(space + 1, close, &at)).then_some(close + 1)
         }
+        None => is_namespace(close, &at).then_some(close + 1),
+    }
+}
+
+/// Whether columns `..end` are a namespace as a prompt spells it: `USER`,
+/// `%SYS`, `RDB81-UL`, and the `TL1:USER` a transaction prefixes.
+///
+/// Must end on an alphanumeric, which is what keeps the `->` and `=>` of
+/// ordinary output from reading as prompts.
+fn is_namespace(end: usize, at: &impl Fn(usize) -> char) -> bool {
+    let mut prev_alphanumeric = false;
+    for i in 0..end {
+        let ch = at(i);
         if !(ch.is_ascii_alphanumeric() || matches!(ch, '%' | '^' | '_' | '-' | '.' | ':')) {
-            return None;
+            return false;
         }
         prev_alphanumeric = ch.is_ascii_alphanumeric();
     }
-    None
+    prev_alphanumeric
+}
+
+/// Whether columns `start..end` are the program stack level a break or an
+/// error leaves on the prompt — `2x0`, `7f0`, `10f0`, `3f2`.
+///
+/// A count, then a letter for what kind of frame the process stopped in, then
+/// a count again. Requiring the letter is what keeps a line of output that
+/// happens to end in `<number>>` from being read as a prompt.
+fn is_stack_level(start: usize, end: usize, at: &impl Fn(usize) -> char) -> bool {
+    if start >= end || !at(start).is_ascii_digit() {
+        return false;
+    }
+    let mut lettered = false;
+    for i in start..end {
+        let ch = at(i);
+        if !ch.is_ascii_alphanumeric() {
+            return false;
+        }
+        lettered |= ch.is_ascii_alphabetic();
+    }
+    lettered
 }
 
 /// End of the string starting at `open`, quote included.
@@ -798,5 +831,55 @@ mod tests {
                 (Kind::Number, "1".to_string()),
             ]
         );
+    }
+
+    /// The shapes of prompt IRIS actually hands out. `prompt_end` is what
+    /// decides whether a row is a command line at all, so a spelling missing
+    /// from here is a row where Home, End, Ctrl+A and clicking to move the
+    /// cursor all stop working.
+    #[test]
+    fn every_spelling_of_a_prompt_is_recognised() {
+        let end_of = |text: &str| {
+            let chars: Vec<char> = text.chars().collect();
+            prompt_end(&chars)
+        };
+
+        assert_eq!(end_of("USER>"), Some(5));
+        assert_eq!(end_of("%SYS>write 1"), Some(5));
+        assert_eq!(end_of("RDB81-UL>"), Some(9));
+        assert_eq!(end_of("TL1:USER>"), Some(9), "a transaction prefix");
+
+        // Stopped inside something: IRIS appends the program stack level, and
+        // the row is still a command line.
+        assert_eq!(end_of("COMP80 2x0>"), Some(11), "an Xecute frame");
+        assert_eq!(end_of("COMP80 7f0>"), Some(11), "a For frame");
+        assert_eq!(end_of("COMP80 10f0>"), Some(12), "a two-digit level");
+        assert_eq!(end_of("RDB81-UL 3f2>asdsadasdas"), Some(13));
+        assert_eq!(end_of("TL1:USER 2d0>"), Some(13), "both at once");
+    }
+
+    /// Output is not a prompt, however much of one it looks like. A false
+    /// prompt is worse than a missing one: the arrow keys IRIS is owed would
+    /// be swallowed and replayed against a line that is not being read.
+    #[test]
+    fn output_is_not_mistaken_for_a_prompt() {
+        let end_of = |text: &str| {
+            let chars: Vec<char> = text.chars().collect();
+            prompt_end(&chars)
+        };
+
+        assert_eq!(end_of("Global ^CSW1 selected"), None, "no `>` at all");
+        assert_eq!(end_of(">"), None, "nothing before it");
+        assert_eq!(end_of("x => 1"), None);
+        assert_eq!(end_of("<BREAK>zTest+3^Routine"), None);
+        // A space is only ever the one before a stack level, and a level is a
+        // count, a letter for the kind of frame, and a count.
+        assert_eq!(end_of("press enter to continue >"), None);
+        assert_eq!(end_of("total 25>"), None, "a number is not a level");
+        assert_eq!(end_of("USER x0>"), None, "a level starts with its count");
+        assert_eq!(end_of("a b 2x0>"), None, "two spaces");
+        assert_eq!(end_of("USER >"), None, "no level after the space");
+        assert_eq!(end_of(" 2x0>"), None, "no namespace before it");
+        assert_eq!(end_of("set x=a-b>c"), None);
     }
 }

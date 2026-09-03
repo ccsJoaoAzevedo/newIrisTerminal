@@ -188,7 +188,9 @@ pub fn current(grid: &Grid) -> Option<LineEdit> {
 ///
 /// `USER>` is the namespace on its own, and a transaction or an instance
 /// prefixes it - `TL1:USER>`, `IRIS:USER>` - so the last colon-separated piece
-/// is the namespace in every spelling of the prompt IRIS uses. `None` off a
+/// is the namespace in every spelling of the prompt IRIS uses. A break appends
+/// the program stack level after a space - `COMP80 2x0>` - and that is not part
+/// of the name either: the tab is still in the same namespace. `None` off a
 /// prompt row, which is what keeps a full-screen routine from being read as
 /// one.
 pub fn namespace(grid: &Grid) -> Option<String> {
@@ -201,7 +203,13 @@ pub fn namespace(grid: &Grid) -> Option<String> {
         .iter()
         .map(|c| c.ch)
         .collect();
-    let name = text.rsplit(':').next().unwrap_or_default().trim();
+    let name = text
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
     (!name.is_empty()).then(|| name.to_string())
 }
 
@@ -339,6 +347,32 @@ mod tests {
         assert_eq!(current(&grid).map(|l| l.start), Some(9));
     }
 
+    /// A break or an execution error leaves the process stopped inside
+    /// something, and IRIS puts the program stack level on the prompt:
+    /// `RDB81-UL 3f2>`. That is still a line being read, so everything built
+    /// on `current` - Home, End, Ctrl+A, the Ctrl+arrow motions, clicking to
+    /// put the cursor somewhere - has to keep working there.
+    #[test]
+    fn a_break_prompt_is_still_a_prompt() {
+        let grid = grid_with("RDB81-UL 3f2>asdsadasdas", 24);
+        let line = current(&grid).expect("a command line");
+        assert_eq!(line.start, 13);
+        assert_eq!(line.cursor, 24);
+        assert_eq!(line.end, 24);
+
+        // And the motions run over the typed part only, as at any prompt.
+        assert_eq!(target(&grid, line, 24, Motion::LineStart), 13);
+        assert_eq!(target(&grid, line, 13, Motion::LineEnd), 24);
+        assert_eq!(
+            target(&grid, line, 13, Motion::Left),
+            13,
+            "not into the level"
+        );
+
+        // The cursor inside the level is IRIS painting the prompt, not reading.
+        assert!(current(&grid_with("RDB81-UL 3f2>write 1", 10)).is_none());
+    }
+
     /// A full-screen routine paints rows that are not command lines, and its
     /// arrow keys have to reach IRIS untouched.
     #[test]
@@ -384,6 +418,11 @@ mod tests {
             namespace(&grid_with("TL1:USER>", 9)).as_deref(),
             Some("USER"),
             "a transaction prefix is not part of the namespace"
+        );
+        assert_eq!(
+            namespace(&grid_with("COMP80 2x0>", 11)).as_deref(),
+            Some("COMP80"),
+            "a break leaves the tab in the same namespace"
         );
         // Not a prompt row, so nothing to read.
         assert_eq!(namespace(&grid_with("Global ^CSW1 selected", 8)), None);
