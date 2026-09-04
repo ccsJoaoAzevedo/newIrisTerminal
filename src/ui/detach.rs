@@ -272,7 +272,16 @@ fn title_bar(
             }
             ui.add_space(6.0);
         }
-        ui.label(egui::RichText::new(title).strong());
+        // Visual only, and a handle for the window: see `chrome::drag_text`.
+        if let Some(asked) = chrome::drag_text(
+            ui,
+            egui::RichText::new(title).strong(),
+            true,
+            window,
+            "title",
+        ) {
+            action = Some(asked);
+        }
         // Claims the rest of the row for dragging either way; without it the
         // window could not be moved at all.
         if let Some(asked) = chrome::title_bar_controls(ui, buttons, !buttons.left, window) {

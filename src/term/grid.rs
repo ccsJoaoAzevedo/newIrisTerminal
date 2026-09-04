@@ -11,25 +11,27 @@ use super::cell::{Cell, Pen};
 /// A single line of the screen. `wrapped` records that this row continued onto
 /// the next one because the text ran past the right margin, which is the only
 /// way reflow-on-resize can tell a hard newline from a soft one.
-#[derive(Clone, Debug)]
+///
+/// A row holds only the columns something has been written to, however wide the
+/// terminal claims to be. That is what makes a margin of
+/// [`crate::ui::terminal_view::TERMINAL_COLS`] affordable: the width is
+/// reported to IRIS so that it does not truncate what it writes, and a column
+/// nobody has touched costs neither memory nor a pass of any per-frame scan.
+/// Every reader bounds itself by `cells.len()` or [`Row::used_width`].
+///
+/// The one thing it gives up: a region erased with a coloured background has no
+/// cells to carry the colour, so it is drawn in the theme background. The
+/// scrollback has always behaved that way - `push_scrollback` trims it - and
+/// nothing in IRIS paints with one.
+#[derive(Clone, Debug, Default)]
 pub struct Row {
     pub cells: Vec<Cell>,
     pub wrapped: bool,
 }
 
 impl Row {
-    pub fn new(cols: usize) -> Self {
-        Row {
-            cells: vec![Cell::default(); cols],
-            wrapped: false,
-        }
-    }
-
-    pub fn blank(cols: usize, pen: &Pen) -> Self {
-        Row {
-            cells: vec![Cell::blank(pen); cols],
-            wrapped: false,
-        }
+    pub fn new() -> Self {
+        Row::default()
     }
 
     /// The row as text, with trailing blanks trimmed. Used by logging, export,
@@ -40,8 +42,6 @@ impl Row {
             .map(|c| c.ch)
             .collect()
     }
-
-    // (see `Row::used_width` below)
 
     /// Columns up to and including the last non-blank cell.
     ///
@@ -54,14 +54,46 @@ impl Row {
             .map_or(0, |i| i + 1)
     }
 
-    fn resize(&mut self, cols: usize) {
-        self.cells.resize(cols, Cell::default());
+    /// Replaces the row with `text`, one column per character.
+    ///
+    /// How a row is built from a string rather than received from the parser -
+    /// which is what the tests want, and the only way to reach a column on a
+    /// row that has never been printed into.
+    pub fn set_text(&mut self, text: &str) {
+        self.cells.clear();
+        self.cells.extend(text.chars().map(|ch| Cell {
+            ch,
+            ..Cell::default()
+        }));
     }
 
-    /// Re-blanks the row in place, reusing its buffer. What `Row::blank` does
-    /// without the allocation, for the rows scrolling recycles.
-    fn reblank(&mut self, pen: &Pen) {
-        self.cells.fill(Cell::blank(pen));
+    /// Makes column `col` exist and hands it over, padding the gap with blanks
+    /// if the row had not reached that far.
+    fn reach(&mut self, col: usize) -> &mut Cell {
+        if self.cells.len() <= col {
+            self.cells.resize(col + 1, Cell::default());
+        }
+        &mut self.cells[col]
+    }
+
+    /// Whatever of `from..to` the row actually holds, for the erase operations.
+    /// Erasing past the end is a no-op: there is nothing there to blank, and
+    /// nothing is drawn there either.
+    fn existing(&mut self, from: usize, to: usize) -> Option<&mut [Cell]> {
+        let to = to.min(self.cells.len());
+        (from < to).then(|| &mut self.cells[from..to])
+    }
+
+    /// Clamps the row to a narrower terminal. Never pads: a row is as long as
+    /// what has been written into it.
+    fn narrow_to(&mut self, cols: usize) {
+        self.cells.truncate(cols);
+    }
+
+    /// Empties the row in place, keeping its buffer for the next thing printed
+    /// there. What the rows recycled by scrolling get.
+    fn reblank(&mut self) {
+        self.cells.clear();
         self.wrapped = false;
     }
 
@@ -74,6 +106,16 @@ impl Row {
         }
     }
 }
+
+/// How long after a resize a homing-and-erasing sweep is read as the
+/// pseudoconsole repainting rather than as a clear-screen.
+///
+/// The repaint arrives in the same read as the resize goes out, so this only
+/// has to cover the round trip. It lapses so that a resize on a connection that
+/// does *not* repaint - a Telnet session, where the far side is told the new
+/// size and says nothing back - cannot leave the next real clear-screen unable
+/// to file its screen into the transcript.
+pub(crate) const REPAINT_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A screen-clear caught in the act.
 ///
@@ -151,6 +193,10 @@ pub struct Grid {
     /// Set while a clear-screen is being carried out a row at a time. See
     /// [`ClearSweep`].
     clear: Option<ClearSweep>,
+    /// Until when a homing-and-erasing sweep is the pseudoconsole repainting
+    /// after a resize rather than a clear-screen. See
+    /// [`Grid::expect_repaint`].
+    repaint_until: Option<std::time::Instant>,
     /// Set by [`Grid::purge_history_on_next_clear`].
     purge_on_clear: bool,
     /// Bumped on every mutation so the UI can skip repainting an idle tab.
@@ -164,7 +210,7 @@ impl Grid {
         Grid {
             cols,
             rows,
-            screen: (0..rows).map(|_| Row::new(cols)).collect(),
+            screen: (0..rows).map(|_| Row::new()).collect(),
             scrollback: VecDeque::new(),
             scrollback_limit,
             cursor: Cursor {
@@ -182,6 +228,7 @@ impl Grid {
             widest: 0,
             pending_wrap: false,
             clear: None,
+            repaint_until: None,
             purge_on_clear: false,
             revision: 0,
         }
@@ -300,7 +347,7 @@ impl Grid {
         let (row, col) = (self.cursor.row, self.cursor.col);
         self.destroying_row(row);
         let cell = Cell::with_pen(ch, &self.pen);
-        self.screen[row].cells[col] = cell;
+        *self.screen[row].reach(col) = cell;
         self.widest = self.widest.max(col + 1);
 
         if col + 1 >= self.cols {
@@ -344,7 +391,6 @@ impl Grid {
         self.cancel_clear();
         let n = n.min(self.scroll_bottom - self.scroll_top + 1);
         let full_screen = self.scroll_top == 0 && self.scroll_bottom == self.rows - 1;
-        let pen = self.pen;
 
         // Rotating the region moves its top `n` rows to the bottom in one
         // pass, where they are recycled as the blank rows. The alternative -
@@ -353,10 +399,10 @@ impl Grid {
         self.screen[self.scroll_top..=self.scroll_bottom].rotate_left(n);
         for index in self.scroll_bottom + 1 - n..=self.scroll_bottom {
             if full_screen {
-                let row = std::mem::replace(&mut self.screen[index], Row::blank(self.cols, &pen));
+                let row = std::mem::replace(&mut self.screen[index], Row::new());
                 self.push_scrollback(row);
             } else {
-                self.screen[index].reblank(&pen);
+                self.screen[index].reblank();
             }
         }
         self.touch();
@@ -372,20 +418,18 @@ impl Grid {
     /// Pushes `top..=bottom` down by `n`, blanking the rows that opens at the
     /// top and dropping what falls off the bottom. Shared by SD and IL.
     fn open_lines_at(&mut self, top: usize, bottom: usize, n: usize) {
-        let pen = self.pen;
         self.screen[top..=bottom].rotate_right(n);
         for row in &mut self.screen[top..top + n] {
-            row.reblank(&pen);
+            row.reblank();
         }
     }
 
     /// Pulls `top..=bottom` up by `n`, blanking the rows that opens at the
     /// bottom. The inner-region half of [`Grid::scroll_up`], shared with DL.
     fn drop_lines_at(&mut self, top: usize, bottom: usize, n: usize) {
-        let pen = self.pen;
         self.screen[top..=bottom].rotate_left(n);
         for row in &mut self.screen[bottom + 1 - n..=bottom] {
-            row.reblank(&pen);
+            row.reblank();
         }
     }
 
@@ -394,12 +438,9 @@ impl Grid {
             return;
         }
         // Trailing blanks are padding, and a line of history is never printed
-        // into again, so they are dropped. It matters once the grid can be much
-        // wider than the window: at 240 columns, ten thousand lines of padding
-        // is tens of megabytes of spaces. Every reader bounds itself by
-        // `cells.len()` or `used_width()`, so a short row is safe; the one place
-        // that needs full width back is a row promoted to the screen by
-        // `resize`, which re-expands it.
+        // into again, so they are dropped. A screen row is no different - see
+        // [`Row`] - but it can still be holding blanks between two words, and
+        // history cannot.
         row.cells.truncate(row.used_width());
         self.scrollback.push_back(row);
         let over = self.scrollback.len().saturating_sub(self.scrollback_limit);
@@ -442,7 +483,6 @@ impl Grid {
     /// nothing left to scroll back to. Only mode 3 - the sequence whose whole
     /// purpose is to drop the history - actually throws it away.
     pub fn erase_in_display(&mut self, mode: u16) {
-        let pen = self.pen;
         let (row, col) = (self.cursor.row, self.cursor.col);
         match mode {
             0 => {
@@ -459,12 +499,12 @@ impl Grid {
                 }
                 self.erase_row_range(row, col, self.cols);
                 for r in row + 1..self.rows {
-                    self.screen[r] = Row::blank(self.cols, &pen);
+                    self.screen[r] = Row::new();
                 }
             }
             1 => {
                 for r in 0..row {
-                    self.screen[r] = Row::blank(self.cols, &pen);
+                    self.screen[r] = Row::new();
                 }
                 self.erase_row_range(row, 0, col + 1);
             }
@@ -478,7 +518,7 @@ impl Grid {
                     self.archive_screen();
                 }
                 for r in 0..self.rows {
-                    self.screen[r] = Row::blank(self.cols, &pen);
+                    self.screen[r] = Row::new();
                 }
             }
         }
@@ -491,12 +531,45 @@ impl Grid {
     /// begins. Nothing is captured yet: most homings are an app about to
     /// repaint, and the sweep is dropped again the moment it behaves like one.
     fn begin_clear(&mut self) {
+        // The pseudoconsole repainting itself after a resize, not a clear: it
+        // hands back the same screen it is erasing, so there is nothing to
+        // file away and filing it is what duplicated the screen.
+        //
+        // Unless a purge is armed, in which case the user has asked for a clear
+        // and whatever comes back is it - a resize a moment earlier must not
+        // leave Ctrl+Delete doing nothing.
+        if self.repainting() && !self.purge_on_clear {
+            return;
+        }
         if self.clear.is_none() {
             self.clear = Some(ClearSweep {
                 rows: vec![None; self.rows],
                 at: 0,
             });
         }
+    }
+
+    /// Notes that a repaint of the whole screen is about to arrive, so that it
+    /// is not mistaken for a clear-screen.
+    ///
+    /// A Windows pseudoconsole answers every resize by repainting: it homes the
+    /// cursor and rewrites the screen a row at a time, erasing each row as it
+    /// goes. That is character for character the shape of IRIS's own `W #` - see
+    /// [`ClearSweep`] - so the sweep filed the screen it was about to be handed
+    /// back into the transcript, and the repaint then landed underneath it.
+    /// Dragging the window taller duplicated everything on screen, once per
+    /// resize.
+    ///
+    /// Nothing is lost by declining to archive it: a repaint hands back the
+    /// same screen it destroys.
+    fn expect_repaint(&mut self) {
+        self.repaint_until = Some(std::time::Instant::now() + REPAINT_WINDOW);
+    }
+
+    /// Whether a sweep starting now is that repaint.
+    fn repainting(&self) -> bool {
+        self.repaint_until
+            .is_some_and(|until| std::time::Instant::now() < until)
     }
 
     fn cancel_clear(&mut self) {
@@ -620,10 +693,18 @@ impl Grid {
     fn erase_row_range(&mut self, row: usize, from: usize, to: usize) {
         self.destroying_row(row);
         let pen = self.pen;
-        let to = to.min(self.cols);
-        self.screen[row].cells[from..to].fill(Cell::blank(&pen));
-        if from == 0 && to == self.cols {
-            self.screen[row].wrapped = false;
+        // To the end of the line, which is what IRIS does on every keystroke of
+        // its own line editing: the tail is dropped rather than blanked, so the
+        // row goes back to being as long as what is left on it.
+        if to >= self.cols {
+            self.screen[row].cells.truncate(from);
+            if from == 0 {
+                self.screen[row].wrapped = false;
+            }
+            return;
+        }
+        if let Some(cells) = self.screen[row].existing(from, to) {
+            cells.fill(Cell::blank(&pen));
         }
     }
 
@@ -641,6 +722,15 @@ impl Grid {
         let cols = self.cols;
         let n = n.min(cols - col);
         let cells = &mut self.screen[row].cells;
+        // Nothing written at or after the cursor, so there is nothing to shift:
+        // inserting blanks into blanks leaves the row as it is.
+        if col >= cells.len() || n == 0 {
+            self.touch();
+            return;
+        }
+        // The tail has to have somewhere to go. What would be pushed past the
+        // margin is dropped, the way it is on a terminal of a fixed width.
+        cells.resize((cells.len() + n).min(cols), Cell::default());
         // Shifting the tail right in one rotate, rather than inserting a blank
         // and popping the last cell `n` times over.
         cells[col..].rotate_right(n);
@@ -650,13 +740,20 @@ impl Grid {
 
     /// DCH — delete `n` characters at the cursor, shifting the rest left.
     pub fn delete_chars(&mut self, n: usize) {
-        let pen = self.pen;
         let (row, col) = (self.cursor.row, self.cursor.col);
         let cols = self.cols;
         let n = n.min(cols - col);
         let cells = &mut self.screen[row].cells;
+        if col >= cells.len() || n == 0 {
+            self.touch();
+            return;
+        }
+        // The blanks a fixed-width terminal shifts in at the right margin are
+        // exactly the cells that stop existing here.
+        let n = n.min(cells.len() - col);
         cells[col..].rotate_left(n);
-        cells[cols - n..].fill(Cell::blank(&pen));
+        let keep = cells.len() - n;
+        cells.truncate(keep);
         self.touch();
     }
 
@@ -711,11 +808,8 @@ impl Grid {
     /// The part of a reset both spellings share: an empty screen, the default
     /// pen, a homed cursor and no leftover modes.
     fn blank_everything(&mut self) {
-        let cols = self.cols;
         for row in &mut self.screen {
-            row.cells.clear();
-            row.cells.resize(cols, Cell::default());
-            row.wrapped = false;
+            row.reblank();
         }
         self.pen.reset();
         self.insert_mode = false;
@@ -749,10 +843,13 @@ impl Grid {
         // A sweep is indexed by row, and the screen is about to be a different
         // height.
         self.cancel_clear();
+        // Whatever the far side sends back about this is a repaint, not a
+        // clear-screen.
+        self.expect_repaint();
 
         if cols != self.cols {
             for row in &mut self.screen {
-                row.resize(cols);
+                row.narrow_to(cols);
             }
             // Scrollback is deliberately left alone: history is not reflowed,
             // padding it back out would undo the trim in `push_scrollback`, and
@@ -781,14 +878,14 @@ impl Grid {
             std::cmp::Ordering::Greater => {
                 for _ in 0..rows - self.rows {
                     if let Some(mut row) = self.scrollback.pop_back() {
-                        // Back to full width: unlike scrollback, a screen row
-                        // is indexed directly by `print` and the erase
-                        // operations, which assume `cols` cells are there.
-                        row.resize(cols);
+                        // Only clamped, never padded: a screen row is as
+                        // long as what has been written into it, and `print`
+                        // grows it from there.
+                        row.narrow_to(cols);
                         self.screen.insert(0, row);
                         self.cursor.row += 1;
                     } else {
-                        self.screen.push(Row::new(cols));
+                        self.screen.push(Row::new());
                     }
                 }
             }
@@ -841,10 +938,93 @@ mod tests {
         assert_eq!(row.to_text(), "hello");
     }
 
-    /// A trimmed row promoted back onto the screen is printed into directly, so
-    /// it has to be full width again or that write is out of bounds.
+    /// The invariant the whole width claim rests on: a column nobody has
+    /// written to costs nothing. At a margin of 16384 the old shape of this -
+    /// every screen row allocated to full width - was half a megabyte a row.
     #[test]
-    fn a_row_promoted_out_of_scrollback_is_full_width_again() {
+    fn a_row_holds_only_what_has_been_written_to_it() {
+        let mut grid = Grid::new(16384, 24, 100);
+        assert!(
+            grid.screen.iter().all(|row| row.cells.is_empty()),
+            "a fresh screen should hold no cells at all"
+        );
+
+        for ch in "USER>".chars() {
+            grid.print(ch);
+        }
+        assert_eq!(grid.screen[0].cells.len(), 5);
+        assert!(grid.screen[1].cells.is_empty());
+
+        // And a long line is held whole, however far past the window it runs.
+        grid.line_feed();
+        grid.set_cursor(1, 0);
+        for _ in 0..3000 {
+            grid.print('X');
+        }
+        assert_eq!(grid.screen[1].to_text().chars().count(), 3000);
+        assert_eq!(grid.widest_line(), 3000);
+    }
+
+    /// Erasing to the end of the line is what IRIS sends on every keystroke of
+    /// its own line editing, so it has to leave the row as short as what is
+    /// left on it rather than blanking thousands of columns.
+    #[test]
+    fn erasing_to_the_end_of_the_line_shortens_the_row() {
+        let mut grid = Grid::new(16384, 4, 100);
+        for ch in "USER>write 1".chars() {
+            grid.print(ch);
+        }
+        grid.set_cursor(0, 5);
+        grid.erase_in_line(0);
+        assert_eq!(grid.screen[0].cells.len(), 5);
+        assert_eq!(grid.screen[0].to_text(), "USER>");
+    }
+
+    /// ECH erases in the middle of a line, which is a blank rather than a
+    /// truncation: what follows has to stay where it is.
+    #[test]
+    fn erasing_characters_in_the_middle_leaves_the_tail_in_place() {
+        let mut grid = Grid::new(16384, 4, 100);
+        for ch in "abcdef".chars() {
+            grid.print(ch);
+        }
+        grid.set_cursor(0, 2);
+        grid.erase_chars(2);
+        assert_eq!(grid.screen[0].to_text(), "ab  ef");
+    }
+
+    /// DCH pulls the tail left; the blanks a fixed-width terminal shifts in at
+    /// the margin are the cells that stop existing.
+    #[test]
+    fn deleting_characters_pulls_the_tail_left() {
+        let mut grid = Grid::new(16384, 4, 100);
+        for ch in "abcdef".chars() {
+            grid.print(ch);
+        }
+        grid.set_cursor(0, 1);
+        grid.delete_chars(2);
+        assert_eq!(grid.screen[0].to_text(), "adef");
+    }
+
+    /// ICH pushes the tail right without dropping any of it, which is the part
+    /// a row that only holds what is written could get wrong.
+    #[test]
+    fn inserting_characters_keeps_the_tail() {
+        let mut grid = Grid::new(16384, 4, 100);
+        for ch in "abcdef".chars() {
+            grid.print(ch);
+        }
+        grid.set_cursor(0, 3);
+        grid.insert_chars(2);
+        assert_eq!(grid.screen[0].to_text(), "abc  def");
+    }
+
+    /// A row promoted back onto the screen out of scrollback stays as short as
+    /// what is on it, and is printed into all the same: the write grows it.
+    /// The old shape of this was to pad it back out to full width, which is
+    /// what a margin of 16384 made unaffordable.
+    #[test]
+    fn a_row_promoted_out_of_scrollback_is_printed_into_without_being_padded() {
         let mut grid = Grid::new(200, 2, 100);
         for ch in "hi".chars() {
             grid.print(ch);
@@ -855,13 +1035,20 @@ mod tests {
 
         grid.resize(200, 4);
         for row in &grid.screen {
-            assert_eq!(row.cells.len(), 200, "a screen row must be full width");
+            assert!(
+                row.cells.len() <= 2,
+                "a screen row holds what is on it and no padding"
+            );
         }
 
-        // The write that would be out of bounds on a short row.
+        // The write that would be out of bounds if the row did not grow.
         grid.set_cursor(0, 199);
         grid.print('X');
+        assert_eq!(grid.screen[0].cells.len(), 200);
         assert_eq!(grid.screen[0].cells[199].ch, 'X');
+        let text = grid.screen[0].to_text();
+        assert!(text.starts_with("hi") && text.ends_with('X'));
+        assert_eq!(text.chars().count(), 200, "the gap is blank, not missing");
     }
 
     /// Narrowing the window must not throw away text already received: only

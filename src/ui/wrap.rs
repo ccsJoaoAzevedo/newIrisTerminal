@@ -169,6 +169,81 @@ mod tests {
         }
     }
 
+    /// The bug this pins, as it looked: three `zwrite`s of a 3000-character
+    /// global on a 47-row screen, and the prompt you had just typed at was off
+    /// the top of the window, with blank space below it.
+    ///
+    /// A terminal screen is a fixed height with the cursor somewhere up it, so
+    /// the rows after the cursor are blank - and each is a display row.
+    /// Counting them into the scroll range is invisible while every line is one
+    /// row tall, because then the whole screen fits either way; once one line
+    /// wraps into thirty, they push the cursor off the top. So the bottom of
+    /// the range is the cursor's line, which is the total `terminal_view`
+    /// passes here.
+    #[test]
+    fn the_cursor_stays_on_screen_when_a_line_wraps_into_dozens_of_rows() {
+        let rows = 47;
+        let mode = Mode::wrapping(102);
+        // Three `zwrite`s of 3000 characters, then the prompt on line 3, then
+        // the untouched bottom of the screen.
+        let cursor_line = 3;
+        let used = move |line: usize| match line {
+            0..=2 => 3000,
+            3 => 8,
+            _ => 0,
+        };
+
+        // Anchored on the whole grid, the blank rows take up the whole budget
+        // and the prompt lands on the *first* row of the window, with nothing
+        // above it and forty blank rows below - which is the bug, exactly as
+        // reported: every command put the new prompt at the top, and seeing
+        // its output meant scrolling up.
+        let whole = top_for_bottom(47, rows, mode, used);
+        let showing = from_top(47, rows, whole, mode, used);
+        assert_eq!(
+            showing.first().map(|s| s.line),
+            Some(cursor_line),
+            "this is the bug: the prompt is the top row"
+        );
+        assert!(
+            !showing.iter().any(|s| s.line == cursor_line - 1),
+            "and the output it answered is off the top of the window"
+        );
+
+        // Anchored on the cursor's line, the prompt is on screen with the
+        // output it answered above it.
+        let to_cursor = top_for_bottom(cursor_line + 1, rows, mode, used);
+        assert!(
+            to_cursor < whole,
+            "and that is further up, not further down"
+        );
+        let showing = from_top(47, rows, to_cursor, mode, used);
+        assert!(
+            showing.iter().any(|s| s.line == cursor_line),
+            "the prompt should be on screen"
+        );
+        assert!(
+            showing.iter().any(|s| s.line == cursor_line - 1),
+            "and so should what it is answering"
+        );
+    }
+
+    /// The ordinary screen must not move: while every line is one row tall the
+    /// whole thing fits, and the blank rows below the prompt stay on screen
+    /// where they have always been.
+    #[test]
+    fn a_screen_that_fits_is_not_scrolled_at_all() {
+        let rows = 47;
+        let mode = Mode::wrapping(102);
+        let cursor_line = 3;
+        let used = move |line: usize| if line <= cursor_line { 40 } else { 0 };
+
+        assert_eq!(top_for_bottom(cursor_line + 1, rows, mode, used), 0);
+        let showing = from_top(47, rows, 0, mode, used);
+        assert_eq!(showing.len(), rows, "the blank rows are still drawn");
+        assert_eq!(showing[cursor_line].line, cursor_line);
+    }
+
     #[test]
     fn a_line_narrower_than_the_window_takes_one_row() {
         let mode = Mode::wrapping(90);

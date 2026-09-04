@@ -189,9 +189,7 @@ mod tests {
     fn grid_showing(lines: &[&str]) -> Grid {
         let mut grid = Grid::new(40, lines.len().max(1), 100);
         for (r, line) in lines.iter().enumerate() {
-            for (c, ch) in line.chars().enumerate().take(40) {
-                grid.screen[r].cells[c].ch = ch;
-            }
+            grid.screen[r].set_text(&line.chars().take(40).collect::<String>());
         }
         grid.touch();
         grid

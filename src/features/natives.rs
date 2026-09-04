@@ -33,15 +33,21 @@ pub struct Invocation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Native {
     CompileClasses,
+    CompileRoutine,
     GenerateInterface,
 }
 
 impl Native {
-    pub const ALL: [Native; 2] = [Native::CompileClasses, Native::GenerateInterface];
+    pub const ALL: [Native; 3] = [
+        Native::CompileClasses,
+        Native::CompileRoutine,
+        Native::GenerateInterface,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Native::CompileClasses => "Compile classes",
+            Native::CompileRoutine => "Compile routines",
             Native::GenerateInterface => "Generate interface",
         }
     }
@@ -61,6 +67,10 @@ impl Native {
                     default: "bkf1",
                 },
             ],
+            Native::CompileRoutine => &[Param {
+                label: "Routine/Group",
+                default: "",
+            }],
             Native::GenerateInterface => &[Param {
                 label: "Routine/Group",
                 default: "",
@@ -106,6 +116,21 @@ impl Native {
                 }
             }
 
+            // The routine compiler the team runs, spelled the way it is
+            // spelled at the prompt: the group name carries the `.MAC`
+            // extension, the second argument is left out entirely, and the
+            // third asks to be told about critical errors and errors.
+            Native::CompileRoutine => {
+                let target = at(0);
+                Invocation {
+                    lines: vec![format!(
+                        "set sc=##class(SrcPub.SourceSyntaxConv).CompilarGrupoRotinas(\"{}.MAC\",,\"ErroCritico;Erro\")",
+                        escape_quotes(&target)
+                    )],
+                    summary: tr1("Compile routines: {}", &target),
+                }
+            }
+
             Native::GenerateInterface => {
                 let target = at(0);
                 Invocation {
@@ -146,6 +171,31 @@ mod tests {
         assert_eq!(
             Native::CompileClasses.default_values(),
             vec![String::new(), "bkf1".to_string()]
+        );
+    }
+
+    /// The whole line, exactly as it is typed at the prompt: the group name
+    /// carries `.MAC`, the second argument is empty, and the third is the
+    /// error filter.
+    #[test]
+    fn compiling_a_routine_group_appends_mac_and_leaves_the_second_argument_out() {
+        let inv = Native::CompileRoutine.build(&values(&["CCPV005"]));
+        assert_eq!(
+            inv.lines,
+            vec![
+                "set sc=##class(SrcPub.SourceSyntaxConv).CompilarGrupoRotinas(\"CCPV005.MAC\",,\"ErroCritico;Erro\")"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// Its own entry in the panel, right after the class compiler - which is
+    /// where it is looked for.
+    #[test]
+    fn the_routine_compiler_sits_under_the_class_compiler() {
+        assert_eq!(
+            Native::ALL[..2],
+            [Native::CompileClasses, Native::CompileRoutine]
         );
     }
 

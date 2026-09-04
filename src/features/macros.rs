@@ -105,6 +105,21 @@ impl Macro {
     }
 }
 
+/// One body line per line of text, blank lines dropped and each line trimmed.
+///
+/// The body is sent a line at a time, so a blank line would be an empty
+/// command and leading indentation would reach IRIS as part of it. Applied when
+/// the XML is read and again when the editor saves - and *only* then: doing it
+/// on every keystroke is what used to swallow the space bar, because a trailing
+/// space was trimmed away before the next frame could put it back on screen.
+pub fn body_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Parses the macro XML format:
 ///
 /// ```xml
@@ -213,12 +228,7 @@ pub fn parse(xml: &str) -> Result<Vec<MacroGroup>> {
                     "body" => {
                         in_body = false;
                         if let Some(m) = current_macro.as_mut() {
-                            m.body = body_text
-                                .lines()
-                                .map(|l| l.trim())
-                                .filter(|l| !l.is_empty())
-                                .map(str::to_string)
-                                .collect();
+                            m.body = body_lines(&body_text);
                         }
                     }
                     "macro" => {
@@ -582,6 +592,18 @@ mod tests {
         assert!(
             groups[1].macros[0].confirm,
             "destructive macro must confirm"
+        );
+    }
+
+    /// Only the ends of a line are trimmed. The spaces inside one are the
+    /// ObjectScript - `Set x = 1` is not `Setx=1` - and the editor used to run
+    /// every keystroke through here, which is what made the space bar look
+    /// broken.
+    #[test]
+    fn body_lines_keep_the_spaces_inside_a_command() {
+        assert_eq!(
+            body_lines("  Set x = 1  \n\n  Write x, !  \n"),
+            vec!["Set x = 1".to_string(), "Write x, !".to_string()]
         );
     }
 

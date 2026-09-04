@@ -7,6 +7,7 @@
 use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 
 use crate::config::{CursorStyle, Theme};
+use crate::features::analyze;
 use crate::i18n::tr;
 use crate::term::cell::{Cell, Color};
 use crate::term::{lineedit, palette, syntax, Attrs, Grid};
@@ -55,16 +56,31 @@ impl Default for RenderOpts {
 ///
 /// IRIS truncates a `Write` at the device right margin rather than wrapping it,
 /// so the tail of a line wider than the terminal is never sent and cannot be
-/// recovered afterwards. The only way to receive it is to report a margin past
-/// where the window ends, which is what this is; the window then shows a view
-/// onto the wider grid, either wrapped or scrolled sideways.
+/// recovered afterwards. The margin it is told is therefore the longest line
+/// the session can ever produce - and the same limit applies to the echo of
+/// what is typed, which is why a command longer than the margin looked like a
+/// terminal that had stopped accepting keys. The window then shows a view onto
+/// the wider grid, either wrapped or scrolled sideways.
 ///
-/// Wide enough for the `zwrite` output that prompted it, and cheap: only the
-/// screen rows are held at full width, since a line trims its trailing blanks
-/// on the way into scrollback. The cost is that anything positioning itself by
-/// column - the `^%G` utility, a full-screen editor - has a wrong idea of the
-/// width.
-pub const TERMINAL_COLS: usize = 512;
+/// It costs nothing to claim: a row holds only the columns something has been
+/// written to (see [`crate::term::grid::Row`]), so the margin is a number the
+/// far side is told, not an allocation.
+///
+/// 16384 rather than something larger because of where the console stops.
+/// A pseudoconsole resized to exactly 32767 columns - `SHRT_MAX` - stops
+/// answering altogether: the session comes up as a black screen that ignores
+/// every key, which is what `tests/live_width.rs` measures and pins. 32000
+/// still worked, but sitting inside a thousand columns of an undocumented
+/// cliff in someone else's process is not worth the characters; half of
+/// `SHRT_MAX` is far past any real line and demonstrably fast at every window
+/// height. What it costs is that a `Write` of more than 16384 characters is
+/// still cut - IRIS itself stops at 32767 - which nothing in the ERP produces.
+///
+/// The one other thing the claim costs: anything positioning itself by the
+/// width it is told - the `^%G` utility, a full-screen editor, a routine
+/// drawing a rule across the screen - has a wrong idea of how wide the screen
+/// is. That was already true at 512.
+pub const TERMINAL_COLS: usize = 16384;
 
 /// Width of the scrollback scrollbar, in points.
 const SCROLLBAR_WIDTH: f32 = 10.0;
@@ -281,15 +297,49 @@ pub fn terminal_font(family: &str, font_size: f32) -> FontId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextAction {
     CopySelection,
+    /// Copy the selection and type it straight back into the session. What
+    /// picking a global off the screen and putting it on the command line
+    /// takes, in one entry instead of two.
+    CopyAndPaste,
     Paste,
     SelectAll,
     ClearSelection,
     ExportScreen,
     /// Hand this much of the output to a Claude Code session.
-    Analyze(crate::features::analyze::Scope),
+    Analyze(analyze::Scope, analyze::Panes),
+    /// Layout of the tab this pane is in. Carried out by the app, which owns
+    /// the tabs; the pane only says which one was asked for.
+    SplitRight,
+    SplitBottom,
+    Unsplit,
+    /// Close the session in this pane, and nothing else: the other pane of a
+    /// split tab stays, unsplit.
+    ClosePane,
     /// Reset the terminal and drop the scrollback. The same thing Ctrl+Delete
     /// does, put where it can be found.
     ClearTerminal,
+}
+
+/// Where one pane stands among the panes on screen.
+///
+/// A struct rather than three more parameters, and one place to read what
+/// "focused" buys a pane: the keyboard, and the cursor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PaneRole {
+    /// This is the pane the keyboard is in - the focused pane of a split tab,
+    /// or the only pane of one that is not split.
+    ///
+    /// Two things follow from it. It is the pane that takes the keyboard back
+    /// whenever no other widget wants it; two panes both claiming it would take
+    /// it from each other every frame. And it is the only pane that draws a
+    /// cursor: a caret sitting in a pane that is not listening says the
+    /// keystrokes are going there, which is exactly wrong.
+    pub focused: bool,
+    /// The active tab changed this frame, so focus should follow it here.
+    pub take_focus: bool,
+    /// The tab holds a second session, so the menu can offer both of them and
+    /// the split can be taken back.
+    pub split: bool,
 }
 
 pub struct RenderResult {
@@ -326,12 +376,9 @@ pub struct RenderResult {
 /// silently moved keyboard focus to a widget that no longer existed and left
 /// the terminal unable to receive keys at all.
 ///
-/// `take_focus` is set by the caller when the active tab changed, so focus
-/// follows the tab the user is looking at. `claim_idle` is what makes the
-/// terminal take the keyboard back whenever no other widget wants it; with the
-/// view split in two only one of the panes may do that, or the two would take
-/// it from each other every frame.
-#[allow(clippy::too_many_arguments)]
+/// `pane` says where this pane stands among the panes on screen - which is
+/// what decides whether it claims the keyboard and whether it draws a cursor.
+/// See [`PaneRole`].
 pub fn show(
     ui: &mut Ui,
     grid: &Grid,
@@ -339,8 +386,7 @@ pub fn show(
     theme: &Theme,
     opts: &RenderOpts,
     tab_uid: u64,
-    take_focus: bool,
-    claim_idle: bool,
+    pane: PaneRole,
 ) -> RenderResult {
     let font = terminal_font(&opts.font_family, opts.font_size);
     let cell = cell_size(ui, &font);
@@ -394,7 +440,7 @@ pub fn show(
     // chrome (a tab button, say) silently steals typing away again. Claim
     // focus when nothing else wants it, or when the caller says the active tab
     // just changed — but never off a dialog or text field that is in use.
-    if take_focus || (claim_idle && ui.memory(|m| m.focused().is_none())) {
+    if pane.take_focus || (pane.focused && ui.memory(|m| m.focused().is_none())) {
         response.request_focus();
     }
 
@@ -424,7 +470,18 @@ pub fn show(
         offset: state.h_offset,
     };
 
-    let max_top = wrap::top_for_bottom(total, rows, mode, used);
+    // The bottom of the view is the line the cursor is on, not the last row of
+    // the grid. A terminal always has blank rows below the cursor - the screen
+    // is a fixed height and the prompt is somewhere up it - and they are worth
+    // one display row each. Counting them into the scroll range is invisible
+    // while every line is one row tall, because then the whole screen fits;
+    // once one line wraps into thirty, those blanks push the prompt off the top
+    // of the view and leave the user scrolling up to find what they just ran.
+    //
+    // Below the cursor there is nothing to see, so there is nowhere to scroll
+    // to. Blank rows after it are still drawn when the screen fits, since
+    // `from_top` fills the viewport from every line there is.
+    let max_top = wrap::top_for_bottom(cursor_line + 1, rows, mode, used);
     let top_line = match state.anchor {
         ScrollAnchor::Bottom => max_top,
         ScrollAnchor::At(line) => line.min(max_top),
@@ -467,7 +524,10 @@ pub fn show(
     // Worked out before the rows are painted, because the cell underneath has
     // to skip its glyph: the cursor draws that character itself in the inverse
     // colour, and drawing it from both places is what made it look doubled.
-    let cursor_at = if grid.cursor.visible && cursor_phase_on(ui, opts) {
+    // Only in the pane that is listening: a caret in a pane the keyboard is
+    // not in says the typing is going there, which is the one thing it must
+    // never say. See [`PaneRole::focused`].
+    let cursor_at = if pane.focused && grid.cursor.visible && cursor_phase_on(ui, opts) {
         wrap::row_of(&segments, mode, cursor_line, grid.cursor.col)
             .map(|screen_row| (screen_row, cursor_line, grid.cursor.col))
     } else {
@@ -597,6 +657,44 @@ pub fn show(
         }
     }
 
+    // Where the system should put an input method's candidate window - and, the
+    // reason this is here at all, the fact that this window takes text input in
+    // the first place.
+    //
+    // egui reports an area only for a `TextEdit`, and `egui-winit` turns that
+    // report straight into `Window::set_ime_allowed`. With no `TextEdit`
+    // anywhere in the app, the window was telling the system it accepts no text
+    // at all - so every surface the shell inserts text through had nothing to
+    // talk to: a CJK input method, the emoji panel, the touch keyboard, the
+    // clipboard history. A terminal is a text input area with a caret in it,
+    // which is exactly what this says.
+    //
+    // Only the pane holding the keyboard says it, and only until something with
+    // a real text field - a dialog's own `TextEdit`, drawn later in the frame -
+    // says otherwise.
+    if response.has_focus() {
+        let caret = wrap::row_of(&segments, mode, cursor_line, grid.cursor.col)
+            .map(|screen_row| {
+                let offset = grid.cursor.col.saturating_sub(segments[screen_row].start);
+                Rect::from_min_size(
+                    Pos2::new(
+                        glyph_x(rect.left(), offset, cell),
+                        rect.top() + screen_row as f32 * cell.y,
+                    ),
+                    cell,
+                )
+            })
+            // Off screen: the top-left of the terminal is where a candidate
+            // window is least in the way.
+            .unwrap_or_else(|| Rect::from_min_size(rect.min, cell));
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                rect,
+                cursor_rect: caret,
+            });
+        });
+    }
+
     // Right-click menu. Copy is disabled without a selection so the menu
     // states plainly what is available, rather than silently doing nothing.
     let has_selection = state.selection.map(|s| !s.is_empty()).unwrap_or(false);
@@ -612,6 +710,16 @@ pub fn show(
         }
         if ui.button(tr("Paste")).clicked() {
             context_action = Some(ContextAction::Paste);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new(tr("Copy and paste")))
+            .on_hover_text(tr(
+                "Puts the selection on the clipboard and types it at the prompt.",
+            ))
+            .clicked()
+        {
+            context_action = Some(ContextAction::CopyAndPaste);
             ui.close_menu();
         }
         ui.separator();
@@ -632,22 +740,29 @@ pub fn show(
             ui.close_menu();
         }
         // A submenu rather than three entries: the scope is the only question
-        // it asks, and asking it in the menu saves a dialog.
+        // it asks, and asking it in the menu saves a dialog. A split tab is
+        // asked one more - which of its two sessions - and only then, because
+        // there is nothing to choose between when there is one pane.
+        //
+        // Nothing in here explains itself, and that is deliberate: a menu popup
+        // sizes its rectangle from its own contents and lays them out
+        // justified, so a wide entry stretches every later one to match and the
+        // width can only ever grow. One line of explanation was enough to latch
+        // it, and the submenu it latched stayed that wide for entries two words
+        // long - which is how hovering this before splitting a tab left the
+        // menu stretched most of the way across the window afterwards. Every
+        // entry here is short, so the menu is the size of its longest label.
         ui.menu_button(tr("Analyze with Claude"), |ui| {
-            ui.small(tr(
-                "Opens a Claude Code session with the output already in context, in a window of its own.",
-            ));
-            for scope in crate::features::analyze::Scope::ALL {
-                // Asking about the selection needs one, so the entry says as
-                // much rather than opening a session on nothing.
-                let usable = has_selection || !scope.is_selection();
-                if ui
-                    .add_enabled(usable, egui::Button::new(tr(scope.label())))
-                    .clicked()
-                {
-                    context_action = Some(ContextAction::Analyze(scope));
-                    ui.close_menu();
+            if pane.split {
+                for panes in [analyze::Panes::Focused, analyze::Panes::Both] {
+                    ui.menu_button(tr(panes.label()), |ui| {
+                        if let Some(chosen) = analyze_scopes(ui, has_selection, panes) {
+                            context_action = Some(chosen);
+                        }
+                    });
                 }
+            } else if let Some(chosen) = analyze_scopes(ui, has_selection, analyze::Panes::Focused) {
+                context_action = Some(chosen);
             }
         });
         if ui
@@ -656,6 +771,51 @@ pub fn show(
             .clicked()
         {
             context_action = Some(ContextAction::ClearTerminal);
+            ui.close_menu();
+        }
+        // The layout of the tab this pane is in, offered where the pane is
+        // rather than only up in the strip: splitting is something you decide
+        // while looking at the output, not while looking at the tab's name.
+        // The same three entries the strip's own menu has, and they do the
+        // same things.
+        ui.separator();
+        if pane.split {
+            if ui
+                .button(tr("Remove split"))
+                .on_hover_text(tr(
+                    "Gives the second session a tab of its own. Nothing is closed.",
+                ))
+                .clicked()
+            {
+                context_action = Some(ContextAction::Unsplit);
+                ui.close_menu();
+            }
+        } else {
+            if ui
+                .button(tr("Split to right"))
+                .on_hover_text(tr(
+                    "Opens a second session in this tab, beside this one. Click into a pane to type in it.",
+                ))
+                .clicked()
+            {
+                context_action = Some(ContextAction::SplitRight);
+                ui.close_menu();
+            }
+            if ui.button(tr("Split to bottom")).clicked() {
+                context_action = Some(ContextAction::SplitBottom);
+                ui.close_menu();
+            }
+        }
+        if ui
+            .button(tr("Close pane"))
+            .on_hover_text(if pane.split {
+                tr("Closes this session. The other pane stays, in a tab of its own.")
+            } else {
+                tr("Closes this session.")
+            })
+            .clicked()
+        {
+            context_action = Some(ContextAction::ClosePane);
             ui.close_menu();
         }
     });
@@ -671,6 +831,32 @@ pub fn show(
         view_rows: rows,
         cell,
     }
+}
+
+/// The scope entries of the "Analyze with Claude" menu, all reporting the same
+/// choice of panes.
+///
+/// A function rather than a closure because it is called from two arms of the
+/// menu and a closure would have to borrow the answer twice.
+fn analyze_scopes(
+    ui: &mut Ui,
+    has_selection: bool,
+    panes: analyze::Panes,
+) -> Option<ContextAction> {
+    let mut chosen = None;
+    for scope in analyze::Scope::ALL {
+        // Asking about the selection needs one, so the entry says as much
+        // rather than opening a session on nothing.
+        let usable = has_selection || !scope.is_selection();
+        if ui
+            .add_enabled(usable, egui::Button::new(tr(scope.label())))
+            .clicked()
+        {
+            chosen = Some(ContextAction::Analyze(scope, panes));
+            ui.close_menu();
+        }
+    }
+    chosen
 }
 
 /// Per-column syntax colour for one row, or an empty vector when the feature is
@@ -1328,9 +1514,7 @@ mod tests {
     fn grid_with(lines: &[&str]) -> Grid {
         let mut grid = Grid::new(20, lines.len().max(1), 100);
         for (r, line) in lines.iter().enumerate() {
-            for (c, ch) in line.chars().enumerate() {
-                grid.screen[r].cells[c].ch = ch;
-            }
+            grid.screen[r].set_text(line);
         }
         grid
     }

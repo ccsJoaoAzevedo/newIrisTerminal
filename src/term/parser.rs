@@ -405,6 +405,90 @@ mod tests {
         assert_eq!(grid.screen[1].to_text(), "USER>");
     }
 
+    /// A Windows pseudoconsole answers every resize by repainting the screen,
+    /// and its repaint is character for character the shape of the `W #` above:
+    /// hide the cursor, home, then erase-to-end-of-line and a newline for every
+    /// row, with the content written back on the way down.
+    ///
+    /// So it used to be filed into the transcript as a clear - and the repaint
+    /// then landed underneath the copy it had just archived. Dragging the window
+    /// taller duplicated everything on screen, once per resize. The bytes here
+    /// are the ones a real pseudoconsole sent, captured on a resize from 24 rows
+    /// to 40.
+    #[test]
+    fn the_repaint_a_pseudoconsole_sends_on_resize_is_not_a_clear() {
+        let mut grid = Grid::new(20, 4, 100);
+        let mut parser = vte::Parser::new();
+        advance(&mut parser, &mut grid, b"one\r\ntwo\r\nUSER>");
+        assert!(grid.scrollback.is_empty());
+
+        // The resize itself, and then what comes back because of it.
+        grid.resize(20, 6);
+        advance(
+            &mut parser,
+            &mut grid,
+            b"\x1b[?25l\x1b[H\x1b[Kone\x1b[K\r\ntwo\x1b[K\r\nUSER>\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[3;6H\x1b[?25h",
+        );
+
+        assert!(
+            grid.scrollback.is_empty(),
+            "the repaint was filed as a clear: {:?}",
+            grid.scrollback
+                .iter()
+                .map(|r| r.to_text())
+                .collect::<Vec<_>>()
+        );
+        let screen: Vec<String> = grid.screen.iter().map(|r| r.to_text()).collect();
+        assert_eq!(
+            screen,
+            vec![
+                "one".to_string(),
+                "two".to_string(),
+                "USER>".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+            "the screen should hold one copy of itself"
+        );
+    }
+
+    /// And the window it is read in has to lapse, or a resize on a connection
+    /// that does not repaint - Telnet, where the far side is told the new size
+    /// and says nothing back - would leave the next real clear-screen unable to
+    /// file its screen away.
+    #[test]
+    fn a_clear_long_after_a_resize_still_files_the_screen_away() {
+        let mut grid = Grid::new(20, 4, 100);
+        let mut parser = vte::Parser::new();
+        grid.resize(20, 4);
+        advance(&mut parser, &mut grid, b"one\r\ntwo\r\nthree\r\nUSER>W #");
+
+        // Past the window the repaint would have arrived in. A real one comes
+        // back in the same read as the resize goes out, so this is the only
+        // place the wait is ever paid.
+        std::thread::sleep(
+            crate::term::grid::REPAINT_WINDOW + std::time::Duration::from_millis(50),
+        );
+        advance(
+            &mut parser,
+            &mut grid,
+            b"\x1b[?25l\x1b[H\x1b[K\r\nUSER>\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[2;7H\x1b[?25h",
+        );
+
+        let history: Vec<String> = grid.scrollback.iter().map(|r| r.to_text()).collect();
+        assert_eq!(
+            history,
+            vec![
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+                "USER>W #".to_string(),
+            ],
+            "a clear that is not a resize repaint must still be archived"
+        );
+    }
+
     /// Ctrl+Delete asks IRIS for the clear, because only IRIS can reset its own
     /// idea of where the cursor is - so the clear that comes back must drop the
     /// history rather than archive it, echoed command and all.

@@ -406,6 +406,49 @@ fn clicked(response: Option<Response>) -> bool {
     response.is_some_and(|r| r.clicked())
 }
 
+/// Makes `rect` a handle the window can be dragged by, and reads a double
+/// click on it as the usual "maximize / restore".
+fn drag_area(ui: &mut Ui, rect: Rect, id: Id) -> Option<WindowAction> {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+    let drag = ui.interact(rect, id, Sense::click_and_drag());
+    if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+    drag.double_clicked()
+        .then_some(WindowAction::ToggleMaximize)
+}
+
+/// Text in the title bar that the window can be dragged by.
+///
+/// Two widgets over one rectangle, and that is the point: the words are drawn
+/// with no interaction of their own - not even egui's click-and-drag to select
+/// a label's text, which is what was quietly eating the drag and leaving the
+/// window stuck - and the handle is then claimed over exactly the space they
+/// took. So the reading matter in the bar is only ever a picture, and pressing
+/// anywhere on the bar moves the window, the way a title bar does.
+///
+/// `draggable` is false while the system is drawing the frame: the real title
+/// bar is doing the moving, and the text here is then simply text.
+pub fn drag_text(
+    ui: &mut Ui,
+    text: impl Into<egui::WidgetText>,
+    draggable: bool,
+    window: &'static str,
+    tag: &'static str,
+) -> Option<WindowAction> {
+    let response = ui.add(egui::Label::new(text).selectable(false));
+    if !draggable {
+        return None;
+    }
+    // The full height of the row rather than the height of the glyphs: a title
+    // bar you can only take hold of by hitting the letters is not one. The row
+    // is as tall as the tallest thing already placed in it, which is a button.
+    let handle = Rect::from_x_y_ranges(response.rect.x_range(), ui.min_rect().y_range());
+    drag_area(ui, handle, Id::new(("nit-titlebar-text", window, tag)))
+}
+
 /// Draws minimize / maximize / close at the right-hand end of the row, then
 /// makes whatever space is left draggable.
 ///
@@ -447,12 +490,8 @@ pub fn title_bar_controls(
             // far as egui is concerned, so only whichever was drawn last would
             // answer to the mouse.
             let id = Id::new(("nit-titlebar-drag", window));
-            let drag = ui.interact(rest, id, Sense::click_and_drag());
-            if drag.drag_started() {
-                ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-            }
-            if drag.double_clicked() {
-                action = Some(WindowAction::ToggleMaximize);
+            if let Some(asked) = drag_area(ui, rest, id) {
+                action = Some(asked);
             }
         }
     });

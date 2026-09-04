@@ -317,6 +317,17 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
                 // modifier is held, so this is genuine typed input.
                 action.text.push_str(text);
             }
+            // Text an input method composed and committed. It arrives here
+            // rather than as `Event::Text` because the composition happens
+            // outside the app - a CJK method, the emoji panel, the touch
+            // keyboard - so a terminal that ignored it could not be typed in by
+            // any of them. The composition itself (`Preedit`) is not shown:
+            // IRIS owns the line being edited and there is nowhere to put a
+            // half-finished word, so it stays in the system's own candidate
+            // window until it is committed.
+            Event::Ime(egui::ImeEvent::Commit(text)) => {
+                action.text.push_str(text);
+            }
             Event::Key {
                 key,
                 pressed: true,
@@ -462,6 +473,35 @@ mod tests {
             pressed: true,
             repeat: false,
             modifiers,
+        }
+    }
+
+    /// Text an input method composed elsewhere and committed has to reach IRIS
+    /// like anything else typed. It arrives as its own event, not as
+    /// `Event::Text`, so a terminal that only read the latter could not be
+    /// typed in by a CJK method, the emoji panel or the touch keyboard at all.
+    #[test]
+    fn committed_input_method_text_is_typed() {
+        let events = [Event::Ime(egui::ImeEvent::Commit("日本".into()))];
+        let action = translate(&events, &ctx());
+        assert_eq!(action.text, "日本");
+    }
+
+    /// The composition on its way to being committed is not: IRIS owns the line
+    /// being edited, so a half-finished word has nowhere to go and belongs in
+    /// the system's own candidate window until it is done.
+    #[test]
+    fn an_unfinished_composition_is_not_typed() {
+        for event in [
+            Event::Ime(egui::ImeEvent::Enabled),
+            Event::Ime(egui::ImeEvent::Preedit("に".into())),
+            Event::Ime(egui::ImeEvent::Disabled),
+        ] {
+            let action = translate(&[event], &ctx());
+            assert!(
+                action.is_empty() && action.text.is_empty(),
+                "an unfinished composition reached IRIS"
+            );
         }
     }
 

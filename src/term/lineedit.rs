@@ -238,9 +238,7 @@ mod tests {
     /// Builds a one-row grid holding `text`, with the cursor at `col`.
     fn grid_with(text: &str, col: usize) -> Grid {
         let mut grid = Grid::new(40, 1, 10);
-        for (i, ch) in text.chars().enumerate() {
-            grid.screen[0].cells[i].ch = ch;
-        }
+        grid.screen[0].set_text(text);
         grid.cursor.col = col;
         grid
     }

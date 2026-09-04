@@ -8,6 +8,12 @@
 //! Redaction matters here. Autologon types a password into the same stream
 //! everything else flows through, so the writer is muted around that moment;
 //! a transcript must never become a plaintext credential store.
+//!
+//! Every write reaches the file before it returns. A transcript is read while
+//! the session it belongs to is still open - that is the whole point of one -
+//! and buffering meant the file sat empty until 8 KB had piled up or the app
+//! closed. One `flush` per chunk of output is nothing next to what arriving at
+//! that chunk already cost.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -26,7 +32,9 @@ pub struct SessionLog {
     max_bytes: u64,
     /// While true, output is dropped instead of written.
     muted: bool,
-    /// Index of the next screen line not yet flushed, in `Clean` mode.
+    /// Index of the next line not yet written, in `Clean` mode. Absolute over
+    /// scrollback-then-screen, which is a coordinate a line keeps as it scrolls
+    /// out of view.
     next_line: usize,
 }
 
@@ -81,16 +89,25 @@ impl SessionLog {
         }
         self.writer.write_all(bytes)?;
         self.written += bytes.len() as u64;
-        Ok(())
+        self.flush()
     }
 
-    /// Clean mode: append the rendered lines that have scrolled out of view.
+    /// Clean mode: append the rendered lines the session has finished with.
     ///
-    /// `scrollback_len` is the grid's current scrollback length; everything
-    /// between what we last wrote and that point is now final and safe to
-    /// record. Lines still on screen may yet be overwritten by a full-screen
-    /// routine, so they are deliberately not logged until they scroll away.
-    /// Whether [`Log::write_settled`] would look at the lines it is handed.
+    /// `settled` is the number of lines the caller considers final - everything
+    /// above the row the cursor is on. Each command and its output therefore
+    /// reaches the file as soon as the next prompt is printed, which is what a
+    /// transcript being read alongside the session has to do.
+    ///
+    /// The row the cursor is on is deliberately left out: it is the line being
+    /// typed or written, and logging it would put half a line in the file and
+    /// the other half on the next one. A routine that addresses the cursor and
+    /// paints over a row already written keeps the version that was there when
+    /// the cursor passed it - the price of writing in real time rather than
+    /// waiting for a row to scroll away for good.
+    ///
+    /// Whether [`SessionLog::write_settled`] would look at the lines it is
+    /// handed.
     ///
     /// Transcribing the whole grid to build them costs a `String` per line of
     /// history, so the caller asks first rather than doing that work for a log
@@ -99,28 +116,33 @@ impl SessionLog {
         self.mode == LogMode::Clean && !self.muted
     }
 
-    pub fn write_settled(&mut self, lines: &[String], scrollback_len: usize) -> Result<()> {
+    pub fn write_settled(&mut self, lines: &[String], settled: usize) -> Result<()> {
         if self.mode != LogMode::Clean || self.muted || self.rotate_if_full()? {
             return Ok(());
         }
-        if scrollback_len < self.next_line {
-            // The scrollback shrank, which only happens when it is deliberately
-            // thrown away - Ctrl+Delete. Everything already written stays
-            // written; counting restarts from what is there now, or the
-            // transcript would go quiet until the history grew back past the
-            // old mark.
-            self.next_line = scrollback_len;
+        if lines.len() < self.next_line {
+            // The history the count refers to is gone: fewer lines exist than
+            // have already been written, which only happens when the scrollback
+            // is deliberately thrown away - Ctrl+Delete. Everything already
+            // written stays written; counting restarts from what is there now,
+            // or the transcript would go quiet until the history grew back past
+            // the old mark.
+            self.next_line = settled;
             return Ok(());
         }
-        if scrollback_len == self.next_line {
+        if settled <= self.next_line {
+            // Nothing new has settled. The cursor moving back up the screen
+            // gets here, and must not rewind the count: the lines it moved back
+            // over are already in the file, and writing them again on the way
+            // down would double them.
             return Ok(());
         }
-        for line in lines.iter().take(scrollback_len).skip(self.next_line) {
+        for line in lines.iter().take(settled).skip(self.next_line) {
             writeln!(self.writer, "{line}")?;
             self.written += line.len() as u64 + 1;
         }
-        self.next_line = scrollback_len;
-        Ok(())
+        self.next_line = settled;
+        self.flush()
     }
 
     /// Records a note from the app itself (session started, ended, reconnected).
@@ -235,6 +257,26 @@ mod tests {
         assert_eq!(content, b"\x1b[2JUSER>");
     }
 
+    /// The bug this guards: the transcript is read while the session is still
+    /// open, and a buffered writer left the file empty until 8 KB had piled up.
+    /// Nothing here calls `flush` - the write is expected to have reached the
+    /// disk on its own.
+    #[test]
+    fn output_is_on_disk_before_the_session_ends() {
+        let dir = tempdir("realtime");
+        let mut log = SessionLog::open(&dir, "test", LogMode::Raw, 0).unwrap();
+        log.write_raw(b"USER>write 1").unwrap();
+        assert_eq!(
+            std::fs::read(log.path()).unwrap(),
+            b"USER>write 1",
+            "the chunk should already be in the file"
+        );
+
+        let mut clean = SessionLog::open(&dir, "clean", LogMode::Clean, 0).unwrap();
+        clean.write_settled(&["one".to_string()], 1).unwrap();
+        assert_eq!(std::fs::read_to_string(clean.path()).unwrap(), "one\n");
+    }
+
     #[test]
     fn clean_mode_only_writes_lines_that_have_scrolled_away() {
         let dir = tempdir("clean");
@@ -253,6 +295,28 @@ mod tests {
         log.flush().unwrap();
         let content = std::fs::read_to_string(log.path()).unwrap();
         assert_eq!(content, "one\ntwo\nthree\n");
+    }
+
+    /// The count follows the cursor, and a routine that addresses the cursor
+    /// moves it back up the screen. That must not rewind the count: the lines
+    /// it moved back over are already in the file, and writing them again on
+    /// the way down would double them.
+    #[test]
+    fn a_cursor_moving_back_up_the_screen_does_not_double_the_lines() {
+        let dir = tempdir("rewind");
+        let mut log = SessionLog::open(&dir, "test", LogMode::Clean, 0).unwrap();
+
+        let lines: Vec<String> = ["one", "two", "three", "four"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        log.write_settled(&lines, 3).unwrap();
+        // The cursor goes back to the second row, then walks down again.
+        log.write_settled(&lines, 1).unwrap();
+        log.write_settled(&lines, 4).unwrap();
+
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(content, "one\ntwo\nthree\nfour\n");
     }
 
     /// Ctrl+Delete throws the scrollback away, so the count the log follows

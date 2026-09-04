@@ -14,22 +14,44 @@ Portuguese.
   profile, server and discovered instance. A tab is named after its instance
   and, if you like, the namespace the session is in — `CONSISTEM | RDB76-TR`,
   following every `ZN`.
-* **Two sessions in one tab** — right-click a tab and *Split to right* or
-  *Split to bottom*, and a second session opens in the pane it makes. The strip
-  entry names whichever pane the keyboard is in — `1: CONSISTEM | COMP80`,
-  `2: ...` — and renaming the tab asks for both names. Each pane sizes its own
-  session, so neither is truncated at a width it is not drawn at. *Remove split*
-  gives the second session a tab of its own without closing anything.
+* **Two sessions in one tab** — right-click a tab, or the terminal itself, and
+  *Split to right* or *Split to bottom*: a second session opens in the pane it
+  makes. Drag the divider between them to give one pane more room, or
+  double-click it to go back to half each. The strip entry names whichever pane
+  the keyboard is in — `1: CONSISTEM | COMP80`, `2: ...` — and renaming the tab
+  asks for both names. Only the pane you are typing in shows a cursor. Each
+  pane sizes its own session, so neither is truncated at a width it is not
+  drawn at. *Remove split* gives the second session a tab of its own without
+  closing anything; *Close pane* closes just the session you right-clicked and
+  leaves the other one in the tab.
 * **Its own window frame** — the tab strip sits where the title bar would be.
-  Drag, double-click to maximize, resize from any edge. The buttons come from
-  the theme, can be moved to either end, hidden one at a time, or switched off
-  altogether.
+  Drag it from anywhere that is not a button — the session line it shows is
+  reading matter, not a widget — double-click to maximize, resize from any
+  edge. The buttons come from the theme, can be moved to either end, hidden one
+  at a time, or switched off altogether.
+* **Lines far longer than the window** — the terminal reports a right margin of
+  16384 columns, so a `zwrite` of a wide global arrives whole and a command
+  longer than the window is echoed whole; the window is a view onto the line,
+  wrapped or scrolled sideways. IRIS truncates a `Write` at the margin it is
+  told, which is why the old 512 looked like a terminal that stopped accepting
+  keys at 503 characters. Claiming the width costs nothing — a row only holds
+  the columns something has been written to — but it is not free to claim more:
+  a pseudoconsole resized to exactly 32767 columns stops answering altogether,
+  which `live_width` measures and pins.
 * **A clear-screen that keeps the transcript** — `W #` files the old screen into
   scrollback instead of destroying it, the way the native IrisTerm does.
   Ctrl+Delete is the separate, deliberate gesture that really throws it away.
 * **ObjectScript colouring in the terminal** — globals, strings, macros,
   class/method references, routine and extrinsic calls, commands and their IRIS
   abbreviations. Prompt-aware, so plain prose never lights up.
+* **A real text input area** — the terminal tells the system where its caret
+  is, which is what lets anything that composes text elsewhere type into it: an
+  input method, the emoji panel, the touch keyboard. egui reports that only for
+  a text field, so a window without one says it accepts no text at all — and a
+  terminal is nothing but a text field with a caret in it.
+* **Copy and paste in one step** — right-click → *Copy and paste* puts the
+  selection on the clipboard and types it at the prompt, which is what picking a
+  global name or a routine label off the screen is usually for.
 * **Line editing at the prompt** — Home/End, Ctrl+Left/Right by word, click to
   place the cursor, Ctrl+A to select the line, Shift to drag a selection out of
   it, double-click to take a word and triple-click a whole line. Built entirely
@@ -49,17 +71,19 @@ Portuguese.
   Code session in a window of its own with the terminal output already in its
   context, then waits for your question rather than asking one for you. Four
   scopes: all output, the last 10 commands, the last 5, or just the selection.
-  Needs `claude` on the PATH.
+  In a split tab it asks first whether to hand over the pane you clicked in or
+  both of them, each under a heading of its own. Needs `claude` on the PATH.
 * **Macros from XML** — `{{param}}` substitution, `confirm="true"` for anything
   that writes, a keyboard shortcut per macro — typed out or recorded by pressing
   it — and `hide_command="true"` for a command line carrying a password.
   Whatever is half-typed at the prompt is rubbed out first, so a macro is the
   command it says it is.
 * **IRIS utilities** — fill in the fields and the exact line is composed and
-  sent: compile a package, generate an interface.
+  sent: compile a package, compile a routine group, generate an interface.
 * **Export** — screen or full scrollback, as text or colour-preserving HTML.
 * **Logging** — per-session transcripts, raw or clean, with password redaction
-  and rotation.
+  and rotation. Written through to the file as the session runs, so a
+  transcript can be read while the session that is producing it is still open.
 * **Autologon** — credentials from the OS credential store, never from
   `settings.toml`.
 * **Auto-update** — checks GitHub for a newer release at startup, through the
@@ -192,7 +216,17 @@ session and read the banner, never logging in and never writing data:
 
 ```sh
 cargo test --test live_session -- --ignored --nocapture
+cargo test --test live_width   -- --ignored --nocapture
+cargo test --test live_resize  -- --ignored --nocapture
 ```
+
+`live_width` is the one that says what the reported margin is worth: it asks the
+instance for a 3000-character line and checks that all of it arrived and that
+the grid is holding it on one row. `live_resize` covers the other side of the
+same conversation — a Windows pseudoconsole answers every resize by repainting
+the whole screen, in a sequence that is character for character IRIS's own
+`W #`, and reading that as a clear-screen used to duplicate everything on screen
+once per resize.
 
 `IRIS_TEST_INSTANCE` picks the instance; otherwise the first discovered one is
 used. Instances come from `iris list`, whose keyword varies by version

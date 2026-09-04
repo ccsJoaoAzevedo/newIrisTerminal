@@ -116,9 +116,45 @@ struct WindowFit {
     centre: Option<egui::Pos2>,
 }
 
-/// Thickness of the divider between two panes, in points. egui's own
-/// separator, which is what draws it.
+/// Thickness of the divider between two panes, in points. Wide enough to be
+/// aimed at with a mouse, which it has to be: it is the handle the split is
+/// resized by.
 const SPLIT_DIVIDER: f32 = 6.0;
+
+/// Smallest a pane may be dragged down to, in points.
+///
+/// A pane thinner than this is not a pane, and a session in one would be
+/// reporting a terminal a couple of characters wide to IRIS - which truncates
+/// its output at the margin it is told about, so everything past it would be
+/// lost rather than merely hidden. The divider stops here instead.
+const MIN_PANE: f32 = 80.0;
+
+/// How much of `usable` the first pane gets at `ratio`, never letting either
+/// side fall below [`MIN_PANE`].
+///
+/// Clamped here rather than where the ratio is stored: the room a split has
+/// changes with the window, and a ratio that was reachable in a wide window
+/// must not squeeze a pane out of existence in a narrow one.
+fn split_extent(usable: f32, ratio: f32) -> f32 {
+    if usable <= MIN_PANE * 2.0 {
+        // No room to honour a minimum on both sides, so the only fair split is
+        // down the middle.
+        return usable / 2.0;
+    }
+    (usable * ratio).clamp(MIN_PANE, usable - MIN_PANE)
+}
+
+/// The ratio a drag of the divider leaves behind.
+///
+/// Measured from where the divider actually is rather than added to the stored
+/// ratio, so a drag that ran into the minimum does not bank the movement past
+/// it and leave the handle lagging behind the pointer on the way back.
+fn dragged_ratio(usable: f32, ratio: f32, delta: f32) -> f32 {
+    if usable <= 0.0 {
+        return ratio;
+    }
+    ((split_extent(usable, ratio) + delta) / usable).clamp(0.0, 1.0)
+}
 
 /// Which way the second pane sits next to the first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +175,10 @@ pub struct Split {
     /// The session the split opened. Boxed: a [`Tab`] holds one of these, so
     /// the type would otherwise have no size.
     pub tab: Box<Tab>,
+    /// How much of the room the first pane gets, 0 to 1. Dragged by the
+    /// divider between them; see [`split_extent`], which is what turns it into
+    /// a size and keeps either pane from being squeezed away.
+    pub ratio: f32,
 }
 
 /// Which of a tab's two sessions.
@@ -161,6 +201,20 @@ impl Pane {
             Pane::Second => 2,
         }
     }
+}
+
+/// A change to the tab layout, asked for from inside a pane.
+///
+/// Deferred rather than carried out on the spot: the right-click menu is drawn
+/// while the panes are, and splitting or closing a tab there would move the
+/// tabs under the loop that is drawing them. Applied once the central panel has
+/// finished - the same reason the tab strip collects its own actions and
+/// applies them after its loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutAction {
+    Split(usize, SplitDir),
+    Unsplit(usize),
+    ClosePane(At),
 }
 
 /// One session on screen: the tab it is in, and which of its panes.
@@ -401,6 +455,35 @@ impl Tab {
         )
     }
 
+    /// How much of the room the first pane gets. 0.5 when the tab is not
+    /// split, which is the value nothing reads.
+    fn split_ratio(&self) -> f32 {
+        self.split.as_ref().map(|split| split.ratio).unwrap_or(0.5)
+    }
+
+    /// Drops one of this tab's two sessions, leaving the other as the tab's
+    /// only one.
+    ///
+    /// Only called on a split tab: a tab with one session in it has nothing
+    /// left to be, so closing that pane closes the tab - see
+    /// [`App::close_pane`], which is where that half of the decision is.
+    fn close_pane(&mut self, going: Pane) {
+        match going {
+            // The second pane goes and the tab stops being split.
+            Pane::Second => self.split = None,
+            // The first one goes, so the second takes the tab over: its
+            // session, its scrollback, its name. Its `uid` comes with it, so
+            // the terminal widget it has been drawn as keeps the scroll
+            // position it had.
+            Pane::First => {
+                if let Some(split) = self.split.take() {
+                    *self = *split.tab;
+                }
+            }
+        }
+        self.focus = Pane::First;
+    }
+
     /// One of this tab's panes. `Second` is there only while the tab is split.
     pub fn pane(&self, pane: Pane) -> Option<&Tab> {
         match pane {
@@ -484,7 +567,12 @@ impl Tab {
             }
 
             let still_on_password = self.autologon.state() == AutoState::WaitPassword;
-            let settled = self.grid.scrollback.len();
+            // Everything above the row the cursor is on. A command and its
+            // output are final the moment the next prompt is printed, and the
+            // transcript is read while the session is still open, so waiting
+            // for a row to scroll off the screen for good left the file empty
+            // for the whole of a short session.
+            let settled = self.grid.scrollback.len() + self.grid.cursor.row;
             if let Some(log) = self.log.as_mut() {
                 if !still_on_password {
                     log.unmute();
@@ -681,6 +769,9 @@ pub struct App {
     window_size: Option<[f32; 2]>,
     window_position: Option<[f32; 2]>,
     window_maximized: bool,
+    /// A split, unsplit or close asked for from a pane's right-click menu,
+    /// waiting for the panes to have finished drawing. See [`LayoutAction`].
+    pending_layout: Option<LayoutAction>,
 }
 
 impl App {
@@ -766,6 +857,7 @@ impl App {
             font_family: String::new(),
             font_request: String::new(),
             renaming: None,
+            pending_layout: None,
             settings_placement,
             confirm_close: false,
             close_confirmed: false,
@@ -941,6 +1033,29 @@ impl App {
         }
     }
 
+    /// Closes one pane, and nothing else.
+    ///
+    /// On a tab that is not split there is only the one session, so this is
+    /// [`App::close_tab`]. On a split tab it closes the session the user
+    /// pointed at and leaves the other one in the tab, unsplit - which is what
+    /// the right-click menu over a pane has to mean, since the other pane
+    /// belongs to whatever is running in it.
+    fn close_pane(&mut self, at: At) {
+        let Some(tab) = self.tabs.get_mut(at.tab) else {
+            return;
+        };
+        if tab.split.is_none() {
+            self.close_tab(at.tab);
+            return;
+        }
+        // Ask IRIS to halt so it releases its locks; dropping the session kills
+        // anything that ignores the request.
+        if let Some(going) = tab.pane(at.pane).and_then(|pane| pane.session.as_ref()) {
+            going.request_halt();
+        }
+        tab.close_pane(at.pane);
+    }
+
     /// The session the user is working in: the focused pane of the active tab.
     fn active_tab(&self) -> Option<&Tab> {
         self.pane(self.focused_at())
@@ -1019,6 +1134,12 @@ impl App {
         // this macro to Ctrl+T", and opening a tab instead would make the app's
         // own shortcuts the only ones that could never be recorded.
         if self.panels.capture_shortcut {
+            return;
+        }
+        // Nor while the window is not the active one: a macro shortcut sends
+        // its lines to a live session, so it answers to the same rule the
+        // keyboard does - see [`App::terminal_pane`].
+        if !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
             return;
         }
         let cmd = Modifiers::COMMAND;
@@ -1235,7 +1356,20 @@ impl App {
                     Some(pid) => format!("  PID {pid}"),
                     None => String::new(),
                 };
-                ui.weak(format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint()));
+                let info = format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint());
+                // Reading matter, and nothing else: the window is dragged by it
+                // like any other empty stretch of the bar. Left as a plain
+                // label while the system draws the frame, which is doing the
+                // moving itself.
+                if let Some(asked) = chrome::drag_text(
+                    ui,
+                    egui::RichText::new(info).weak(),
+                    !self.settings.native_decorations,
+                    "nit-main",
+                    "session",
+                ) {
+                    action = Some(asked);
+                }
             }
 
             // Last, so the leftover space it claims for dragging is whatever
@@ -1577,6 +1711,9 @@ impl App {
         self.tabs[index].split = Some(Split {
             dir,
             tab: Box::new(opened),
+            // Down the middle to start with. The divider between them is what
+            // moves it from there.
+            ratio: 0.5,
         });
         self.tabs[index].focus = Pane::Second;
         self.active = index;
@@ -1810,20 +1947,62 @@ impl App {
         }
     }
 
-    /// Writes the active tab's output to a file and opens a Claude Code
-    /// session on it.
+    /// Hands this session over to Claude Code, with `panes` deciding whether
+    /// the other half of a split goes with it.
     ///
-    /// Two steps rather than one because they fail for different reasons and
-    /// the user can act on each: nothing to analyze yet, or no `claude` on the
-    /// PATH.
-    fn analyze_with_claude(&mut self, at: At, scope: analyze::Scope) {
-        let Some(tab) = self.pane(at) else {
+    /// The focused pane is always in the file. A split is usually two halves of
+    /// one problem - a routine running on one side, a global inspected on the
+    /// other - so `Both` is there for when leaving one out is what would make
+    /// the answer useless. On a tab that is not split it means the same thing
+    /// as `Focused`.
+    fn analyze_with_claude(&mut self, at: At, scope: analyze::Scope, panes: analyze::Panes) {
+        if self.pane(at).is_none() {
             self.set_status(tr("No active session."));
             return;
+        }
+        // Both panes in the order they are on screen, so "pane 1" in the file
+        // is the pane called `1:` in the tab strip - rather than in the order
+        // the keyboard happens to be in.
+        let wanted: Vec<At> = match panes {
+            analyze::Panes::Both if self.tabs.get(at.tab).is_some_and(|t| t.split.is_some()) => {
+                vec![
+                    At {
+                        tab: at.tab,
+                        pane: Pane::First,
+                    },
+                    At {
+                        tab: at.tab,
+                        pane: Pane::Second,
+                    },
+                ]
+            }
+            _ => vec![at],
         };
-        let endpoint = tab.profile.endpoint();
-        let selection = tab.view.selected_text(&tab.grid);
-        let path = match analyze::write_context(&tab.grid, scope, &endpoint, selection.as_deref()) {
+
+        // The endpoint and the selection come out in one pass, and the sources
+        // borrow them: both are owned values a `Source` only points at, so they
+        // have to outlive it.
+        let captured: Vec<(&Tab, String, Option<String>)> = wanted
+            .iter()
+            .filter_map(|&at| self.pane(at))
+            .map(|tab| {
+                (
+                    tab,
+                    tab.profile.endpoint(),
+                    tab.view.selected_text(&tab.grid),
+                )
+            })
+            .collect();
+        let sources: Vec<analyze::Source> = captured
+            .iter()
+            .map(|(tab, endpoint, selection)| analyze::Source {
+                endpoint,
+                grid: &tab.grid,
+                selection: selection.as_deref(),
+            })
+            .collect();
+
+        let path = match analyze::write_context(&sources, scope) {
             Ok(path) => path,
             Err(e) => {
                 self.set_status(tr1("Could not prepare the output: {}", &format!("{e:#}")));
@@ -2123,6 +2302,41 @@ impl App {
         }
     }
 
+    /// Copies the selection and types it straight back into the same session.
+    ///
+    /// The gesture this terminal is actually asked for: a global name, a
+    /// routine label or an error location is on screen, and it has to reach the
+    /// command line. By hand that is a copy, a click into the prompt and a
+    /// paste. The clipboard is filled all the same, so what was picked up is
+    /// still available to whatever else the user is working in.
+    ///
+    /// It goes through the same sanitiser a real paste does, so a selection
+    /// spanning two lines arrives as two lines - which at a prompt means IRIS
+    /// runs the first of them. That is what pasting the same text does, and
+    /// pretending otherwise would be a different gesture with the same name.
+    fn copy_and_paste(&mut self, ctx: &Context, at: At) {
+        let Some((text, encoding)) = self.pane(at).and_then(|tab| {
+            Some((
+                tab.view.selected_text(&tab.grid)?,
+                tab.profile.wire_encoding(),
+            ))
+        }) else {
+            return;
+        };
+        ctx.copy_text(text.clone());
+        let wire = self
+            .plugins
+            .on_input(&encoding.encode(&input::sanitize_paste(&text)));
+        if let Some(tab) = self.pane_mut(at) {
+            // The same two things typing does: what the recall had walked to is
+            // no longer where the line came from, and the view returns to the
+            // live output.
+            tab.recall_step = None;
+            tab.view.scroll_to_bottom();
+            tab.send(&wire);
+        }
+    }
+
     fn send_lines_to_active(&mut self, lines: &[String]) {
         let at = self.focused_at();
         let Some(tab) = self.pane(at) else {
@@ -2193,7 +2407,11 @@ impl App {
         // Only the focused pane follows the active session, and only it claims
         // the keyboard when nothing else holds it. Two panes both claiming it
         // would take it from each other every frame.
-        let take_focus = focused && self.focused_tab != Some(uid);
+        let role = terminal_view::PaneRole {
+            focused,
+            take_focus: focused && self.focused_tab != Some(uid),
+            split: self.tabs.get(at.tab).is_some_and(|tab| tab.split.is_some()),
+        };
         if focused {
             self.focused_tab = Some(uid);
         }
@@ -2203,7 +2421,7 @@ impl App {
                 return PaneMeasure::default();
             };
             let has_selection = tab.view.selection.map(|s| !s.is_empty()).unwrap_or(false);
-            let result = draw_pane(ui, tab, theme, &opts, take_focus, focused);
+            let result = draw_pane(ui, tab, theme, &opts, role);
             (result, has_selection)
         };
 
@@ -2234,6 +2452,7 @@ impl App {
             use terminal_view::ContextAction;
             match action {
                 ContextAction::CopySelection => self.copy_selection(ctx, at),
+                ContextAction::CopyAndPaste => self.copy_and_paste(ctx, at),
                 ContextAction::Paste => {
                     // The clipboard is only readable through egui's paste
                     // event, so ask for one rather than reaching for the OS
@@ -2252,8 +2471,24 @@ impl App {
                     }
                 }
                 ContextAction::ExportScreen => self.panels.show_export = true,
-                ContextAction::Analyze(scope) => self.analyze_with_claude(at, scope),
+                ContextAction::Analyze(scope, panes) => self.analyze_with_claude(at, scope, panes),
                 ContextAction::ClearTerminal => self.clear_terminal(at),
+                // The layout of the tab this pane is in. Recorded rather than
+                // done, because the tabs are being drawn - see
+                // [`LayoutAction`]. `at` is the pane the menu was opened over,
+                // so Close closes that session and nothing else.
+                ContextAction::SplitRight => {
+                    self.pending_layout = Some(LayoutAction::Split(at.tab, SplitDir::Right));
+                }
+                ContextAction::SplitBottom => {
+                    self.pending_layout = Some(LayoutAction::Split(at.tab, SplitDir::Bottom));
+                }
+                ContextAction::Unsplit => {
+                    self.pending_layout = Some(LayoutAction::Unsplit(at.tab));
+                }
+                ContextAction::ClosePane => {
+                    self.pending_layout = Some(LayoutAction::ClosePane(at));
+                }
             }
         }
 
@@ -2266,7 +2501,18 @@ impl App {
         // them out of the frame's events itself, but that is too late to stop
         // them reaching IRIS from here - and a recorded Ctrl+D would otherwise
         // have ended the session it was recorded in.
-        if !result.response.has_focus() || self.panels.capture_shortcut {
+        //
+        // And nothing is typed into IRIS while this window is not the active
+        // one. That should never arise - the system sends keys to the window
+        // that has them - but the shell puts surfaces of its own over the top
+        // of whatever is in front, the clipboard history (Win+V) among them,
+        // and a keystroke meant for one of those must not reach a live session:
+        // Up and Down at an IRIS prompt walk the command history, and the
+        // session is on a database the whole team shares. `focused` is unknown
+        // on a platform that does not report it, and unknown counts as focused
+        // rather than leaving the terminal unable to type at all.
+        let window_active = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if !result.response.has_focus() || self.panels.capture_shortcut || !window_active {
             return measure;
         }
 
@@ -2409,6 +2655,67 @@ impl App {
     }
 }
 
+/// The handle between two panes: a separator that can be dragged.
+///
+/// Returns the new ratio while it is being dragged, and `None` otherwise. A
+/// double-click puts the split back down the middle, which is the way out of a
+/// layout dragged somewhere useless.
+///
+/// `across` is the length of the divider - the height of a left/right split,
+/// the width of a top/bottom one - and `usable` is the room the two panes
+/// share.
+fn split_divider(
+    ui: &mut egui::Ui,
+    dir: SplitDir,
+    across: f32,
+    usable: f32,
+    ratio: f32,
+) -> Option<f32> {
+    let size = match dir {
+        SplitDir::Right => egui::Vec2::new(SPLIT_DIVIDER, across),
+        SplitDir::Bottom => egui::Vec2::new(across, SPLIT_DIVIDER),
+    };
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+
+    // A hairline down the middle of the hit area rather than a fill of it: the
+    // grab area has to be wide enough to aim a mouse at, and a 6-point band of
+    // colour between two terminals would read as a gap in the window.
+    let visuals = ui.style().interact(&response);
+    let active = response.hovered() || response.dragged();
+    let stroke = if active {
+        egui::Stroke::new(2.0_f32, visuals.fg_stroke.color)
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
+    let painter = ui.painter();
+    match dir {
+        SplitDir::Right => {
+            painter.vline(rect.center().x, rect.y_range(), stroke);
+        }
+        SplitDir::Bottom => {
+            painter.hline(rect.x_range(), rect.center().y, stroke);
+        }
+    }
+    if active {
+        ui.ctx().set_cursor_icon(match dir {
+            SplitDir::Right => egui::CursorIcon::ResizeHorizontal,
+            SplitDir::Bottom => egui::CursorIcon::ResizeVertical,
+        });
+    }
+
+    if response.double_clicked() {
+        return Some(0.5);
+    }
+    if !response.dragged() {
+        return None;
+    }
+    let delta = match dir {
+        SplitDir::Right => response.drag_delta().x,
+        SplitDir::Bottom => response.drag_delta().y,
+    };
+    (delta != 0.0).then(|| dragged_ratio(usable, ratio, delta))
+}
+
 /// Draws one session: the notes above its terminal, and the terminal.
 ///
 /// A free function rather than a method because it needs the session and
@@ -2419,8 +2726,7 @@ fn draw_pane(
     tab: &mut Tab,
     theme: &Theme,
     opts: &RenderOpts,
-    take_focus: bool,
-    claim_idle: bool,
+    role: terminal_view::PaneRole,
 ) -> terminal_view::RenderResult {
     // Autologon status belongs next to the terminal it applies to.
     if let Some(note) = tab.autologon.status_note() {
@@ -2443,16 +2749,7 @@ fn draw_pane(
     }
 
     let uid = tab.uid;
-    terminal_view::show(
-        ui,
-        &tab.grid,
-        &mut tab.view,
-        theme,
-        opts,
-        uid,
-        take_focus,
-        claim_idle,
-    )
+    terminal_view::show(ui, &tab.grid, &mut tab.view, theme, opts, uid, role)
 }
 
 /// Loads the organisation file (if configured) and the personal one, and
@@ -2623,14 +2920,17 @@ impl eframe::App for App {
                         let room = ui.available_size();
                         let mut top = PaneMeasure::default();
                         let mut bottom = PaneMeasure::default();
+                        let ratio = self.tabs[active].split_ratio();
+                        // The panes are given exact sizes, so what the divider
+                        // and the spacing around it take comes off the room
+                        // first: a share that did not fit would be clipped at
+                        // the window edge.
+                        let mut dragged = None;
                         match dir {
                             SplitDir::Right => {
-                                // Half each, less what the divider and the
-                                // spacing around it take: the panes are given
-                                // exact sizes, and a share that did not fit
-                                // would be clipped at the window edge.
                                 let gap = ui.spacing().item_spacing.x * 2.0 + SPLIT_DIVIDER;
-                                let half = egui::Vec2::new((room.x - gap) / 2.0, room.y);
+                                let usable = room.x - gap;
+                                let first_width = split_extent(usable, ratio);
                                 ui.horizontal(|ui| {
                                     top = self.sized_pane(
                                         ui,
@@ -2638,44 +2938,53 @@ impl eframe::App for App {
                                         &theme,
                                         first,
                                         focus == Pane::First,
-                                        half,
+                                        egui::Vec2::new(first_width, room.y),
                                     );
-                                    ui.separator();
+                                    dragged = split_divider(ui, dir, room.y, usable, ratio);
                                     bottom = self.sized_pane(
                                         ui,
                                         ctx,
                                         &theme,
                                         second,
                                         focus == Pane::Second,
-                                        half,
+                                        egui::Vec2::new(usable - first_width, room.y),
                                     );
                                 });
                             }
                             SplitDir::Bottom => {
                                 let gap = ui.spacing().item_spacing.y * 2.0 + SPLIT_DIVIDER;
-                                let half = egui::Vec2::new(room.x, (room.y - gap) / 2.0);
+                                let usable = room.y - gap;
+                                let first_height = split_extent(usable, ratio);
                                 top = self.sized_pane(
                                     ui,
                                     ctx,
                                     &theme,
                                     first,
                                     focus == Pane::First,
-                                    half,
+                                    egui::Vec2::new(room.x, first_height),
                                 );
-                                ui.separator();
+                                dragged = split_divider(ui, dir, room.x, usable, ratio);
                                 bottom = self.sized_pane(
                                     ui,
                                     ctx,
                                     &theme,
                                     second,
                                     focus == Pane::Second,
-                                    half,
+                                    egui::Vec2::new(room.x, usable - first_height),
                                 );
+                            }
+                        }
+                        // Written back after both panes have been drawn: the
+                        // frame the drag happened in is already laid out, and
+                        // the next one opens at the new ratio.
+                        if let Some(ratio) = dragged {
+                            if let Some(split) = self.tabs[active].split.as_mut() {
+                                split.ratio = ratio;
                             }
                         }
                         // Clicking a pane is how the keyboard is moved into it,
                         // and the strip entry says which one has it - `1:` or
-                        // `2:` in front of that session's name.
+                        // `2:` in front of that session name.
                         if top.clicked {
                             self.tabs[active].focus = Pane::First;
                         }
@@ -2709,6 +3018,15 @@ impl eframe::App for App {
                     }
                 }
             });
+
+        // The panes have finished drawing, so the tabs can move again.
+        if let Some(asked) = self.pending_layout.take() {
+            match asked {
+                LayoutAction::Split(index, dir) => self.split_tab(index, dir),
+                LayoutAction::Unsplit(index) => self.remove_split(index),
+                LayoutAction::ClosePane(at) => self.close_pane(at),
+            }
+        }
 
         self.rename_tab_dialog(ctx);
         self.close_confirm_dialog(ctx);
@@ -2842,6 +3160,114 @@ pub fn discover_instances() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tab with no session behind it. Closing a pane is about which session
+    /// ends up in the tab, and needs no IRIS to answer.
+    fn bare_tab(name: &str) -> Tab {
+        let profile = Profile {
+            name: name.to_string(),
+            ..Profile::default()
+        };
+        Tab {
+            uid: NEXT_TAB_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            autologon: Autologon::new(&profile),
+            grid: Grid::new(80, 24, 100),
+            profile,
+            session: None,
+            parser: vte::Parser::new(),
+            view: ViewState::default(),
+            log: None,
+            custom_title: None,
+            namespace: None,
+            commands: Vec::new(),
+            recall_step: None,
+            clear_asked: None,
+            ended: false,
+            error: None,
+            split: None,
+            focus: Pane::First,
+        }
+    }
+
+    fn split_tab_of(first: &str, second: &str) -> Tab {
+        let mut tab = bare_tab(first);
+        tab.split = Some(Split {
+            dir: SplitDir::Right,
+            tab: Box::new(bare_tab(second)),
+            ratio: 0.5,
+        });
+        tab.focus = Pane::Second;
+        tab
+    }
+
+    /// Closing the second pane leaves the first where it was.
+    #[test]
+    fn closing_the_second_pane_leaves_the_first_in_the_tab() {
+        let mut tab = split_tab_of("left", "right");
+        tab.close_pane(Pane::Second);
+        assert!(tab.split.is_none(), "the tab should no longer be split");
+        assert_eq!(tab.profile.name, "left");
+        assert_eq!(tab.focus, Pane::First);
+    }
+
+    /// Closing the first pane promotes the second into the tab, session and
+    /// all - it is a live IRIS session, and the click was on the other one.
+    #[test]
+    fn closing_the_first_pane_promotes_the_second_into_the_tab() {
+        let mut tab = split_tab_of("left", "right");
+        let promoted = tab.pane(Pane::Second).map(|pane| pane.uid);
+        tab.close_pane(Pane::First);
+        assert!(tab.split.is_none(), "the tab should no longer be split");
+        assert_eq!(tab.profile.name, "right");
+        assert_eq!(Some(tab.uid), promoted, "the pane keeps its own identity");
+        assert_eq!(tab.focus, Pane::First);
+    }
+
+    /// The divider can be dragged anywhere, and neither pane may be squeezed
+    /// away: a pane a couple of characters wide would have IRIS truncating
+    /// every line it wrote at that margin.
+    #[test]
+    fn a_dragged_split_never_squeezes_a_pane_below_the_minimum() {
+        let usable = 900.0_f32;
+        for ratio in [-1.0, 0.0, 0.01, 0.5, 0.99, 1.0, 2.0] {
+            let first = split_extent(usable, ratio);
+            assert!(
+                first >= MIN_PANE && usable - first >= MIN_PANE,
+                "ratio {ratio} left {first} of {usable}"
+            );
+        }
+    }
+
+    /// A window too narrow to give both sides a minimum has no fair answer but
+    /// half each, and must not come back with a negative pane.
+    #[test]
+    fn a_window_with_no_room_for_two_minimums_splits_evenly() {
+        let usable = MIN_PANE;
+        assert_eq!(split_extent(usable, 0.9), usable / 2.0);
+    }
+
+    /// Dragging left then right by the same amount comes back to where it
+    /// started, which is what stops the handle lagging behind the pointer.
+    #[test]
+    fn dragging_the_divider_and_back_returns_to_the_same_place() {
+        let usable = 800.0_f32;
+        let moved = dragged_ratio(usable, 0.5, 120.0);
+        let back = dragged_ratio(usable, moved, -120.0);
+        assert!((back - 0.5).abs() < 0.001, "came back to {back}");
+        assert!(split_extent(usable, moved) > split_extent(usable, 0.5));
+    }
+
+    /// A drag past the end stops at the minimum rather than banking movement
+    /// nothing can be done with.
+    #[test]
+    fn a_drag_past_the_edge_stops_at_the_minimum() {
+        let usable = 600.0_f32;
+        let far = dragged_ratio(usable, 0.5, -10_000.0);
+        assert_eq!(split_extent(usable, far), MIN_PANE);
+        // And one step back off the edge moves again straight away.
+        let back = dragged_ratio(usable, far, 50.0);
+        assert!((split_extent(usable, back) - (MIN_PANE + 50.0)).abs() < 0.001);
+    }
 
     /// The window is corrected from a measurement, so the check that matters is
     /// that measuring the corrected window gives the geometry that was asked

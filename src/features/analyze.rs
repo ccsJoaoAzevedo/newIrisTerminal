@@ -32,6 +32,42 @@ pub enum Scope {
     Selection,
 }
 
+/// Which of a split tab's panes to hand over.
+///
+/// Only ever a question when a tab *is* split. One pane is the honest default -
+/// it is the one being typed in - but a split is usually two halves of one
+/// problem (a routine running on the left, a global inspected on the right),
+/// and cutting one of them out of the context is exactly what makes the answer
+/// useless.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Panes {
+    /// The pane the keyboard is in.
+    #[default]
+    Focused,
+    /// Both of a split tab's sessions, each under a heading of its own.
+    Both,
+}
+
+impl Panes {
+    /// Menu entry. Keyed for translation like every other label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Panes::Focused => "This pane",
+            Panes::Both => "Both panes",
+        }
+    }
+}
+
+/// One session's contribution to a context file.
+pub struct Source<'a> {
+    /// What the session is called - the profile's endpoint.
+    pub endpoint: &'a str,
+    pub grid: &'a Grid,
+    /// What is highlighted in this session, for [`Scope::Selection`]. Lives in
+    /// the view, not in the grid, so only the caller knows it.
+    pub selection: Option<&'a str>,
+}
+
 impl Scope {
     pub const ALL: [Scope; 4] = [
         Scope::All,
@@ -135,13 +171,12 @@ pub fn analysis_dir() -> PathBuf {
 /// system prompt, so nothing here should read as a task - the user has not
 /// asked anything yet, and the session should not answer a question nobody
 /// put.
-pub fn write_context(
-    grid: &Grid,
-    scope: Scope,
-    endpoint: &str,
-    selection: Option<&str>,
-) -> Result<PathBuf> {
-    write_context_in(&analysis_dir(), grid, scope, endpoint, selection)
+///
+/// `sources` is one session, or both panes of a split tab. Two of them arrive
+/// as two headed sections rather than one run of text, so the model can tell
+/// which prompt said what.
+pub fn write_context(sources: &[Source], scope: Scope) -> Result<PathBuf> {
+    write_context_in(&analysis_dir(), sources, scope)
 }
 
 /// [`write_context`], into a directory of the caller's choosing.
@@ -149,21 +184,16 @@ pub fn write_context(
 /// Split out for the tests, which have no business writing into the config
 /// directory of whoever is running them - and which, hammering one directory in
 /// parallel, were occasionally losing a race with the filesystem there.
-fn write_context_in(
-    dir: &Path,
-    grid: &Grid,
-    scope: Scope,
-    endpoint: &str,
-    selection: Option<&str>,
-) -> Result<PathBuf> {
-    // The selection is the caller's to know: it lives in the view, not in the
-    // grid, and the grid has no idea what the mouse has been doing.
-    let text = if scope.is_selection() {
-        selection.unwrap_or_default().trim_end().to_string()
-    } else {
-        transcript(grid, scope)
-    };
-    if text.trim().is_empty() {
+fn write_context_in(dir: &Path, sources: &[Source], scope: Scope) -> Result<PathBuf> {
+    // A pane with nothing in it is dropped rather than refused: asking about
+    // both halves of a split where only one has been used is a reasonable
+    // thing to do, and the empty half has nothing to contribute either way.
+    let captured: Vec<(&str, String)> = sources
+        .iter()
+        .map(|source| (source.endpoint, text_of(source, scope)))
+        .filter(|(_, text)| !text.trim().is_empty())
+        .collect();
+    if captured.is_empty() {
         if scope.is_selection() {
             bail!("nothing is selected");
         }
@@ -173,21 +203,47 @@ fn write_context_in(
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = free_path(dir)?;
 
-    let body = format!(
+    let mut body = format!(
         "# Context: the user's InterSystems IRIS terminal\n\n\
-         Below is output captured from the terminal session the user is working \
-         in - ObjectScript on InterSystems IRIS/Caché. It is background for \
-         whatever they are about to ask; there is no question in it, so wait \
-         for theirs rather than volunteering an analysis of it.\n\n\
-         - Session: {endpoint}\n\
+         Below is output captured from the terminal the user is working in - \
+         ObjectScript on InterSystems IRIS/Caché. It is background for whatever \
+         they are about to ask; there is no question in it, so wait for theirs \
+         rather than volunteering an analysis of it.\n\n\
          - Captured: {}\n\
-         - Scope: {}\n\n\
-         ```text\n{text}\n```\n",
+         - Scope: {}\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         scope.label(),
     );
+    // One session reads as one capture, so it keeps the flat shape it always
+    // had. Two get a heading each, and a line saying they were side by side -
+    // which is the fact that makes reading them together worth anything.
+    if let [(endpoint, text)] = captured.as_slice() {
+        body.push_str(&format!("- Session: {endpoint}\n\n```text\n{text}\n```\n"));
+    } else {
+        body.push_str(&format!(
+            "- Panes: {} sessions, side by side in one split view\n",
+            captured.len()
+        ));
+        for (n, (endpoint, text)) in captured.iter().enumerate() {
+            body.push_str(&format!(
+                "\n## Pane {} - {endpoint}\n\n```text\n{text}\n```\n",
+                n + 1
+            ));
+        }
+    }
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
+}
+
+/// What `scope` covers in one session.
+fn text_of(source: &Source, scope: Scope) -> String {
+    if scope.is_selection() {
+        // The selection is the caller's to know: it lives in the view, not in
+        // the grid, and the grid has no idea what the mouse has been doing.
+        source.selection.unwrap_or_default().trim_end().to_string()
+    } else {
+        transcript(source.grid, scope)
+    }
 }
 
 /// A file in `dir` that does not exist yet, and now does.
@@ -329,11 +385,18 @@ mod tests {
     fn grid_with(lines: &[&str]) -> Grid {
         let mut grid = Grid::new(40, lines.len().max(1), 100);
         for (r, line) in lines.iter().enumerate() {
-            for (c, ch) in line.chars().enumerate() {
-                grid.screen[r].cells[c].ch = ch;
-            }
+            grid.screen[r].set_text(line);
         }
         grid
+    }
+
+    /// One pane's worth of context, the shape nearly every test wants.
+    fn source<'a>(grid: &'a Grid, selection: Option<&'a str>) -> Source<'a> {
+        Source {
+            endpoint: "TEST",
+            grid,
+            selection,
+        }
     }
 
     #[test]
@@ -392,7 +455,7 @@ mod tests {
     fn an_empty_session_is_refused() {
         let dir = tempdir("empty");
         let grid = Grid::new(40, 6, 100);
-        let result = write_context_in(&dir, &grid, Scope::All, "TEST", None);
+        let result = write_context_in(&dir, &[source(&grid, None)], Scope::All);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -404,10 +467,68 @@ mod tests {
     fn two_captures_in_the_same_second_get_two_files() {
         let dir = tempdir("twice");
         let grid = grid_with(&["USER>write 1", "1"]);
-        let first = write_context_in(&dir, &grid, Scope::All, "TEST", None).expect("first");
-        let second = write_context_in(&dir, &grid, Scope::All, "TEST", None).expect("second");
+        let first = write_context_in(&dir, &[source(&grid, None)], Scope::All).expect("first");
+        let second = write_context_in(&dir, &[source(&grid, None)], Scope::All).expect("second");
         assert_ne!(first, second);
         assert!(first.exists() && second.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both panes: each session under a heading of its own, so the model can
+    /// tell which prompt said what instead of reading one run of interleaved
+    /// output.
+    #[test]
+    fn both_panes_are_handed_over_as_two_headed_sections() {
+        let dir = tempdir("both");
+        let left = grid_with(&["USER>write 1", "1"]);
+        let right = grid_with(&["%SYS>write 2", "2"]);
+        let path = write_context_in(
+            &dir,
+            &[
+                Source {
+                    endpoint: "IRIS:USER",
+                    grid: &left,
+                    selection: None,
+                },
+                Source {
+                    endpoint: "IRIS:%SYS",
+                    grid: &right,
+                    selection: None,
+                },
+            ],
+            Scope::All,
+        )
+        .expect("written");
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(body.contains("## Pane 1 - IRIS:USER"), "{body}");
+        assert!(body.contains("## Pane 2 - IRIS:%SYS"), "{body}");
+        assert!(body.contains("USER>write 1") && body.contains("%SYS>write 2"));
+        assert!(
+            body.contains("side by side"),
+            "the file should say the two were on screen together: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A split where only one pane has been used still analyses: the empty
+    /// half is dropped, and what is left reads as the single capture it is.
+    #[test]
+    fn an_empty_pane_is_left_out_rather_than_refusing_the_pair() {
+        let dir = tempdir("half");
+        let used = grid_with(&["USER>write 1", "1"]);
+        let fresh = Grid::new(40, 6, 100);
+        let path = write_context_in(
+            &dir,
+            &[source(&used, None), source(&fresh, None)],
+            Scope::All,
+        )
+        .expect("written");
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(body.contains("USER>write 1"));
+        assert!(
+            !body.contains("## Pane"),
+            "one capture, no headings: {body}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -420,10 +541,8 @@ mod tests {
         let grid = grid_with(&["USER>write 1", "1", "USER>write 2", "2"]);
         let path = write_context_in(
             &dir,
-            &grid,
+            &[source(&grid, Some("<UNDEFINED> zRun+7"))],
             Scope::Selection,
-            "TEST",
-            Some("<UNDEFINED> zRun+7"),
         )
         .expect("written");
         let body = std::fs::read_to_string(&path).expect("read back");
@@ -442,7 +561,7 @@ mod tests {
         let dir = tempdir("no-selection");
         let grid = grid_with(&["USER>write 1", "1"]);
         for selection in [None, Some(""), Some("   ")] {
-            assert!(write_context_in(&dir, &grid, Scope::Selection, "TEST", selection).is_err());
+            assert!(write_context_in(&dir, &[source(&grid, selection)], Scope::Selection).is_err());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -488,7 +607,7 @@ mod tests {
     fn the_context_file_asks_for_nothing() {
         let dir = tempdir("context");
         let grid = grid_with(&["USER>write 1", "1"]);
-        let path = write_context_in(&dir, &grid, Scope::All, "TEST", None).expect("written");
+        let path = write_context_in(&dir, &[source(&grid, None)], Scope::All).expect("written");
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.contains("USER>write 1"));
         assert!(body.contains("wait for theirs"));

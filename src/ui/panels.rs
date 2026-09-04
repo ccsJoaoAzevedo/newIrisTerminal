@@ -69,6 +69,13 @@ pub struct PanelState {
     pub editing: Option<(usize, usize)>,
     /// Draft being edited, kept separate so Cancel is a real cancel.
     pub draft: Option<Macro>,
+    /// The body exactly as it is being typed, before it is split into lines.
+    ///
+    /// The field's own text, in other words, rather than the macro's lines
+    /// rejoined every frame: rejoining meant every keystroke went through
+    /// `trim`, and a space at the end of a line was taken away again before it
+    /// could be drawn. Split into lines once, on Save.
+    body_draft: String,
     /// The editor is waiting for a key combination to be pressed, so that it
     /// can be read off the keyboard instead of typed out. Public because the
     /// app has to stop claiming shortcuts for itself while it is set, or Ctrl+T
@@ -105,6 +112,7 @@ impl PanelState {
     /// Opens the editor on one macro, on a copy of it.
     fn open_editor(&mut self, at: (usize, usize), draft: Macro) {
         self.editing = Some(at);
+        self.body_draft = draft.body.join("\n");
         self.draft = Some(draft);
         self.reveal_body = false;
         self.capture_shortcut = false;
@@ -417,7 +425,13 @@ fn macro_details(
 
 /// How many body lines a hidden macro has, without saying what they are.
 fn hidden_body_note(m: &Macro) -> String {
-    match m.body.len() {
+    hidden_lines_note(m.body.len())
+}
+
+/// [`hidden_body_note`] from a line count, for the editor - whose body is a
+/// draft string rather than the macro's own lines.
+fn hidden_lines_note(count: usize) -> String {
+    match count {
         1 => tr("1 command hidden").to_string(),
         n => tr1("{} commands hidden", &n.to_string()),
     }
@@ -445,6 +459,9 @@ pub fn macro_editor_dialog(
     let mut open = true;
     let mut reveal = state.reveal_body;
     let mut capture = state.capture_shortcut;
+    // Taken out of the state for the duration of the window, which borrows the
+    // rest of it to reach the draft.
+    let mut body = std::mem::take(&mut state.body_draft);
 
     egui::Window::new(tr("Edit macro"))
         .id(egui::Id::new("nit-macro-editor"))
@@ -556,24 +573,17 @@ pub fn macro_editor_dialog(
             ui.label(tr("Body - one command per line, {{param}} is substituted"));
             if draft.hide_command && !reveal {
                 ui.horizontal(|ui| {
-                    ui.weak(hidden_body_note(draft));
+                    ui.weak(hidden_lines_note(
+                        crate::features::macros::body_lines(&body).len(),
+                    ));
                     if ui.button(tr("Reveal")).clicked() {
                         reveal = true;
                     }
                 });
             } else {
-                let mut body = draft.body.join("\n");
-                if ui
-                    .add(egui::TextEdit::multiline(&mut body).desired_rows(4))
-                    .changed()
-                {
-                    draft.body = body
-                        .lines()
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                }
+                // The field owns the text and nothing rewrites it between
+                // keystrokes - see `PanelState::body_draft`.
+                ui.add(egui::TextEdit::multiline(&mut body).desired_rows(4));
             }
 
             ui.label(tr("Parameters"));
@@ -606,6 +616,9 @@ pub fn macro_editor_dialog(
                     // shared file.
                     let mut saved = draft.clone();
                     saved.origin = Origin::Personal;
+                    // Where the typed text becomes lines: once, on the way to
+                    // the file, rather than on every keystroke.
+                    saved.body = crate::features::macros::body_lines(&body);
                     groups[gi].macros[mi] = saved;
                     close = true;
                     request = Some(UiRequest::SavePersonalMacros);
@@ -618,10 +631,12 @@ pub fn macro_editor_dialog(
 
     state.reveal_body = reveal;
     state.capture_shortcut = capture;
+    state.body_draft = body;
 
     if close || !open {
         state.editing = None;
         state.draft = None;
+        state.body_draft = String::new();
         state.reveal_body = false;
         state.capture_shortcut = false;
     }
