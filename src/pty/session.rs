@@ -14,6 +14,10 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use portable_pty::{Child, MasterPty, PtySize};
 
+use std::path::Path;
+
+use portable_pty::CommandBuilder;
+
 use super::launcher::{IrisLauncher, LaunchSpec};
 use super::telnet::TelnetSession;
 
@@ -44,6 +48,26 @@ pub struct PtySession {
     rows: u16,
 }
 
+/// A pseudo-terminal of the given size, with the size it settled on.
+///
+/// The size matters at spawn time: IRIS reads the terminal dimensions once at
+/// login, so opening at 80x24 and resizing immediately makes full-screen
+/// routines repaint needlessly. A shell cares less, but there is no reason to
+/// open one at the wrong size either.
+fn open_pty(cols: u16, rows: u16) -> Result<(portable_pty::PtyPair, u16, u16)> {
+    let cols = cols.max(2);
+    let rows = rows.max(2);
+    let pair = portable_pty::native_pty_system()
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("opening a pseudo-terminal")?;
+    Ok((pair, cols, rows))
+}
+
 impl PtySession {
     /// Starts a session at the given size. The size matters at spawn time:
     /// IRIS reads the terminal dimensions once at login, so opening at 80x24
@@ -54,20 +78,46 @@ impl PtySession {
         cols: u16,
         rows: u16,
     ) -> Result<Self> {
-        let cols = cols.max(2);
-        let rows = rows.max(2);
-
-        let pty_system = portable_pty::native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("opening a pseudo-terminal")?;
-
+        let (pair, cols, rows) = open_pty(cols, rows)?;
         let cmd = launcher.command(spec)?;
+        Self::from_command(
+            pair,
+            cmd,
+            cols,
+            rows,
+            &format!("IRIS session for instance {}", spec.instance),
+        )
+    }
+
+    /// Starts a shell rather than an IRIS session.
+    ///
+    /// Everything below the command is the same - a pseudo-terminal, a child,
+    /// and a reader thread - which is the whole reason a shell can be a plugin
+    /// that only declares a program. See [`crate::plugins::shells`].
+    pub fn spawn_shell(program: &Path, args: &[String], cols: u16, rows: u16) -> Result<Self> {
+        let (pair, cols, rows) = open_pty(cols, rows)?;
+        let cmd = super::launcher::shell_command(program, args);
+        Self::from_command(
+            pair,
+            cmd,
+            cols,
+            rows,
+            &format!("shell {}", program.display()),
+        )
+    }
+
+    /// The half of starting a session that has nothing to do with what is being
+    /// started: the child, the reader thread, and the handles they need.
+    ///
+    /// `what` names the thing being started, for the error a failed spawn
+    /// produces - which is the message the tab shows.
+    fn from_command(
+        pair: portable_pty::PtyPair,
+        cmd: CommandBuilder,
+        cols: u16,
+        rows: u16,
+        what: &str,
+    ) -> Result<Self> {
         // Whether the command is the session itself or a shell in front of it.
         let wrapped = cmd
             .get_argv()
@@ -82,7 +132,7 @@ impl PtySession {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .with_context(|| format!("starting IRIS session for instance {}", spec.instance))?;
+            .with_context(|| format!("starting {what}"))?;
 
         // The slave handle must be dropped, or the PTY never reports EOF when
         // the child exits and the reader thread hangs forever.
@@ -258,6 +308,12 @@ impl Session {
         rows: u16,
     ) -> Result<Self> {
         PtySession::spawn(launcher, spec, cols, rows).map(Session::Pty)
+    }
+
+    /// Opens a shell rather than an IRIS session. See
+    /// [`crate::plugins::shells`].
+    pub fn shell(program: &Path, args: &[String], cols: u16, rows: u16) -> Result<Self> {
+        PtySession::spawn_shell(program, args, cols, rows).map(Session::Pty)
     }
 
     /// Opens a session on a remote server over Telnet.

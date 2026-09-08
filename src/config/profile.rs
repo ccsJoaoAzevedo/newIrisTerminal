@@ -55,6 +55,23 @@ pub struct Profile {
     /// this field being set means.
     #[serde(default)]
     pub remote: Option<Remote>,
+    /// A shell to run instead of an IRIS session.
+    ///
+    /// Set when the tab was opened from the Shells section of the new-session
+    /// menu; see [`crate::plugins::shells`]. It takes precedence over
+    /// everything IRIS-shaped on this profile, because a `pwsh.exe` has no
+    /// instance, no namespace and nothing to log in to - which is exactly what
+    /// this field being set means.
+    #[serde(default)]
+    pub shell: Option<ShellCommand>,
+}
+
+/// The program a shell profile runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCommand {
+    pub program: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// Where a remote session connects to.
@@ -80,6 +97,7 @@ impl Default for Profile {
             logging: LogMode::Off,
             macro_file: None,
             remote: None,
+            shell: None,
         }
     }
 }
@@ -158,11 +176,49 @@ impl Profile {
     /// Where this profile's session goes, in one line, for a tooltip or the
     /// status bar.
     pub fn endpoint(&self) -> String {
+        if let Some(shell) = self.shell.as_ref() {
+            // The program's own file name: `pwsh.exe` is what someone looking
+            // at the bar wants, not the three directories above it.
+            return shell
+                .program
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| shell.program.display().to_string());
+        }
         match self.remote.as_ref() {
             Some(remote) => format!("{}:{} (telnet)", remote.address, remote.port),
             None if self.instance.is_empty() => "no instance configured".to_string(),
             None => self.instance.clone(),
         }
+    }
+
+    /// A profile that opens one of the machine's shells.
+    ///
+    /// Deliberately not built from the current profile the way a server pick
+    /// is: a shell inherits nothing IRIS-shaped, because none of it means
+    /// anything to `bash`. Autologon would type a username at it, a namespace
+    /// would be sent as a command, and the logging modes describe an IRIS
+    /// transcript. What it does keep is the shell's own name, which is what
+    /// names the tab.
+    pub fn for_shell(shell: &crate::plugins::shells::Shell) -> Profile {
+        Profile {
+            name: shell.name.clone(),
+            instance: shell.name.clone(),
+            namespace: String::new(),
+            shell: Some(ShellCommand {
+                program: shell.program.clone(),
+                args: shell.args.clone(),
+            }),
+            ..Profile::default()
+        }
+    }
+
+    /// Whether this profile runs a shell rather than an IRIS session.
+    ///
+    /// Read by everything that would otherwise assume IRIS is at the other
+    /// end: the ObjectScript colouring, the command history, and autologon.
+    pub fn is_shell(&self) -> bool {
+        self.shell.is_some()
     }
 
     pub fn launch_spec(&self) -> crate::pty::launcher::LaunchSpec {

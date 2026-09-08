@@ -112,6 +112,37 @@ fn announce_terminal(cmd: &mut CommandBuilder) {
     cmd.env("TERM", "vt100");
 }
 
+/// The command that starts a shell rather than an IRIS session.
+///
+/// Here rather than in [`crate::plugins::shells`] for the reason this module
+/// exists at all: it is the one place allowed to know which operating system it
+/// is running on, and what a shell needs before it will speak UTF-8 is entirely
+/// a question about the platform.
+///
+/// On Windows that means the same wrapper an IRIS session gets - `cmd /c chcp
+/// 65001 & ...` - because a console starts on the OEM codepage and a shell
+/// inherits it. Without it `cmd.exe` prints accented text as mojibake and no
+/// decoding on this side can rescue it; see [`crate::term::encoding`]. The
+/// shells that already speak UTF-8, PowerShell 7 among them, are unaffected by
+/// being told to.
+pub fn shell_command(program: &Path, args: &[String]) -> CommandBuilder {
+    #[cfg(windows)]
+    {
+        windows::shell_command(program, args)
+    }
+    #[cfg(not(windows))]
+    {
+        // Nothing to arrange: the terminal is already UTF-8 and the shell reads
+        // it from the locale.
+        let mut cmd = CommandBuilder::new(program);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        announce_terminal(&mut cmd);
+        cmd
+    }
+}
+
 /// Locates a binary by trying an explicit override, then a list of candidate
 /// directories, then bare PATH lookup.
 fn find_binary(override_path: Option<&Path>, dirs: &[PathBuf], names: &[&str]) -> Result<PathBuf> {
@@ -261,6 +292,12 @@ mod windows {
     /// like - the command builder escapes a quote in a way cmd does not
     /// understand - so every character cmd would act on gets a caret of its
     /// own.
+    ///
+    /// The one thing it cannot do anything about is a **space**, because a
+    /// space is not something cmd escapes: it is the delimiter, and the only
+    /// way past it is a quote. So nothing with a space in it may be put on this
+    /// line - which is why both callers name their program bare and put its
+    /// directory on PATH instead.
     fn escape_for_cmd(arg: &str) -> String {
         let mut out = String::with_capacity(arg.len());
         for ch in arg.chars() {
@@ -289,6 +326,56 @@ mod windows {
     /// quoted path is not something `cmd` understands. So the name is bare and
     /// the directory it lives in goes on PATH, which works whatever spaces the
     /// path has.
+    /// A shell, with the console put into UTF-8 first.
+    ///
+    /// The same wrapper [`session_command`] uses, and - as it turns out - for
+    /// the same *two* reasons. The console opens on the OEM codepage and a
+    /// shell that inherits it prints accented text as bytes this side cannot
+    /// decode; and the program is named bare, with its directory prepended to
+    /// PATH, because the command line inside `cmd /c` is one `cmd` parses and
+    /// a path with a space in it is three words to it. Passing the full path
+    /// is what produced `'C:\Program' is not recognized` for Git Bash. There
+    /// is no quoting round it: see [`escape_for_cmd`] for why a quote cannot
+    /// survive the trip.
+    pub fn shell_command(program: &Path, args: &[String]) -> CommandBuilder {
+        let (Some(name), Some(dir)) = (program.file_name(), program.parent()) else {
+            // Neither a file name nor a parent directory: nothing to put on
+            // PATH, so start it directly and leave the console on whatever
+            // codepage it opened on. Accented output will not survive that.
+            // Reachable only for a program that is a bare relative name, which
+            // the shell files never hold - they are absolute paths, checked to
+            // be files before they are offered.
+            let mut cmd = CommandBuilder::new(program);
+            for arg in args {
+                cmd.arg(arg);
+            }
+            announce_terminal(&mut cmd);
+            return cmd;
+        };
+
+        let mut line = escape_for_cmd(&name.to_string_lossy());
+        for arg in args {
+            line.push(' ');
+            line.push_str(&escape_for_cmd(arg));
+        }
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.arg("/s");
+        cmd.arg("/c");
+        cmd.arg(format!("chcp 65001>nul & {line}"));
+        cmd.env("PATH", prepend_to_path(dir));
+        announce_terminal(&mut cmd);
+        cmd
+    }
+
+    /// `dir` in front of the inherited PATH, which is how a program with a
+    /// space in its path is named without quoting it.
+    fn prepend_to_path(dir: &Path) -> String {
+        match std::env::var("PATH") {
+            Ok(existing) => format!("{};{existing}", dir.display()),
+            Err(_) => dir.display().to_string(),
+        }
+    }
+
     fn session_command(exe: &Path, spec: &LaunchSpec) -> CommandBuilder {
         let (Some(name), Some(dir)) = (exe.file_name(), exe.parent()) else {
             // Nothing to put on PATH, so there is nothing to wrap: start it
@@ -316,11 +403,7 @@ mod windows {
             "chcp 65001>nul & {} {args}",
             name.to_string_lossy()
         ));
-        let path = match std::env::var("PATH") {
-            Ok(existing) => format!("{};{existing}", dir.display()),
-            Err(_) => dir.display().to_string(),
-        };
-        cmd.env("PATH", path);
+        cmd.env("PATH", prepend_to_path(dir));
         cmd
     }
 
@@ -349,6 +432,78 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The command line `cmd` will parse, as one string.
+        fn command_line(cmd: &CommandBuilder) -> String {
+            cmd.get_argv()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        fn path_of(cmd: &CommandBuilder) -> String {
+            cmd.get_env("PATH")
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        }
+
+        /// The bug this pins, and it is worth pinning because the failure is
+        /// entirely invisible from this side: the tab opens, `cmd` says
+        /// `'C:\Program' is not recognized`, and the shell never runs. A path
+        /// with a space in it cannot go on a line `cmd` parses, so the program
+        /// is named bare and its directory goes on PATH instead.
+        #[test]
+        fn a_shell_under_program_files_is_named_bare() {
+            let program = Path::new(r"C:\Program Files\Git\bin\bash.exe");
+            let cmd = shell_command(program, &["--login".to_string(), "-i".to_string()]);
+
+            let line = command_line(&cmd);
+            assert!(
+                line.contains("bash.exe --login -i"),
+                "the shell is not on the line: {line}"
+            );
+            assert!(
+                !line.contains("Program Files"),
+                "the path is on the line, so cmd will split it: {line}"
+            );
+            assert!(
+                path_of(&cmd).starts_with(r"C:\Program Files\Git\bin;"),
+                "its directory has to come first on PATH: {}",
+                path_of(&cmd)
+            );
+        }
+
+        /// And the console still gets its codepage, which is the other half of
+        /// why a shell is wrapped in `cmd` at all.
+        #[test]
+        fn a_shell_is_started_with_the_console_in_utf8() {
+            let cmd = shell_command(Path::new(r"C:\Windows\System32\cmd.exe"), &[]);
+            assert_eq!(
+                cmd.get_argv()
+                    .first()
+                    .map(|a| a.to_string_lossy().into_owned()),
+                Some("cmd.exe".to_string())
+            );
+            assert!(command_line(&cmd).contains("chcp 65001>nul &"));
+        }
+
+        /// An IRIS session is named the same way, for the same reason: the
+        /// standard install root is under `C:\Program Files\InterSystems`.
+        #[test]
+        fn an_iris_session_is_named_bare_too() {
+            let spec = LaunchSpec {
+                instance: "CONSISTEM".into(),
+                ..LaunchSpec::default()
+            };
+            let exe = Path::new(r"C:\Program Files\InterSystems\IRIS\bin\irissession.exe");
+            let cmd = session_command(exe, &spec);
+
+            let line = command_line(&cmd);
+            assert!(line.contains("irissession.exe CONSISTEM"), "{line}");
+            assert!(!line.contains("Program Files"), "{line}");
+            assert!(path_of(&cmd).starts_with(r"C:\Program Files\InterSystems\IRIS\bin;"));
+        }
 
         /// A routine name is the reason the escaping exists: `^MYROUTINE`
         /// reaches IRIS whole only if the caret survives cmd's own parsing.

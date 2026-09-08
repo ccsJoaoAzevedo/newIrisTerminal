@@ -1,21 +1,28 @@
-//! Side panels and dialogs: macros, natives, settings, and export.
+//! Side panels and dialogs: the IRIS utilities, settings, and the dialogs the
+//! rest of the interface hands its questions to.
 //!
 //! These are pure-ish view functions — they render, and report back what the
 //! user asked for as an [`UiRequest`], which `app.rs` then carries out. Keeping
 //! the "decide" and "do" halves apart is what lets a destructive macro be
 //! routed through a confirmation step without the panel knowing anything about
 //! sessions.
+//!
+//! Three things used to live here and no longer do. Macros are managed in
+//! [`crate::ui::macro_manager`], a window of its own reached from Settings, and
+//! run from the terminal's right-click menu; exporting and the IRIS utilities
+//! are on that menu too, beside the output they act on. What is left of the
+//! macros here is the confirmation step, which is the part that has to
+//! interrupt.
 
 use egui::{Context, Ui};
 
 use crate::config::profile::Remote;
 use crate::config::servers::{Server, ServerList, Target};
 use crate::config::{profile::LogMode, CursorStyle, Profile, Settings, Theme};
-use crate::features::macros::{Macro, MacroGroup, Origin, Param};
+use crate::features::macros::Macro;
 use crate::features::natives::Native;
 use crate::i18n::{tr, tr1, tr2};
 use crate::term::Encoding;
-use crate::ui::shortcut;
 
 /// Colour for "this is set, but it will not do what you expect". Not from the
 /// theme: it has to stay legible as a warning in every one of them.
@@ -43,80 +50,39 @@ pub enum UiRequest {
     OpenFolder(std::path::PathBuf),
     /// Ask GitHub whether there is a newer version, and say either way.
     CheckForUpdates,
+    /// Store (or, when empty, forget) the password for the HTTP proxy.
+    SetProxyPassword(String),
 }
 
 /// State the panels own between frames.
 #[derive(Default)]
 pub struct PanelState {
-    pub show_macros: bool,
     pub show_settings: bool,
-    pub show_export: bool,
     /// The theme manager, which keeps its own selection and rename draft.
     pub themes: crate::ui::theme_manager::ThemeManagerState,
-    pub macro_filter: String,
+    /// The macro manager, which keeps its own selection and editing draft.
+    pub macros: crate::ui::macro_manager::MacroManagerState,
     /// A macro waiting on parameter values and/or confirmation.
     pub pending: Option<PendingMacro>,
-    /// One value per parameter of the selected native helper.
-    pub native_values: Vec<String>,
-    pub selected_native: Option<Native>,
-    /// Which helper `native_values` belongs to, so folding one away and opening
-    /// it again keeps what was typed while switching to a different one starts
-    /// from that one's defaults.
-    native_values_of: Option<Native>,
-    /// Macro shown in the details block, by (group, index).
-    pub selected: Option<(usize, usize)>,
-    /// The personal macro currently open in the editor, by (group, index).
-    pub editing: Option<(usize, usize)>,
-    /// Draft being edited, kept separate so Cancel is a real cancel.
-    pub draft: Option<Macro>,
-    /// The body exactly as it is being typed, before it is split into lines.
+    /// An IRIS helper waiting on its fields.
+    pub pending_native: Option<PendingNative>,
+    /// The proxy password as it is being typed. Handed to the credential store
+    /// when the field loses focus and cleared immediately, so the secret is not
+    /// left sitting in the app's state for the rest of the session.
+    proxy_password: String,
+    /// The settings window is listening for the manager's chord.
     ///
-    /// The field's own text, in other words, rather than the macro's lines
-    /// rejoined every frame: rejoining meant every keystroke went through
-    /// `trim`, and a space at the end of a line was taken away again before it
-    /// could be drawn. Split into lines once, on Save.
-    body_draft: String,
-    /// The editor is waiting for a key combination to be pressed, so that it
-    /// can be read off the keyboard instead of typed out. Public because the
-    /// app has to stop claiming shortcuts for itself while it is set, or Ctrl+T
-    /// would open a tab rather than be recorded.
-    pub capture_shortcut: bool,
-    /// Whether a hidden body is currently shown in the editor. Deliberately not
-    /// persisted and cleared every time the editor closes, so opening a macro
-    /// never starts by putting its password on screen.
-    reveal_body: bool,
-    /// Group name for a macro about to be created.
-    pub new_group: String,
+    /// Its own flag rather than the manager's: both pickers consume the key
+    /// presses of the frame they are listening in, and sharing one would have
+    /// the manager's editor - drawn later in the frame - record the chord meant
+    /// for the setting into whichever macro happened to be open. Public for the
+    /// same reason the manager's is: the app has to stop claiming shortcuts for
+    /// itself while it is set.
+    pub capture_manager_shortcut: bool,
     /// Installed monospace families, listed once. Enumerating system fonts is
     /// slow enough that doing it per frame would be felt while the Settings
     /// window is open.
     font_families: Option<Vec<String>>,
-}
-
-impl PanelState {
-    /// Shows one IRIS helper's fields, or `None` to fold the open one away.
-    ///
-    /// The fields are only reset when a *different* helper is opened; the
-    /// compile flag starts at its default rather than blank, and re-opening the
-    /// helper you just closed gives you back what you had typed.
-    fn open_native(&mut self, native: Option<Native>) {
-        self.selected_native = native;
-        if let Some(native) = native {
-            if self.native_values_of != Some(native) {
-                self.native_values = native.default_values();
-                self.native_values_of = Some(native);
-            }
-        }
-    }
-
-    /// Opens the editor on one macro, on a copy of it.
-    fn open_editor(&mut self, at: (usize, usize), draft: Macro) {
-        self.editing = Some(at);
-        self.body_draft = draft.body.join("\n");
-        self.draft = Some(draft);
-        self.reveal_body = false;
-        self.capture_shortcut = false;
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +91,8 @@ pub struct PendingMacro {
     pub values: Vec<(String, String)>,
     /// Set once parameters are filled and only the yes/no remains.
     pub confirming: bool,
+    /// The keyboard has yet to be put in the first field. See `focus_first`.
+    focus_first: bool,
 }
 
 impl PendingMacro {
@@ -135,6 +103,21 @@ impl PendingMacro {
             source,
             values,
             confirming,
+            focus_first: true,
+        }
+    }
+
+    /// A macro whose parameters have already been filled in — by the
+    /// right-click menu's own fields — and which only wants the yes/no its
+    /// `confirm` flag asks for.
+    pub fn to_confirm(source: Macro, values: Vec<(String, String)>) -> Self {
+        PendingMacro {
+            source,
+            values,
+            confirming: true,
+            // Nothing to type into: the values are already filled in and the
+            // only thing left is the yes/no.
+            focus_first: false,
         }
     }
 
@@ -143,552 +126,64 @@ impl PendingMacro {
     }
 }
 
-/// The macro browser: pick a macro, see what it will do, then run it.
+/// Dims everything behind a dialog, and swallows the clicks aimed at it.
 ///
-/// Selection rather than run-on-click. A list where clicking a name fires the
-/// command underneath it has no room to show what that command is, and half
-/// these macros write to a shared database — so the click selects, the details
-/// below say what would happen, and Run is a separate, deliberate press.
-/// Clicking the open macro again folds those details away.
-///
-/// Takes the groups mutably because personal macros are edited in place here;
-/// organisation macros are shown with a badge and no edit affordance, since
-/// their file is shared and never written from the app.
-pub fn macros_panel(
-    ui: &mut Ui,
-    groups: &mut Vec<MacroGroup>,
-    state: &mut PanelState,
-) -> Option<UiRequest> {
-    let mut request = None;
-
-    // The panel says what it is and offers the way out. Clicking Macros in the
-    // menu bar again still closes it - this is the same gesture put where a
-    // panel is normally closed from, since nothing on screen said that the
-    // toggle in the bar was the only way back.
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(tr("Macros")).strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button("x")
-                .on_hover_text(tr("Close this panel"))
-                .clicked()
-            {
-                state.show_macros = false;
-            }
-        });
-    });
-    ui.horizontal(|ui| {
-        ui.label(tr("Filter"));
-        ui.text_edit_singleline(&mut state.macro_filter);
-    });
-    ui.separator();
-
-    if groups.is_empty() {
-        ui.label(tr("No macros defined."));
-        ui.small(tr(
-            "Add them below, or configure the organization file in Settings.",
-        ));
-    }
-
-    // An index into a list that has since been reloaded, or had a macro
-    // deleted, would point at the wrong macro; a stale selection is dropped
-    // rather than followed.
-    if let Some((gi, mi)) = state.selected {
-        if groups.get(gi).and_then(|g| g.macros.get(mi)).is_none() {
-            state.selected = None;
-        }
-    }
-
-    let filter = state.macro_filter.to_lowercase();
-    // `Some(None)` is "fold the details away", which is what clicking the open
-    // macro again means; `None` is "nothing was clicked".
-    let mut to_select: Option<Option<(usize, usize)>> = None;
-    let mut to_run: Option<Macro> = None;
-
-    // No scroll area of its own: the whole panel scrolls, so a long macro list
-    // is not squeezed into half the height with the details below it fighting
-    // for the rest.
-    for (gi, group) in groups.iter().enumerate() {
-        let matching: Vec<(usize, &Macro)> = group
-            .macros
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                filter.is_empty()
-                    || m.name.to_lowercase().contains(&filter)
-                    || m.description.to_lowercase().contains(&filter)
-            })
-            .collect();
-        if matching.is_empty() {
-            continue;
-        }
-
-        let title = if group.name.is_empty() {
-            "Macros"
-        } else {
-            &group.name
-        };
-        egui::CollapsingHeader::new(title)
-            .id_source(("macro-group", gi))
-            .default_open(true)
-            .show(ui, |ui| {
-                for (mi, m) in matching {
-                    ui.horizontal(|ui| {
-                        // Run sits on the row with the name, so firing
-                        // a macro is one press from the list. It still
-                        // goes through the same request path, so a
-                        // macro that asks for parameters or a
-                        // confirmation asks for them here too.
-                        if ui
-                            .small_button(tr("Run"))
-                            .on_hover_text(if m.confirm {
-                                tr("Runs after confirming.")
-                            } else {
-                                tr("Sends this macro to the active session.")
-                            })
-                            .clicked()
-                        {
-                            to_run = Some(m.clone());
-                        }
-                        let label = if m.confirm {
-                            format!("{}  ({})", m.name, tr("confirms"))
-                        } else {
-                            m.name.clone()
-                        };
-                        let selected = state.selected == Some((gi, mi));
-                        let button = ui.selectable_label(selected, label);
-                        let button = if m.description.is_empty() {
-                            button
-                        } else {
-                            button.on_hover_text(&m.description)
-                        };
-                        if button.clicked() {
-                            // Clicking the open one again folds its
-                            // details away, the same gesture the IRIS
-                            // utilities below use.
-                            to_select = Some((!selected).then_some((gi, mi)));
-                        }
-
-                        // Provenance at a glance: a shared macro
-                        // behaving oddly is someone else's file, not
-                        // something the user can have broken locally.
-                        if m.origin == Origin::Organization {
-                            ui.weak(tr("org"))
-                                .on_hover_text(tr("Provided by the organization; read-only here."));
-                        }
-
-                        // The shortcut belongs next to the name. A
-                        // binding nobody can see is a binding nobody
-                        // uses.
-                        if let Some(key) = &m.key {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.weak(key);
-                                },
-                            );
-                        }
-                    });
-                }
-            });
-    }
-
-    if let Some(at) = to_select {
-        state.selected = at;
-    }
-    if let Some(m) = to_run {
-        request = Some(UiRequest::RunMacro(m));
-    }
-
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label(tr("New in group"));
-        ui.add(egui::TextEdit::singleline(&mut state.new_group).desired_width(90.0));
-        let named = !state.new_group.trim().is_empty();
-        if ui.add_enabled(named, egui::Button::new("Add")).clicked() {
-            let name = state.new_group.trim().to_string();
-            let gi = match groups.iter().position(|g| g.name == name) {
-                Some(i) => i,
-                None => {
-                    groups.push(MacroGroup {
-                        name,
-                        origin: Origin::Personal,
-                        macros: Vec::new(),
-                    });
-                    groups.len() - 1
-                }
-            };
-            groups[gi].macros.push(Macro {
-                origin: Origin::Personal,
-                name: "New macro".into(),
-                ..Macro::default()
-            });
-            let mi = groups[gi].macros.len() - 1;
-            state.selected = Some((gi, mi));
-            state.open_editor((gi, mi), groups[gi].macros[mi].clone());
-        }
-    });
-
-    if let Some(r) = macro_details(ui, groups, state) {
-        request = Some(r);
-    }
-    request
-}
-
-/// What the selected macro is, what it would send, and the actions on it.
-fn macro_details(
-    ui: &mut Ui,
-    groups: &mut Vec<MacroGroup>,
-    state: &mut PanelState,
-) -> Option<UiRequest> {
-    let (gi, mi) = state.selected?;
-    let m = groups.get(gi).and_then(|g| g.macros.get(mi))?.clone();
-
-    let mut request = None;
-    let mut delete = false;
-
-    ui.separator();
-    ui.heading(&m.name);
-    if !m.description.is_empty() {
-        ui.label(&m.description);
-    }
-
-    // No Run here: it lives next to the name in the list above, where it is
-    // reachable without selecting the macro first.
-    ui.horizontal(|ui| match m.origin {
-        Origin::Personal => {
-            if ui.button(tr("Edit")).clicked() {
-                state.open_editor((gi, mi), m.clone());
-            }
-            if ui
-                .button(tr("Delete"))
-                .on_hover_text(tr("Removes it from your personal macro file."))
-                .clicked()
-            {
-                delete = true;
-            }
-        }
-        Origin::Organization => {
-            ui.weak(tr("Provided by the organization; read-only here."));
-        }
-    });
-
-    if let Some(key) = &m.key {
-        ui.horizontal(|ui| {
-            ui.label(tr("Shortcut"));
-            ui.weak(key);
-            if shortcut::parse(key).is_none() {
-                ui.colored_label(WARNING, tr("not a shortcut this app understands"));
-            }
-        });
-    }
-
-    if !m.params.is_empty() {
-        ui.label(tr("Parameters"));
-        for p in &m.params {
-            let prompt = if p.prompt.is_empty() {
-                &p.name
-            } else {
-                &p.prompt
-            };
-            ui.small(format!("{}  -  {prompt}", p.name));
-        }
-    }
-
-    if m.hide_command {
-        // The whole point of the flag: this body holds a credential, so the
-        // panel does not put it on screen just because the macro is selected.
-        ui.weak(hidden_body_note(&m));
-    } else {
-        for line in &m.body {
-            ui.code(line);
-        }
-    }
-
-    if delete {
-        // Guarded by construction - Delete only appears on personal macros -
-        // but checked anyway so a future refactor cannot destroy shared data.
-        if groups[gi].macros[mi].origin.is_editable() {
-            groups[gi].macros.remove(mi);
-            if groups[gi].macros.is_empty() {
-                groups.remove(gi);
-            }
-            state.selected = None;
-            state.editing = None;
-            state.draft = None;
-            request = Some(UiRequest::SavePersonalMacros);
-        }
-    }
-
-    request
-}
-
-/// How many body lines a hidden macro has, without saying what they are.
-fn hidden_body_note(m: &Macro) -> String {
-    hidden_lines_note(m.body.len())
-}
-
-/// [`hidden_body_note`] from a line count, for the editor - whose body is a
-/// draft string rather than the macro's own lines.
-fn hidden_lines_note(count: usize) -> String {
-    match count {
-        1 => tr("1 command hidden").to_string(),
-        n => tr1("{} commands hidden", &n.to_string()),
-    }
-}
-
-/// Editor for one personal macro, in a window of its own.
-///
-/// A window rather than another section stacked under the list: the sidebar is
-/// for choosing and reading, and an editor wedged into the bottom of it left
-/// neither enough room.
-pub fn macro_editor_dialog(
-    ctx: &Context,
-    groups: &mut [MacroGroup],
-    state: &mut PanelState,
-) -> Option<UiRequest> {
-    let (gi, mi) = state.editing?;
-    if groups.get(gi).and_then(|g| g.macros.get(mi)).is_none() {
-        state.editing = None;
-        state.draft = None;
-        return None;
-    }
-
-    let mut request = None;
-    let mut close = false;
-    let mut open = true;
-    let mut reveal = state.reveal_body;
-    let mut capture = state.capture_shortcut;
-    // Taken out of the state for the duration of the window, which borrows the
-    // rest of it to reach the draft.
-    let mut body = std::mem::take(&mut state.body_draft);
-
-    egui::Window::new(tr("Edit macro"))
-        .id(egui::Id::new("nit-macro-editor"))
-        .collapsible(false)
-        .resizable(true)
-        .default_width(480.0)
-        .open(&mut open)
+/// egui 0.28 has no modal of its own, and these two dialogs have to be modal:
+/// both of them are the last look at a line of ObjectScript before it reaches a
+/// shared `RDB*` database, and a dialog you can click straight past while it is
+/// open is one you can answer by accident. The veil is drawn in the same layer
+/// order as a window and before the window, so it covers the terminal and the
+/// window covers it.
+fn veil(ctx: &Context, id: &str) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new((id, "veil")))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .interactable(true)
         .show(ctx, |ui| {
-            let Some(draft) = state.draft.as_mut() else {
-                close = true;
-                return;
-            };
-
-            ui.horizontal(|ui| {
-                ui.label(tr("Name"));
-                ui.text_edit_singleline(&mut draft.name);
-            });
-            ui.horizontal(|ui| {
-                ui.label(tr("Description"));
-                ui.text_edit_singleline(&mut draft.description);
-            });
-
-            ui.horizontal(|ui| {
-                ui.label(tr("Shortcut"));
-                let mut key = draft.key.clone().unwrap_or_default();
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut key)
-                            .hint_text("Ctrl+Shift+G")
-                            .desired_width(140.0),
-                    )
-                    .changed()
-                {
-                    let key = key.trim().to_string();
-                    draft.key = (!key.is_empty()).then_some(key);
-                }
-                // Typing the name of a chord is fiddly and easy to get subtly
-                // wrong - `Num7` against `7`, `Option` against `Alt` - so the
-                // other way in is to press it. What lands in the field is what
-                // the parser produced, which is the value that will fire.
-                let label = if capture {
-                    tr("Press the keys...")
-                } else {
-                    tr("Detect")
-                };
-                if ui
-                    .selectable_label(capture, label)
-                    .on_hover_text(tr(
-                        "Press the combination and it is filled in here. Esc cancels, Backspace clears it.",
-                    ))
-                    .clicked()
-                {
-                    capture = !capture;
-                }
-            });
-            if capture {
-                match captured_shortcut(ui) {
-                    Capture::Waiting => {}
-                    Capture::Cancelled => capture = false,
-                    Capture::Cleared => {
-                        draft.key = None;
-                        capture = false;
-                    }
-                    Capture::Chord(text) => {
-                        draft.key = Some(text);
-                        capture = false;
-                    }
-                }
-                ui.small(tr("A modifier is required: Ctrl, Alt, or both, with or without Shift."));
-            }
-            // Reported rather than rejected: this field is also edited by hand
-            // in the shared XML, and a value we do not understand has to
-            // survive a round trip through here instead of being erased.
-            if let Some(key) = draft.key.as_deref() {
-                match shortcut::parse(key) {
-                    None => {
-                        ui.colored_label(
-                            WARNING,
-                            tr("Not understood, so it will not fire. Needs a modifier, like Ctrl+Shift+G."),
-                        );
-                    }
-                    Some((modifiers, parsed)) => {
-                        if let Some(used_for) = shortcut::is_reserved(modifiers, parsed) {
-                            ui.colored_label(
-                                WARNING,
-                                tr1("The app already uses this for {}; add Shift.", used_for),
-                            );
-                        }
-                    }
-                }
-            }
-
-            ui.checkbox(
-                &mut draft.confirm,
-                tr("Confirm before sending (use for anything that writes)"),
-            );
-            if ui
-                .checkbox(&mut draft.hide_command, tr("Hide command"))
-                .on_hover_text(
-                    tr("For a body that carries a password. Keeps it out of the macro panel; IRIS still echoes what it is sent."),
-                )
-                .changed()
-            {
-                // Ticking the box hides the body again immediately, so the
-                // secret is not left on screen by the act of protecting it.
-                reveal = false;
-            }
-
-            ui.label(tr("Body - one command per line, {{param}} is substituted"));
-            if draft.hide_command && !reveal {
-                ui.horizontal(|ui| {
-                    ui.weak(hidden_lines_note(
-                        crate::features::macros::body_lines(&body).len(),
-                    ));
-                    if ui.button(tr("Reveal")).clicked() {
-                        reveal = true;
-                    }
-                });
-            } else {
-                // The field owns the text and nothing rewrites it between
-                // keystrokes - see `PanelState::body_draft`.
-                ui.add(egui::TextEdit::multiline(&mut body).desired_rows(4));
-            }
-
-            ui.label(tr("Parameters"));
-            let mut drop_param = None;
-            for (pi, param) in draft.params.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut param.name).desired_width(60.0))
-                        .on_hover_text(tr("Name used as {{name}} in the body"));
-                    ui.add(egui::TextEdit::singleline(&mut param.prompt).desired_width(100.0))
-                        .on_hover_text(tr("Prompt shown when running"));
-                    ui.add(egui::TextEdit::singleline(&mut param.default).desired_width(70.0))
-                        .on_hover_text(tr("Default value"));
-                    if ui.small_button("x").clicked() {
-                        drop_param = Some(pi);
-                    }
-                });
-            }
-            if let Some(pi) = drop_param {
-                draft.params.remove(pi);
-            }
-            if ui.small_button(tr("Add parameter")).clicked() {
-                draft.params.push(Param::default());
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button(tr("Save")).clicked() {
-                    // Origin is never taken from the draft: an edited macro
-                    // stays personal, so nothing can promote itself into the
-                    // shared file.
-                    let mut saved = draft.clone();
-                    saved.origin = Origin::Personal;
-                    // Where the typed text becomes lines: once, on the way to
-                    // the file, rather than on every keystroke.
-                    saved.body = crate::features::macros::body_lines(&body);
-                    groups[gi].macros[mi] = saved;
-                    close = true;
-                    request = Some(UiRequest::SavePersonalMacros);
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    close = true;
-                }
-            });
+            // Allocated before it is painted, because an area's painter is
+            // clipped to what the area has claimed - and the click-and-drag
+            // sense is the half that makes it modal rather than decorative.
+            ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
         });
-
-    state.reveal_body = reveal;
-    state.capture_shortcut = capture;
-    state.body_draft = body;
-
-    if close || !open {
-        state.editing = None;
-        state.draft = None;
-        state.body_draft = String::new();
-        state.reveal_body = false;
-        state.capture_shortcut = false;
-    }
-    request
 }
 
-/// What a frame of key presses meant while the editor was listening for a
-/// shortcut.
-enum Capture {
-    /// Nothing usable yet, so keep listening.
-    Waiting,
-    /// Escape: leave the binding as it was.
-    Cancelled,
-    /// Backspace or Delete: no shortcut at all.
-    Cleared,
-    /// A chord, in the parser's own spelling.
-    Chord(String),
-}
-
-/// Takes the pressed chord out of this frame's events.
+/// The frame both dialogs are drawn in: veiled, centred, and not resizable.
 ///
-/// Every key press is consumed while listening, and so is the text they would
-/// have produced: a key pressed here is the shortcut being named, not typing,
-/// and leaving it in the stream would put a letter in the name field or fire
-/// the very shortcut being recorded. A chord without Ctrl or Alt is ignored
-/// rather than accepted - a bare letter, or Shift plus one, would fire while
-/// the user was typing at the prompt.
-fn captured_shortcut(ui: &Ui) -> Capture {
-    ui.input_mut(|input| {
-        let mut result = Capture::Waiting;
-        input.events.retain(|event| match event {
-            egui::Event::Text(_) => false,
-            egui::Event::Key {
-                key,
-                modifiers,
-                pressed: true,
-                ..
-            } => {
-                match key {
-                    egui::Key::Escape => result = Capture::Cancelled,
-                    egui::Key::Backspace | egui::Key::Delete => result = Capture::Cleared,
-                    key if modifiers.ctrl || modifiers.alt || modifiers.command => {
-                        result = Capture::Chord(shortcut::format(*modifiers, *key));
-                    }
-                    _ => {}
-                }
-                false
-            }
-            _ => true,
-        });
-        result
-    })
+/// Centred by anchor rather than by opening position, so it cannot be dragged
+/// off to a corner and then be somewhere else the next time. A dialog answering
+/// one question does not need to be moved.
+fn modal<R>(
+    ctx: &Context,
+    id: &str,
+    title: String,
+    open: &mut bool,
+    contents: impl FnOnce(&mut Ui) -> R,
+) {
+    veil(ctx, id);
+    egui::Window::new(title)
+        .id(egui::Id::new(id))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(open)
+        .show(ctx, contents);
+}
+
+/// Puts the keyboard in the first field of a dialog that has just opened.
+///
+/// Without it the terminal keeps the keyboard - it claims it back whenever no
+/// other widget holds it - so the first thing typed into a freshly opened
+/// dialog went to the IRIS prompt behind it instead. `first` is the response of
+/// the first field; `pending` is cleared once it has been given focus, so
+/// clicking into a later field is not undone on the next frame.
+fn focus_first(first: &egui::Response, pending: &mut bool) {
+    if *pending {
+        first.request_focus();
+        *pending = false;
+    }
 }
 
 /// Parameter-fill and confirmation dialog for a pending macro.
@@ -709,56 +204,71 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
         pending.source.name.clone()
     };
 
-    egui::Window::new(title)
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            if !pending.source.description.is_empty() {
-                ui.label(&pending.source.description);
-                ui.separator();
-            }
-
-            for (index, param) in pending.source.params.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(&param.prompt);
-                    if let Some((_, value)) = pending.values.get_mut(index) {
-                        ui.text_edit_singleline(value);
-                    }
-                });
-            }
-
+    modal(ctx, "nit-macro-run", title, &mut open, |ui| {
+        ui.set_min_width(360.0);
+        if !pending.source.description.is_empty() {
+            ui.label(&pending.source.description);
             ui.separator();
-            ui.label(tr("Will send:"));
-            let preview = pending.source.expand(&pending.values);
+        }
+
+        for (index, param) in pending.source.params.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let prompt = if param.prompt.is_empty() {
+                    &param.name
+                } else {
+                    &param.prompt
+                };
+                ui.label(prompt);
+                if let Some((_, value)) = pending.values.get_mut(index) {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(value)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(&param.default),
+                    );
+                    if index == 0 {
+                        focus_first(&field, &mut pending.focus_first);
+                    }
+                }
+            });
+        }
+
+        ui.separator();
+        ui.label(tr("Will send:"));
+        let preview = pending.source.expand(&pending.values);
+        // Hidden bodies stay hidden even here: the flag exists because the
+        // body carries a credential, and this dialog is on screen.
+        if pending.source.hide_command {
+            ui.weak(tr("Hidden; this macro carries a secret."));
+        } else {
             for line in &preview {
                 ui.code(line);
             }
+        }
 
-            if pending.source.confirm {
-                ui.separator();
-                ui.colored_label(
-                    WARNING,
-                    tr("This macro is marked as modifying data. RDB* databases are shared with the team."),
-                );
-            }
-
+        if pending.source.confirm {
             ui.separator();
-            ui.horizontal(|ui| {
-                let send_label = if pending.source.confirm {
-                    tr("Yes, send it")
-                } else {
-                    tr("Send")
-                };
-                if ui.button(send_label).clicked() {
-                    request = Some(UiRequest::SendLines(preview.clone()));
-                    close = true;
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    close = true;
-                }
-            });
+            ui.colored_label(
+                WARNING,
+                tr("This macro is marked as modifying data. RDB* databases are shared with the team."),
+            );
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            let send_label = if pending.source.confirm {
+                tr("Yes, send it")
+            } else {
+                tr("Send")
+            };
+            if ui.button(send_label).clicked() {
+                request = Some(UiRequest::SendLines(preview.clone()));
+                close = true;
+            }
+            if ui.button(tr("Cancel")).clicked() {
+                close = true;
+            }
         });
+    });
 
     if close || !open {
         state.pending = None;
@@ -766,102 +276,92 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
     request
 }
 
-/// The native-utility helpers.
-pub fn natives_panel(ui: &mut Ui, state: &mut PanelState) -> Option<UiRequest> {
-    let mut request = None;
-
-    ui.label(tr("IRIS utilities"));
-    ui.separator();
-
-    for native in Native::ALL {
-        let selected = state.selected_native == Some(native);
-        if ui.selectable_label(selected, tr(native.label())).clicked() {
-            // Clicking the open one again folds it away rather than resetting
-            // its fields, which is what the same click used to do - and losing
-            // a typed package name to a stray click is a poor trade for a
-            // gesture that reads like "close this".
-            state.open_native(if selected { None } else { Some(native) });
-        }
-    }
-
-    if let Some(native) = state.selected_native {
-        ui.separator();
-        // A selection made before the last reload could be holding fewer
-        // values than the helper now asks for.
-        state
-            .native_values
-            .resize(native.params().len(), String::new());
-        for (param, value) in native.params().iter().zip(state.native_values.iter_mut()) {
-            ui.label(tr(param.label));
-            ui.text_edit_singleline(value);
-        }
-
-        let invocation = native.build(&state.native_values);
-        ui.add_space(8.0);
-        ui.label(tr("Will send:"));
-        for line in &invocation.lines {
-            ui.code(line);
-        }
-        ui.add_space(8.0);
-        if ui.button(tr("Run")).clicked() {
-            request = Some(UiRequest::RunNative(native, state.native_values.clone()));
-        }
-    }
-
-    request
+/// An IRIS helper waiting for its fields to be filled in.
+#[derive(Clone, Debug)]
+pub struct PendingNative {
+    pub source: Native,
+    pub values: Vec<String>,
+    /// The keyboard has yet to be put in the first field. See [`focus_first`].
+    focus_first: bool,
 }
 
-/// Export / copy actions.
-pub fn export_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiRequest> {
-    use crate::features::export::Range;
-
-    if !state.show_export {
-        return None;
+impl PendingNative {
+    pub fn new(source: Native) -> Self {
+        PendingNative {
+            source,
+            values: source.default_values(),
+            focus_first: true,
+        }
     }
-    let mut request = None;
-    let mut open = true;
+}
 
-    egui::Window::new(tr("Export output"))
-        .id(egui::Id::new("nit-export"))
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label(tr("Save to a file"));
-            ui.horizontal(|ui| {
-                if ui.button(tr("Screen as text")).clicked() {
-                    request = Some(UiRequest::ExportText(Range::Screen));
-                }
-                if ui.button(tr("Everything as text")).clicked() {
-                    request = Some(UiRequest::ExportText(Range::All));
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button(tr("Screen as HTML")).clicked() {
-                    request = Some(UiRequest::ExportHtml(Range::Screen));
-                }
-                if ui.button(tr("Everything as HTML")).clicked() {
-                    request = Some(UiRequest::ExportHtml(Range::All));
-                }
-            });
+/// Field-fill dialog for an IRIS helper.
+///
+/// The composed line is always shown, and that is the point of the dialog
+/// rather than a nicety: a helper's arguments are positional and quoted, so
+/// reading the call back is the only way to see that the package name landed in
+/// the argument meant for it.
+pub fn pending_native_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiRequest> {
+    let pending = state.pending_native.as_mut()?;
+
+    let mut request = None;
+    let mut close = false;
+    let mut open = true;
+    let native = pending.source;
+
+    // A selection made before a reload could be holding fewer values than the
+    // helper now asks for.
+    pending.values.resize(native.params().len(), String::new());
+
+    modal(
+        ctx,
+        "nit-native-run",
+        tr(native.label()).to_string(),
+        &mut open,
+        |ui| {
+            ui.set_min_width(360.0);
+            for (index, param) in native.params().iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(tr(param.label));
+                    if let Some(value) = pending.values.get_mut(index) {
+                        let field =
+                            ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+                        if index == 0 {
+                            focus_first(&field, &mut pending.focus_first);
+                        }
+                    }
+                });
+            }
+
+            let invocation = native.build(&pending.values);
+            ui.separator();
+            ui.label(tr("Will send:"));
+            for line in &invocation.lines {
+                ui.code(line);
+            }
 
             ui.separator();
-            ui.label(tr("Copy to the clipboard"));
             ui.horizontal(|ui| {
-                if ui.button(tr("Screen")).clicked() {
-                    request = Some(UiRequest::CopyRange(Range::Screen));
+                if ui.button(tr("Send")).clicked() {
+                    request = Some(UiRequest::RunNative(native, pending.values.clone()));
+                    close = true;
                 }
-                if ui.button(tr("Everything")).clicked() {
-                    request = Some(UiRequest::CopyRange(Range::All));
+                if ui.button(tr("Cancel")).clicked() {
+                    close = true;
+                }
+                if ui
+                    .button(tr("Reset"))
+                    .on_hover_text(tr("Back to the fields this helper starts with."))
+                    .clicked()
+                {
+                    pending.values = native.default_values();
                 }
             });
-        });
+        },
+    );
 
-    if !open {
-        state.show_export = false;
-    }
-    if request.is_some() {
-        state.show_export = false;
+    if close || !open {
+        state.pending_native = None;
     }
     request
 }
@@ -905,16 +405,51 @@ pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool
             if let Some(error) = state.error.as_ref() {
                 ui.add_space(4.0);
                 ui.colored_label(WARNING, error);
+                // The way out when the app cannot get the file itself. On a
+                // network whose proxy demands NTLM the download can never
+                // succeed - ureq speaks only Basic - and the browser, which
+                // authenticates as the logged-in user, always can. Offered
+                // only once something has gone wrong, so the ordinary path
+                // stays one press.
+                ui.horizontal(|ui| {
+                    ui.small(tr("Or fetch it yourself:"));
+                    ui.hyperlink_to(tr("open the download"), &release.download);
+                });
+                ui.small(tr(
+                    "Save it next to the running program, then replace the program with it.",
+                ));
             }
             ui.add_space(6.0);
             ui.separator();
 
-            ui.horizontal(|ui| {
-                if state.downloading {
+            if state.downloading {
+                // How far, not just that it is trying. A twelve-megabyte
+                // executable through a corporate proxy takes long enough that
+                // a bare spinner leaves no way to tell a slow download from a
+                // stuck one - which is the state this updater was reported in.
+                let (done, total) = state.downloaded();
+                ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(tr("Downloading..."));
-                    return;
+                    if total > 0 {
+                        ui.label(tr2(
+                            "Downloading... {} of {}",
+                            &megabytes(done),
+                            &megabytes(total),
+                        ));
+                    } else {
+                        ui.label(tr1("Downloading... {}", &megabytes(done)));
+                    }
+                });
+                if total > 0 {
+                    ui.add(
+                        egui::ProgressBar::new(done as f32 / total as f32)
+                            .desired_width(260.0)
+                            .show_percentage(),
+                    );
                 }
+                return;
+            }
+            ui.horizontal(|ui| {
                 if state.staged.is_some() {
                     if ui
                         .button(tr("Restart and update"))
@@ -940,6 +475,12 @@ pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool
         state.asked = false;
     }
     apply
+}
+
+/// A byte count as megabytes, for a download whose size is the only thing worth
+/// saying about it.
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
 }
 
 /// A heading with room around it, so the sections of the settings window read
@@ -1276,6 +817,18 @@ pub fn settings_dialog(
                 {
                     changed = true;
                 }
+                if ui
+                    .checkbox(
+                        &mut settings.tabs_in_title_bar,
+                        tr("Tabs on window title bar"),
+                    )
+                    .on_hover_text(tr(
+                        "Puts the tabs on the same row as the window buttons, from the new-session button across to the gear. One row instead of two; the session line - instance, PID and size - goes, since the tabs already say which session it is.",
+                    ))
+                    .changed()
+                {
+                    changed = true;
+                }
                 ui.horizontal(|ui| {
                     ui.label(tr("Terminal size"));
                     if ui
@@ -1370,20 +923,102 @@ pub fn settings_dialog(
                 });
                 if let Some(proxy) = crate::features::update::system_proxy() {
                     ui.small(tr1("Going through the system proxy at {}.", &proxy));
+                    // Only shown when there is a proxy to authenticate to. A
+                    // proxy that lets the check through and then demands
+                    // credentials for the host GitHub serves the release from
+                    // is what left this updater checking successfully and
+                    // never downloading, so the fields are here rather than
+                    // the failure being something only the log knows about.
+                    ui.horizontal(|ui| {
+                        ui.label(tr("Proxy user"));
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut settings.proxy_user)
+                                    .desired_width(140.0),
+                            )
+                            .on_hover_text(tr(
+                                "Only if the proxy asks for credentials. Leave empty otherwise.",
+                            ))
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.label(tr("Password"));
+                        // Not read back out of the credential store to fill
+                        // this in: a password manager is not a place to show
+                        // passwords from. Typing here replaces what is stored,
+                        // and emptying the field forgets it.
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut state.proxy_password)
+                                    .password(true)
+                                    .hint_text(if crate::features::update::has_proxy_password() {
+                                        tr("stored")
+                                    } else {
+                                        tr("none")
+                                    })
+                                    .desired_width(140.0),
+                            )
+                            .on_hover_text(tr(
+                                "Kept in the operating system's credential store, never in settings.toml.",
+                            ))
+                            .lost_focus()
+                        {
+                            action = Some(UiRequest::SetProxyPassword(state.proxy_password.clone()));
+                            state.proxy_password.clear();
+                        }
+                    });
+                    ui.small(tr(
+                        "Basic authentication only. A proxy that insists on NTLM cannot be reached this way; download the release from the browser instead.",
+                    ));
                 } else {
                     ui.small(tr("No system proxy configured; connecting directly."));
                 }
 
                 section(ui, tr("Macros"));
+                ui.horizontal(|ui| {
+                    // The manager first: it is what anyone opening this section
+                    // came for, and the shared file below it is a path most
+                    // installs set once and never look at again.
+                    if ui
+                        .button(tr("Manage macros..."))
+                        .on_hover_text(tr("Make, edit and delete your own macros, and read the organization's. Running them is on the terminal's right-click menu."))
+                        .clicked()
+                    {
+                        state.macros.open = true;
+                    }
+                    if ui
+                        .button(tr("Open folder"))
+                        .on_hover_text(crate::config::personal_macros_path().display().to_string())
+                        .clicked()
+                    {
+                        if let Some(folder) = crate::config::personal_macros_path().parent() {
+                            action = Some(UiRequest::OpenFolder(folder.to_path_buf()));
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr("Shortcut for the manager"));
+                    // The same field a macro's own binding is set in, so the
+                    // two behave the same way - including the warning when the
+                    // chord is one the app has already taken.
+                    if crate::ui::shortcut::picker(
+                        ui,
+                        &mut settings.macro_manager_shortcut,
+                        &mut state.capture_manager_shortcut,
+                    ) {
+                        changed = true;
+                    }
+                });
                 ui.label(tr("Organization macro file (shared, read-only)"));
                 let mut org = settings.org_macros_path.display().to_string();
                 if ui.text_edit_singleline(&mut org).changed() {
                     settings.org_macros_path = std::path::PathBuf::from(org.trim());
                     changed = true;
                 }
-                ui.small(
-                    tr("A UNC share, mapped drive, or local copy. Leave empty for none.                      Your personal macros are edited in the Macros panel."),
-                );
+                ui.small(tr(
+                    "A UNC share, mapped drive, or local copy. Leave empty for none.",
+                ));
                 if let Some(path) = settings.org_macros() {
                     if path.exists() {
                         ui.small(tr("Found."));
@@ -1394,6 +1029,43 @@ pub fn settings_dialog(
                         );
                     }
                 }
+
+                section(ui, tr("Shells"));
+                ui.small(tr(
+                    "Other command interpreters, offered under Shells in the new-session menu. Every one of them is a .toml file in the folder below - the ones found installed on this machine were written there for you, and can be renamed, re-armed or deleted like any other.",
+                ));
+                let shells = crate::plugins::shells::available();
+                if shells.is_empty() {
+                    ui.weak(tr("None found."));
+                }
+                for shell in &shells {
+                    ui.horizontal(|ui| {
+                        ui.label(&shell.name);
+                        ui.weak(tr(shell.source_label()));
+                    });
+                    ui.small(shell.command_line());
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(tr("Open folder"))
+                        .on_hover_text(crate::plugins::shells::shells_dir().display().to_string())
+                        .clicked()
+                    {
+                        action = Some(UiRequest::OpenFolder(
+                            crate::plugins::shells::shells_dir(),
+                        ));
+                    }
+                    if ui
+                        .button(tr("Reload"))
+                        .on_hover_text(tr("Probe again and re-read the folder."))
+                        .clicked()
+                    {
+                        // The list is cached for the process, because the
+                        // new-session menu asks for it on every frame it is
+                        // open. This is the way to say a file has just changed.
+                        crate::plugins::shells::refresh();
+                    }
+                });
 
                 section(ui, tr("Logging"));
                 ui.horizontal(|ui| {

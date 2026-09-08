@@ -8,6 +8,9 @@ use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Response, Sense, Str
 
 use crate::config::{CursorStyle, Theme};
 use crate::features::analyze;
+use crate::features::export;
+use crate::features::macros::{Macro, MacroGroup};
+use crate::features::natives::Native;
 use crate::i18n::tr;
 use crate::term::cell::{Cell, Color};
 use crate::term::{lineedit, palette, syntax, Attrs, Grid};
@@ -294,7 +297,10 @@ pub fn terminal_font(family: &str, font_size: f32) -> FontId {
 }
 
 /// What the right-click menu asked for, if anything.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Clone` rather than `Copy`: two of these carry a macro, and a macro carries
+/// its body.
+#[derive(Clone, Debug, PartialEq)]
 pub enum ContextAction {
     CopySelection,
     /// Copy the selection and type it straight back into the session. What
@@ -304,7 +310,19 @@ pub enum ContextAction {
     Paste,
     SelectAll,
     ClearSelection,
-    ExportScreen,
+    /// Write this much of the output to a file, in this format.
+    Export(export::Format, export::Range),
+    /// Put this much of the output on the clipboard.
+    CopyRange(export::Range),
+    /// Run a macro chosen from the menu.
+    ///
+    /// Nothing is filled in here: one that takes parameters, or that asks to be
+    /// confirmed, opens a dialog over the terminal, and one that does neither
+    /// goes straight out. The menu's job is to say *which* macro.
+    RunMacro(Macro),
+    /// Run an IRIS helper chosen from the menu. Always opens its dialog: every
+    /// helper has at least one field to fill in.
+    RunNative(Native),
     /// Hand this much of the output to a Claude Code session.
     Analyze(analyze::Scope, analyze::Panes),
     /// Layout of the tab this pane is in. Carried out by the app, which owns
@@ -379,6 +397,11 @@ pub struct RenderResult {
 /// `pane` says where this pane stands among the panes on screen - which is
 /// what decides whether it claims the keyboard and whether it draws a cursor.
 /// See [`PaneRole`].
+///
+/// `macros` is what the right-click menu offers under Macros. Borrowed rather
+/// than owned here: the list belongs to the app, which reloads it when the
+/// shared file changes, and is never written from this side.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     grid: &Grid,
@@ -387,6 +410,7 @@ pub fn show(
     opts: &RenderOpts,
     tab_uid: u64,
     pane: PaneRole,
+    macros: &[MacroGroup],
 ) -> RenderResult {
     let font = terminal_font(&opts.font_family, opts.font_size);
     let cell = cell_size(ui, &font);
@@ -470,18 +494,12 @@ pub fn show(
         offset: state.h_offset,
     };
 
-    // The bottom of the view is the line the cursor is on, not the last row of
-    // the grid. A terminal always has blank rows below the cursor - the screen
-    // is a fixed height and the prompt is somewhere up it - and they are worth
-    // one display row each. Counting them into the scroll range is invisible
-    // while every line is one row tall, because then the whole screen fits;
-    // once one line wraps into thirty, those blanks push the prompt off the top
-    // of the view and leave the user scrolling up to find what they just ran.
-    //
-    // Below the cursor there is nothing to see, so there is nowhere to scroll
-    // to. Blank rows after it are still drawn when the screen fits, since
-    // `from_top` fills the viewport from every line there is.
-    let max_top = wrap::top_for_bottom(cursor_line + 1, rows, mode, used);
+    // The bottom of the view is the line the cursor is on, and its top is the
+    // first line of the screen: the screen is the whole of what a live view
+    // shows, and history belongs above it. See [`wrap::live_top`], which is
+    // where both halves of that are argued - including the clear-screen this
+    // was getting wrong.
+    let max_top = wrap::live_top(grid.scrollback.len(), cursor_line, rows, mode, used);
     let top_line = match state.anchor {
         ScrollAnchor::Bottom => max_top,
         ScrollAnchor::At(line) => line.min(max_top),
@@ -735,10 +753,29 @@ pub fn show(
             ui.close_menu();
         }
         ui.separator();
-        if ui.button(tr("Export screen...")).clicked() {
-            context_action = Some(ContextAction::ExportScreen);
-            ui.close_menu();
-        }
+        // Macros, where the output they are run against is. The manager in
+        // Settings is for writing them; this is for using them, which is a
+        // different gesture at a different moment.
+        ui.menu_button(tr("Macros"), |ui| {
+            if let Some(chosen) = macro_menu(ui, macros) {
+                context_action = Some(chosen);
+            }
+        });
+        // The IRIS helpers, beside the macros: both compose a line and send it
+        // to the session, and both belong where that session's output is.
+        ui.menu_button(tr("IRIS utilities"), |ui| {
+            if let Some(chosen) = natives_menu(ui) {
+                context_action = Some(chosen);
+            }
+        });
+        // Exporting used to be a button in the menu bar opening a dialog of six
+        // choices. All six are here, which is one press each instead of two,
+        // and they are next to the output they act on.
+        ui.menu_button(tr("Export"), |ui| {
+            if let Some(chosen) = export_menu(ui) {
+                context_action = Some(chosen);
+            }
+        });
         // A submenu rather than three entries: the scope is the only question
         // it asks, and asking it in the menu saves a dialog. A split tab is
         // asked one more - which of its two sessions - and only then, because
@@ -838,6 +875,132 @@ pub fn show(
 ///
 /// A function rather than a closure because it is called from two arms of the
 /// menu and a closure would have to borrow the answer twice.
+/// The Export submenu: the six things the old Export dialog offered.
+///
+/// Every label is short, for the reason given at the Analyze submenu: a popup
+/// is as wide as its widest entry and can only ever grow.
+fn export_menu(ui: &mut Ui) -> Option<ContextAction> {
+    let mut chosen = None;
+    ui.label(tr("Save to a file"));
+    for (label, format, range) in [
+        (
+            "Screen as text",
+            export::Format::Text,
+            export::Range::Screen,
+        ),
+        (
+            "Everything as text",
+            export::Format::Text,
+            export::Range::All,
+        ),
+        (
+            "Screen as HTML",
+            export::Format::Html,
+            export::Range::Screen,
+        ),
+        (
+            "Everything as HTML",
+            export::Format::Html,
+            export::Range::All,
+        ),
+    ] {
+        if ui.button(tr(label)).clicked() {
+            chosen = Some(ContextAction::Export(format, range));
+            ui.close_menu();
+        }
+    }
+    ui.separator();
+    ui.label(tr("Copy to the clipboard"));
+    for (label, range) in [
+        ("Screen", export::Range::Screen),
+        ("Everything", export::Range::All),
+    ] {
+        if ui.button(tr(label)).clicked() {
+            chosen = Some(ContextAction::CopyRange(range));
+            ui.close_menu();
+        }
+    }
+    chosen
+}
+
+/// The Macros submenu: a level per group, then the macros in it.
+fn macro_menu(ui: &mut Ui, groups: &[MacroGroup]) -> Option<ContextAction> {
+    let mut chosen = None;
+    if groups.iter().all(|g| g.macros.is_empty()) {
+        ui.weak(tr("No macros defined."));
+        return chosen;
+    }
+    for group in groups {
+        if group.macros.is_empty() {
+            continue;
+        }
+        // A group with no name is not a level worth walking through: its macros
+        // are offered directly, the way a single ungrouped file reads.
+        if group.name.is_empty() {
+            if let Some(picked) = group_entries(ui, group) {
+                chosen = Some(picked);
+            }
+            continue;
+        }
+        ui.menu_button(&group.name, |ui| {
+            if let Some(picked) = group_entries(ui, group) {
+                chosen = Some(picked);
+            }
+        });
+    }
+    chosen
+}
+
+/// One group's macros, as menu entries.
+///
+/// Every entry is a plain press. What follows it depends on the macro: one
+/// with parameters, or one marked `confirm`, opens a dialog over the terminal;
+/// anything else is sent there and then.
+fn group_entries(ui: &mut Ui, group: &MacroGroup) -> Option<ContextAction> {
+    let mut chosen = None;
+    for m in &group.macros {
+        // Said on the entry rather than only in the dialog that follows: which
+        // macros write is worth knowing *before* picking one. An ellipsis for
+        // the ones that stop to ask, the way a menu entry opening a dialog is
+        // spelled everywhere else.
+        let label = match (m.confirm, m.needs_input()) {
+            (true, _) => format!("{}...  ({})", m.name, tr("confirms")),
+            (false, true) => format!("{}...", m.name),
+            (false, false) => m.name.clone(),
+        };
+        let entry = ui.button(label);
+        let entry = if m.description.is_empty() {
+            entry
+        } else {
+            entry.on_hover_text(&m.description)
+        };
+        if entry.clicked() {
+            chosen = Some(ContextAction::RunMacro(m.clone()));
+            ui.close_menu();
+        }
+    }
+    chosen
+}
+
+/// The IRIS utilities submenu: one entry per helper.
+///
+/// Every one of them opens its dialog - they all take at least one field, so
+/// there is no such thing here as a helper that can be run by picking it. The
+/// fields used to be a flyout hanging off the entry, which put text fields
+/// inside a menu: a menu closes when the pointer wanders onto a sibling, and a
+/// half-typed package name went with it. A dialog over the terminal stays until
+/// it is answered.
+fn natives_menu(ui: &mut Ui) -> Option<ContextAction> {
+    let mut chosen = None;
+    for native in Native::ALL {
+        if ui.button(tr(native.label())).clicked() {
+            chosen = Some(ContextAction::RunNative(native));
+            ui.close_menu();
+        }
+    }
+    chosen
+}
+
 fn analyze_scopes(
     ui: &mut Ui,
     has_selection: bool,

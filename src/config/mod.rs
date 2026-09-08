@@ -206,6 +206,14 @@ pub struct Settings {
     /// Never written to: it is shared, so the app treats it as read-only and
     /// keeps personal edits in [`personal_macros_path`].
     pub org_macros_path: PathBuf,
+    /// Chord that opens the macro manager, e.g. `Ctrl+Shift+M`. `None` means
+    /// the manager is only reachable from the settings window.
+    ///
+    /// Text, like a macro's own binding, and read by the same parser: see
+    /// [`crate::ui::shortcut`]. A value it cannot understand never fires,
+    /// which is what keeps a hand-edited settings file from breaking the app.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub macro_manager_shortcut: Option<String>,
     pub profiles: Vec<Profile>,
     /// Profile opened by Ctrl+T and at startup. Empty means "ask".
     pub default_profile: String,
@@ -224,6 +232,14 @@ pub struct Settings {
     /// Alt+F4. Ignored while the system title bar is in use, which brings its
     /// own controls.
     pub show_window_buttons: bool,
+    /// Put the tabs in the title bar, on the same row as the window controls,
+    /// instead of on a strip of their own below it.
+    ///
+    /// One row instead of two, which on a laptop screen is two more lines of
+    /// output. What it costs is the session line - instance, PID, geometry -
+    /// because the two cannot both have the middle of the bar; the tabs name
+    /// the session anyway, which is most of what that line was for.
+    pub tabs_in_title_bar: bool,
     /// Reopen at the size the window was last closed at. Off opens every
     /// launch at [`Settings::default_geometry`].
     pub save_terminal_size: bool,
@@ -260,6 +276,17 @@ pub struct Settings {
     /// One HTTPS request through the machine's own proxy, and nothing is
     /// downloaded or replaced without being asked for.
     pub check_for_updates: bool,
+    /// Username to authenticate to the HTTP proxy as, for the update check and
+    /// download. Empty means "do not authenticate".
+    ///
+    /// The password is not here: it goes to the OS credential store, keyed by
+    /// [`crate::features::update::PROXY_KEYRING_ACCOUNT`], the same way a
+    /// profile's password does.
+    ///
+    /// Needed because a proxy that answers `407` for the host GitHub serves
+    /// release assets from will not let the download past without it - which
+    /// is what left the updater checking successfully and never downloading.
+    pub proxy_user: String,
 }
 
 impl Default for Settings {
@@ -285,12 +312,16 @@ impl Default for Settings {
             default_log_mode: LogMode::Off,
             log_retention_days: 30,
             org_macros_path: PathBuf::new(),
+            // Nothing by default: a shortcut the user did not ask for is one
+            // that shadows whatever they were using it for.
+            macro_manager_shortcut: None,
             profiles: Vec::new(),
             default_profile: String::new(),
             open_on_start: true,
             confirm_close_with_live_session: true,
             native_decorations: false,
             show_window_buttons: true,
+            tabs_in_title_bar: false,
             save_terminal_size: false,
             default_cols: DEFAULT_TERMINAL_COLS,
             default_rows: DEFAULT_TERMINAL_ROWS,
@@ -302,6 +333,7 @@ impl Default for Settings {
             settings_window_position: None,
             enable_plugins: false,
             check_for_updates: true,
+            proxy_user: String::new(),
         }
     }
 }

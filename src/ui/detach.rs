@@ -127,8 +127,9 @@ pub fn shell(
         egui::CentralPanel::default().show(ctx, contents);
         if !native_decorations {
             // Last, and in a foreground layer, for the same reason the main
-            // window does it last.
-            chrome::resize_grips(ctx, id);
+            // window does it last. Nothing to keep off: a dialog has no
+            // terminal in it reaching the window edge.
+            chrome::resize_grips(ctx, id, &[]);
         }
         remember_position(ctx, id);
         if let Some(placement) = placement.as_mut() {
@@ -267,7 +268,9 @@ fn title_bar(
     let mut action = None;
     ui.horizontal(|ui| {
         if buttons.left {
-            if let Some(asked) = chrome::leading_window_buttons(ui, buttons) {
+            // No gear: a dialog does not open the settings window - it may
+            // well *be* the settings window.
+            if let Some(asked) = chrome::leading_window_buttons(ui, buttons, None) {
                 action = Some(asked);
             }
             ui.add_space(6.0);
@@ -284,7 +287,7 @@ fn title_bar(
         }
         // Claims the rest of the row for dragging either way; without it the
         // window could not be moved at all.
-        if let Some(asked) = chrome::title_bar_controls(ui, buttons, !buttons.left, window) {
+        if let Some(asked) = chrome::title_bar_controls(ui, buttons, !buttons.left, window, None) {
             action = Some(asked);
         }
     });

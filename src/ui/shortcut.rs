@@ -1,11 +1,18 @@
-//! Parsing and formatting the keyboard shortcut a macro can be bound to.
+//! Parsing, formatting and setting the keyboard shortcuts the app can be told
+//! about.
 //!
 //! Shortcuts live in the macro XML as text (`key="Ctrl+Shift+G"`), because the
-//! file is shared between people and hand-edited. That text is the source of
+//! file is shared between people and hand-edited, and the one for the macro
+//! manager lives in `settings.toml` the same way. That text is the source of
 //! truth; this module is the only thing that decides what it means, so a value
 //! that cannot be understood simply never fires rather than breaking the file.
+//!
+//! [`picker`] is the field it is set in, shared by the two places that set one.
 
-use egui::{Key, Modifiers};
+use egui::{Key, Modifiers, Ui};
+
+use crate::i18n::{tr, tr1};
+use crate::ui::panels::WARNING;
 
 /// Modifiers the app keeps for itself, and the keys they are used with.
 ///
@@ -138,6 +145,146 @@ pub fn is_reserved(modifiers: Modifiers, key: Key) -> Option<&'static str> {
         .iter()
         .find(|(_, reserved)| *reserved == key)
         .map(|(name, _)| *name)
+}
+
+/// The field a shortcut is set in: the text, a button that reads the chord off
+/// the keyboard, and the warnings for a value that will not do what it says.
+///
+/// Shared by the macro editor and the settings window, which is the whole
+/// reason it is here rather than in either of them: the two were the same forty
+/// lines, and the second copy would have been the one that stopped warning
+/// about a chord the app has already taken.
+///
+/// `capture` is the caller's "listening right now" flag. It has to be the
+/// caller's, because while it is set the app must stop claiming shortcuts for
+/// itself - otherwise Ctrl+T opens a tab instead of being recorded.
+///
+/// Reports whether the binding changed.
+pub fn picker(ui: &mut Ui, binding: &mut Option<String>, capture: &mut bool) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let mut text = binding.clone().unwrap_or_default();
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("Ctrl+Shift+G")
+                    .desired_width(140.0),
+            )
+            .changed()
+        {
+            let text = text.trim().to_string();
+            *binding = (!text.is_empty()).then_some(text);
+            changed = true;
+        }
+        // Typing the name of a chord is fiddly and easy to get subtly wrong -
+        // `Num7` against `7`, `Option` against `Alt` - so the other way in is
+        // to press it. What lands in the field is what the parser produced,
+        // which is the value that will fire.
+        let label = if *capture {
+            tr("Press the keys...")
+        } else {
+            tr("Detect")
+        };
+        if ui
+            .selectable_label(*capture, label)
+            .on_hover_text(tr(
+                "Press the combination and it is filled in here. Esc cancels, Backspace clears it.",
+            ))
+            .clicked()
+        {
+            *capture = !*capture;
+        }
+    });
+
+    if *capture {
+        match captured(ui) {
+            Capture::Waiting => {}
+            Capture::Cancelled => *capture = false,
+            Capture::Cleared => {
+                *binding = None;
+                *capture = false;
+                changed = true;
+            }
+            Capture::Chord(text) => {
+                *binding = Some(text);
+                *capture = false;
+                changed = true;
+            }
+        }
+        ui.small(tr(
+            "A modifier is required: Ctrl, Alt, or both, with or without Shift.",
+        ));
+    }
+
+    // Reported rather than rejected: a macro's binding is also edited by hand
+    // in the shared XML, and a value we do not understand has to survive a
+    // round trip through here instead of being erased.
+    if let Some(key) = binding.as_deref() {
+        match parse(key) {
+            None => {
+                ui.colored_label(
+                    WARNING,
+                    tr("Not understood, so it will not fire. Needs a modifier, like Ctrl+Shift+G."),
+                );
+            }
+            Some((modifiers, parsed)) => {
+                if let Some(used_for) = is_reserved(modifiers, parsed) {
+                    ui.colored_label(
+                        WARNING,
+                        tr1("The app already uses this for {}; add Shift.", used_for),
+                    );
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// What a frame of key presses meant while [`picker`] was listening.
+enum Capture {
+    /// Nothing usable yet, so keep listening.
+    Waiting,
+    /// Escape: leave the binding as it was.
+    Cancelled,
+    /// Backspace or Delete: no shortcut at all.
+    Cleared,
+    /// A chord, in the parser's own spelling.
+    Chord(String),
+}
+
+/// Takes the pressed chord out of this frame's events.
+///
+/// Every key press is consumed while listening, and so is the text they would
+/// have produced: a key pressed here is the shortcut being named, not typing,
+/// and leaving it in the stream would put a letter in the field beside it or
+/// fire the very shortcut being recorded. A chord without Ctrl or Alt is
+/// ignored rather than accepted - a bare letter, or Shift plus one, would fire
+/// while the user was typing at the prompt.
+fn captured(ui: &Ui) -> Capture {
+    ui.input_mut(|input| {
+        let mut result = Capture::Waiting;
+        input.events.retain(|event| match event {
+            egui::Event::Text(_) => false,
+            egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } => {
+                match key {
+                    Key::Escape => result = Capture::Cancelled,
+                    Key::Backspace | Key::Delete => result = Capture::Cleared,
+                    key if modifiers.ctrl || modifiers.alt || modifiers.command => {
+                        result = Capture::Chord(format(*modifiers, *key));
+                    }
+                    _ => {}
+                }
+                false
+            }
+            _ => true,
+        });
+        result
+    })
 }
 
 #[cfg(test)]

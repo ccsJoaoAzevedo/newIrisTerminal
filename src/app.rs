@@ -17,10 +17,11 @@ use crate::pty::launcher::launcher;
 use crate::pty::Session;
 use crate::term::{lineedit, Grid, Motion};
 use crate::ui::chrome::{self, WindowAction};
+use crate::ui::macro_manager;
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
 use crate::ui::terminal_view::{self, RenderOpts, Selection, ViewState};
 use crate::ui::theme_manager::{self, ThemeAction};
-use crate::ui::{fonts, input, shortcut};
+use crate::ui::{fonts, icons, input, shortcut};
 
 /// What the app knows about a newer version.
 ///
@@ -34,6 +35,10 @@ pub struct UpdateState {
     /// The downloaded executable, waiting to be put in place.
     pub staged: Option<std::path::PathBuf>,
     pub downloading: bool,
+    /// Bytes of the download written so far, shared with the thread doing the
+    /// writing. Read every frame while `downloading`, which is what lets the
+    /// dialog say how far it has got instead of only that it is trying.
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub error: Option<String>,
     /// The dialog has been shown for this release and dismissed. Kept so a
     /// "later" is not undone by the next frame.
@@ -67,7 +72,27 @@ impl UpdateState {
         self.events = Some(rx);
         self.downloading = true;
         self.error = None;
-        update::download_in_background(release, tx);
+        self.progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        update::download_in_background(release, self.progress.clone(), tx);
+    }
+
+    /// Bytes written so far, and the total if the release said how big it is.
+    pub fn downloaded(&self) -> (u64, u64) {
+        (
+            self.progress.load(std::sync::atomic::Ordering::Relaxed),
+            self.available.as_ref().map(|r| r.size).unwrap_or(0),
+        )
+    }
+
+    /// Whether a thread is still working, so the frame loop knows to keep
+    /// drawing.
+    ///
+    /// An idle terminal gives egui no reason to draw another frame, and the
+    /// events from the check and the download are only picked up while frames
+    /// are being drawn - so without this the answer could sit in the channel
+    /// unread and the spinner never move.
+    fn working(&self) -> bool {
+        self.events.is_some()
     }
 
     fn drain(&mut self) -> Vec<update::Event> {
@@ -86,6 +111,20 @@ impl UpdateState {
 /// margin rather than wrapping it, so a session opened at 80 columns loses
 /// everything past column 80 until it is resized. Opening at the real size
 /// means nothing is cut in the first place.
+/// A strip of the title bar kept free of tabs, in front of the window
+/// controls.
+///
+/// The handle that is always there. A row of tabs long enough to fill the bar
+/// would otherwise leave nothing to drag the window by, and with the system's
+/// frame turned off there is then no way to move it at all. Held back at the
+/// end of the row rather than in front of the tabs, where an empty gap looks
+/// like a tab that failed to draw.
+const TITLE_FREE_STRIP: f32 = 28.0;
+
+/// How wide one title-bar control is, for working out what to keep back for
+/// them. egui sizes them from the row height, which is `interact_size.y`.
+const TITLE_CONTROL_SIDE: f32 = 24.0;
+
 const FALLBACK_COLS: u16 = 80;
 const FALLBACK_ROWS: u16 = 24;
 
@@ -370,12 +409,16 @@ impl Tab {
         let cols = self.grid.cols as u16;
         let rows = self.grid.rows as u16;
 
-        // A remote server has no process here to start: it is reached by
-        // logging in to its Telnet service, the same way the launcher's own
-        // Terminal reaches it. Everything above this point is identical.
-        let opened = match self.profile.remote.as_ref() {
-            Some(remote) => Session::telnet(&remote.address, remote.port, cols, rows),
-            None => {
+        // Three things this could be, and the profile has already decided
+        // which. A shell is a program on this machine with no instance and
+        // nothing to log in to; a remote server has no process here at all and
+        // is reached by logging in to its Telnet service, the same way the
+        // launcher's own Terminal reaches it. Everything above this point is
+        // identical for all three.
+        let opened = match (self.profile.shell.as_ref(), self.profile.remote.as_ref()) {
+            (Some(shell), _) => Session::shell(&shell.program, &shell.args, cols, rows),
+            (None, Some(remote)) => Session::telnet(&remote.address, remote.port, cols, rows),
+            (None, None) => {
                 let launcher = launcher();
                 Session::local(launcher.as_ref(), &self.profile.launch_spec(), cols, rows)
             }
@@ -714,6 +757,14 @@ pub struct App {
     /// ever surprise the user. Restarting picks up an edit.
     pub servers: crate::config::ServerList,
     pub macro_groups: Vec<MacroGroup>,
+    /// The rectangles the terminal panes drew into this frame.
+    ///
+    /// Collected so the window's resize grips can keep off them: a grip is in a
+    /// foreground layer and outranks whatever is under it, and a terminal
+    /// reaching the window edge would lose its first column to one. Cleared and
+    /// refilled every frame - a pane that has gone must not still be claiming
+    /// the space it used to be in.
+    pane_rects: Vec<egui::Rect>,
     /// Commands typed at an IRIS prompt, shared by every tab so a new one opens
     /// knowing what was run in the last.
     history: History,
@@ -836,6 +887,7 @@ impl App {
         let mut app = App {
             new_tab_profile: default_profile,
             macro_groups: load_macros(&settings).groups,
+            pane_rects: Vec::new(),
             history: History::load(
                 &config::command_history_path(),
                 settings.save_command_history,
@@ -871,6 +923,9 @@ impl App {
         // go, and the check for the next one starts now: it is a request over
         // a corporate proxy, so it is not going to answer this frame.
         update::clean_up();
+        // Before the check: it is what the check authenticates to the proxy
+        // with, and a check that starts without it gets a 407 instead.
+        update::configure_proxy_user(&app.settings.proxy_user);
         if app.settings.check_for_updates {
             app.updates.start_check();
         }
@@ -1133,7 +1188,7 @@ impl App {
         // The macro editor is listening for a chord: Ctrl+T there means "bind
         // this macro to Ctrl+T", and opening a tab instead would make the app's
         // own shortcuts the only ones that could never be recorded.
-        if self.panels.capture_shortcut {
+        if self.panels.macros.capture_shortcut || self.panels.capture_manager_shortcut {
             return;
         }
         // Nor while the window is not the active one: a macro shortcut sends
@@ -1197,6 +1252,22 @@ impl App {
             self.clear_active_terminal();
         }
 
+        // The macro manager's own chord, if the user has set one. Before the
+        // macros themselves so that a chord bound to both opens the manager -
+        // the one of the two that cannot send anything to a live session.
+        if terminal_focus {
+            if let Some((modifiers, key)) = self
+                .settings
+                .macro_manager_shortcut
+                .as_deref()
+                .and_then(shortcut::parse)
+            {
+                if consume_exact(ctx, modifiers, key) {
+                    self.panels.macros.open = true;
+                }
+            }
+        }
+
         // Macro shortcuts come after the app's own, which is what the editor's
         // "the app already uses this" warning promises. A macro whose `key` is
         // missing or unparseable simply never fires; the text is shared and
@@ -1236,20 +1307,38 @@ impl App {
         // The system bar brings its own controls, and the setting can turn the
         // app's off entirely.
         let own_buttons = !self.settings.native_decorations && self.settings.show_window_buttons;
+        // Whether the tabs share this row. Read before the closure: it decides
+        // both what goes in the middle of the bar and whether the session's own
+        // line is drawn at all.
+        let inline_tabs = self.settings.tabs_in_title_bar && !self.tabs.is_empty();
+        // Taken out of `self` for the length of the row, because the gear is
+        // handed to `chrome` as a `&mut bool` while the closure still holds
+        // `self` for the tab strip.
+        let mut show_settings = self.panels.show_settings;
+        // Which end the gear goes on: beside minimize, which means the leading
+        // group when that group is the one being drawn. Worked out once,
+        // because getting it from each end separately is how the gear ended up
+        // on neither - a theme with left-hand buttons and the buttons switched
+        // off drew no leading group for it to join and skipped the trailing
+        // one because the theme said left. Settings was then unreachable.
+        let leading_buttons = own_buttons && buttons.left;
         ui.horizontal(|ui| {
             // Drawn before anything else when the theme puts them on the left,
             // which is where Aqua has them.
-            if own_buttons && buttons.left {
-                if let Some(asked) = chrome::leading_window_buttons(ui, buttons) {
+            if leading_buttons {
+                if let Some(asked) =
+                    chrome::leading_window_buttons(ui, buttons, Some(&mut show_settings))
+                {
                     action = Some(asked);
                 }
                 ui.add_space(6.0);
             }
             let endpoint = self.new_tab_profile.endpoint();
-            let new_tab = ui.button("+").on_hover_text(tr1(
+            let new_tab = icon_button(ui, icons::Glyph::Plus).on_hover_text(tr1(
                 "New session on {} (Ctrl+T).\nRight-click to connect somewhere else.",
                 &endpoint,
             ));
+            let new_tab_right = new_tab.rect.right();
             if new_tab.clicked() {
                 open_default = true;
             }
@@ -1338,51 +1427,123 @@ impl App {
                 {
                     ui.weak(tr("No servers, profiles or instances found."));
                 }
+
+                // The shells this machine has, under the IRIS entries rather
+                // than among them: they are a different kind of session, and
+                // nothing about a profile or a namespace applies to one. See
+                // [`crate::plugins::shells`].
+                let shells = crate::plugins::shells::available();
+                if !shells.is_empty() {
+                    ui.separator();
+                    ui.weak(tr("Shells"));
+                    for shell in &shells {
+                        if ui
+                            .button(&shell.name)
+                            .on_hover_text(shell.command_line())
+                            .clicked()
+                        {
+                            pick = Some(Profile::for_shell(shell));
+                            ui.close_menu();
+                        }
+                    }
+                }
             });
-            ui.separator();
-            ui.toggle_value(&mut self.panels.show_macros, tr("Macros"));
-            // Toggles, not plain buttons: clicking the button that opened a
-            // dialog is how everyone expects to close it again, and it shows
-            // which dialogs are open the way Macros already does.
-            ui.toggle_value(&mut self.panels.show_export, tr("Export"));
-            ui.toggle_value(&mut self.panels.show_settings, tr("Settings"));
-            ui.separator();
-            if let Some(tab) = self.active_tab() {
-                let (cols, rows) = self.view_size;
-                // The instance, then what identifies this session of it, then
-                // how big the window is - in that order because that is how
-                // specific each one is.
-                let pid = match tab.pid().filter(|_| self.settings.show_pid) {
-                    Some(pid) => format!("  PID {pid}"),
-                    None => String::new(),
-                };
-                let info = format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint());
-                // Reading matter, and nothing else: the window is dragged by it
-                // like any other empty stretch of the bar. Left as a plain
-                // label while the system draws the frame, which is doing the
-                // moving itself.
-                if let Some(asked) = chrome::drag_text(
+            // One rule after the new-session button, and none at all when the
+            // tabs are up here: the first tab's own edge is the divider, and a
+            // rule in front of it - there used to be two, with a gap between
+            // them - reads as a slot with something missing out of it.
+            //
+            // Macros, Export and the IRIS utilities all used to sit between
+            // those two rules. Every one of them was about the output rather
+            // than about the app, and all three are now on the terminal's own
+            // right-click menu, beside the session they act on; writing macros
+            // is in Settings, with the themes.
+            if !inline_tabs {
+                ui.separator();
+            }
+
+            // The tabs, when the setting has moved them up here. Drawn in the
+            // row rather than into a rectangle handed to `chrome`, which is
+            // what lets the row's own cursor measure them: everything after
+            // them is then the space they left, and that space is what the
+            // window is dragged by.
+            if inline_tabs {
+                // Bounded, or a strip of tabs long enough would run under the
+                // window buttons: a scroll area takes the width it is offered,
+                // and what is offered here has the buttons at the end of it.
+                // The reserve also leaves a strip in front of them that is
+                // always free, so a row filled with tabs still has somewhere
+                // to take hold of the window.
+                let tabs_from = ui.cursor().min.x;
+                let room = ui.available_width() - self.title_bar_reserve();
+                self.tab_strip_bounded(ui, room.max(60.0));
+                // The sliver between the button and the first tab. Nothing is
+                // allocated for it - it is the row's own spacing - it simply
+                // drags the window now instead of doing nothing.
+                if let Some(asked) = chrome::drag_span(
                     ui,
-                    egui::RichText::new(info).weak(),
+                    new_tab_right..tabs_from,
                     !self.settings.native_decorations,
                     "nit-main",
-                    "session",
+                    "before-tabs",
                 ) {
                     action = Some(asked);
                 }
             }
 
-            // Last, so the leftover space it claims for dragging is whatever
-            // the items above did not take. Claimed even when the controls are
+            // The session's own line - instance, PID, geometry - unless the
+            // tabs have moved up here, in which case the row is theirs: the
+            // two cannot both have the middle of the bar, and the tabs say
+            // which session it is anyway.
+            if !inline_tabs {
+                if let Some(tab) = self.active_tab() {
+                    let (cols, rows) = self.view_size;
+                    // The instance, then what identifies this session of it,
+                    // then how big the window is - in that order because that
+                    // is how specific each one is.
+                    let pid = match tab.pid().filter(|_| self.settings.show_pid) {
+                        Some(pid) => format!("  PID {pid}"),
+                        None => String::new(),
+                    };
+                    let info = format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint());
+                    // Reading matter, and nothing else: the window is dragged
+                    // by it like any other empty stretch of the bar. Left as a
+                    // plain label while the system draws the frame, which is
+                    // doing the moving itself.
+                    if let Some(asked) = chrome::drag_text(
+                        ui,
+                        egui::RichText::new(info).weak(),
+                        !self.settings.native_decorations,
+                        "nit-main",
+                        "session",
+                    ) {
+                        action = Some(asked);
+                    }
+                }
+            }
+
+            // Last, so the space it claims for dragging is whatever the items
+            // above did not take. Claimed even when the window controls are
             // hidden or already drawn on the left: without it there is nothing
             // to drag the window by.
             if !self.settings.native_decorations {
                 let trailing = own_buttons && !buttons.left;
-                if let Some(asked) = chrome::title_bar_controls(ui, buttons, trailing, "nit-main") {
+                let gear = (!leading_buttons).then_some(&mut show_settings);
+                if let Some(asked) =
+                    chrome::title_bar_controls(ui, buttons, trailing, "nit-main", gear)
+                {
                     action = Some(asked);
                 }
+            } else {
+                // The system is drawing the frame, so there are no window
+                // controls of the app's own for the gear to sit beside - but it
+                // is the only way into Settings, so it still has to be here.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    chrome::settings_button(ui, buttons, &mut show_settings);
+                });
             }
         });
+        self.panels.show_settings = show_settings;
 
         // A pick opens that session and leaves the default alone. Making the
         // choice stick was worse than it sounds: after one Telnet server, the
@@ -1577,6 +1738,38 @@ impl App {
         }
     }
 
+    /// How much of the title-bar row is kept back from the tabs: the window
+    /// controls and the gear, plus the strip that is always draggable.
+    ///
+    /// Measured rather than guessed, because a theme can hide any of the three
+    /// controls and the row height decides how wide one is. The tabs are given
+    /// what is left, so a long strip of them scrolls instead of running under
+    /// the close button. See [`TITLE_FREE_STRIP`] for the rest of it.
+    fn title_bar_reserve(&self) -> f32 {
+        // The gear is always there; the other three are the theme's to hide.
+        let buttons = if self.settings.native_decorations || !self.settings.show_window_buttons {
+            1
+        } else {
+            4
+        };
+        let side = TITLE_CONTROL_SIDE;
+        buttons as f32 * side + TITLE_FREE_STRIP
+    }
+
+    /// The tab strip, in no more than `width` of the row it is drawn in.
+    ///
+    /// Only ever called from a left-to-right row, and that matters:
+    /// `allocate_ui_at_rect` gives the child the *parent's* layout, and what it
+    /// then advances the row by is the child's `min_rect`. In a right-to-left
+    /// parent that rect starts at the right-hand edge, so a narrow strip of
+    /// tabs would measure as ending where the row ends and leave nothing after
+    /// it - which is precisely how the title bar lost its drag area.
+    fn tab_strip_bounded(&mut self, ui: &mut egui::Ui, width: f32) {
+        let height = ui.available_height().max(ui.spacing().interact_size.y);
+        let rect = egui::Rect::from_min_size(ui.cursor().min, egui::Vec2::new(width, height));
+        ui.allocate_ui_at_rect(rect, |ui| self.tab_strip(ui));
+    }
+
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let mut to_close = None;
         let mut to_rename = None;
@@ -1584,7 +1777,12 @@ impl App {
         let mut to_unsplit = None;
         let mut to_activate = None;
         let with_namespace = self.settings.show_namespace_in_tab;
-        egui::ScrollArea::horizontal().show(ui, |ui| {
+        // Shrunk to the tabs rather than filling the row: in the title bar the
+        // space left over is what the window is dragged by, and a scroll area
+        // that claimed the whole width would take all of it.
+        egui::ScrollArea::horizontal()
+            .auto_shrink([true, false])
+            .show(ui, |ui| {
             ui.horizontal(|ui| {
                 for index in 0..self.tabs.len() {
                     let selected = index == self.active;
@@ -1651,7 +1849,10 @@ impl App {
                             ui.close_menu();
                         }
                     });
-                    if ui.small_button("x").clicked() {
+                    if icon_button(ui, icons::Glyph::SmallCross)
+                        .on_hover_text(tr("Close this tab."))
+                        .clicked()
+                    {
                         to_close = Some(index);
                     }
                     ui.separator();
@@ -1864,6 +2065,9 @@ impl App {
                     &config::command_history_path(),
                     self.settings.save_command_history,
                 );
+                // The next check has to authenticate as whoever the field now
+                // names, not as whoever it named when the app started.
+                update::configure_proxy_user(&self.settings.proxy_user);
                 if let Err(e) = self.settings.save() {
                     self.set_status(tr1("Could not save settings: {}", &format!("{e:#}")));
                 }
@@ -1878,6 +2082,14 @@ impl App {
                 }
             }
             UiRequest::CheckForUpdates => self.updates.check_now(),
+            UiRequest::SetProxyPassword(password) => match update::set_proxy_password(&password) {
+                Ok(()) if password.is_empty() => self.set_status(tr("Proxy password forgotten.")),
+                Ok(()) => self.set_status(tr("Proxy password saved.")),
+                Err(e) => self.set_status(tr1(
+                    "Could not save the proxy password: {}",
+                    &format!("{e:#}"),
+                )),
+            },
             UiRequest::SavePersonalMacros => {
                 let path = config::personal_macros_path();
                 let xml = macros::to_xml(&self.macro_groups);
@@ -1911,10 +2123,20 @@ impl App {
                     self.updates.staged = Some(path);
                 }
                 update::Event::Failed(why) => {
+                    let downloading = self.updates.downloading;
                     self.updates.downloading = false;
-                    // A failed check at startup is not the user's problem: it
-                    // goes to the log. One they asked for is answered.
-                    if self.updates.announce {
+                    if downloading {
+                        // The failure this used to swallow. A download that
+                        // stopped left the dialog showing its Download button
+                        // again with nothing said, which reads exactly like a
+                        // button that does nothing - and was how a timeout on
+                        // a slow connection looked. It is the user's problem
+                        // now: they pressed the button.
+                        self.updates.error = Some(why.clone());
+                        self.set_status(tr1("Could not download the update: {}", &why));
+                    } else if self.updates.announce {
+                        // A failed check at startup is not the user's problem:
+                        // it goes to the log. One they asked for is answered.
                         self.set_status(tr1("Could not check for updates: {}", &why));
                     } else {
                         log::warn!("update check failed: {why}");
@@ -1922,6 +2144,10 @@ impl App {
                 }
             }
             self.updates.announce = false;
+            // The exchange is over, so nothing is left to poll for: this is
+            // what stops `working` from keeping the frame loop awake for the
+            // rest of the session.
+            self.updates.events = None;
         }
     }
 
@@ -2382,6 +2608,39 @@ impl App {
         }
     }
 
+    /// How far the terminal is held back from the window's own edges.
+    ///
+    /// The resize grips live in a foreground layer along each edge, which
+    /// outranks whatever is under them for hit-testing - and the terminal
+    /// reaches three of those edges. Its first column was therefore inside the
+    /// left-hand grip: the pointer turned into a resize arrow over it, and a
+    /// drag starting there resized the window instead of selecting the text.
+    /// Holding the grid back by exactly the width of the grip gives the column
+    /// back without taking anything away from the grip.
+    ///
+    /// A point wider than the grip rather than exactly as wide: at exactly as
+    /// wide, the first column began on the last coordinate the grip still
+    /// answered to, which is the boundary case that left this reported as
+    /// unfixed. The grip is also told to keep off the panes outright - see
+    /// `keep_out` in [`chrome::resize_grips`] - so the two now disagree in the
+    /// terminal's favour whatever the arithmetic works out to.
+    ///
+    /// Nothing is held back at the top - the tab strip is there, not the
+    /// terminal - and nothing at all while the system draws the frame, which
+    /// brings its own borders and needs no grips.
+    fn terminal_inset(&self) -> egui::Margin {
+        if self.settings.native_decorations {
+            return egui::Margin::ZERO;
+        }
+        let gutter = chrome::RESIZE_GRAB + 1.0;
+        egui::Margin {
+            left: gutter,
+            right: gutter,
+            top: 0.0,
+            bottom: gutter,
+        }
+    }
+
     /// Draws one pane - a tab's own notes and its terminal - and carries out
     /// everything the mouse and the keyboard did in it.
     ///
@@ -2398,7 +2657,14 @@ impl App {
         at: At,
         focused: bool,
     ) -> PaneMeasure {
-        let opts = self.render_opts();
+        let mut opts = self.render_opts();
+        // ObjectScript colouring on a `bash` session colours the wrong things:
+        // a `$` is a variable to the highlighter and a prompt to the shell.
+        // Turned off for the pane rather than for the app, so an IRIS tab
+        // beside a shell tab keeps its colours.
+        if self.pane(at).is_some_and(|tab| tab.profile.is_shell()) {
+            opts.syntax = false;
+        }
         let uid = match self.pane(at) {
             Some(tab) => tab.uid,
             // Nothing there to draw: a tab that went away between frames.
@@ -2416,14 +2682,22 @@ impl App {
             self.focused_tab = Some(uid);
         }
 
+        // The macro list is lent to the pane for the length of the draw, and
+        // taken back straight afterwards. Moved out rather than borrowed
+        // because drawing a pane borrows the whole app mutably to reach the
+        // tab, and the menu is drawn from inside that - the list itself is
+        // never written from there.
+        let groups = std::mem::take(&mut self.macro_groups);
         let (result, has_selection) = {
             let Some(tab) = self.pane_mut(at) else {
+                self.macro_groups = groups;
                 return PaneMeasure::default();
             };
             let has_selection = tab.view.selection.map(|s| !s.is_empty()).unwrap_or(false);
-            let result = draw_pane(ui, tab, theme, &opts, role);
+            let result = draw_pane(ui, tab, theme, &opts, role, &groups);
             (result, has_selection)
         };
+        self.macro_groups = groups;
 
         // This pane's own session, sized to this pane: a pane is a window onto
         // one session, and telling IRIS about the whole split area would
@@ -2431,6 +2705,7 @@ impl App {
         if let Some(tab) = self.pane_mut(at) {
             tab.resize(result.cols, result.rows);
         }
+        self.pane_rects.push(result.response.rect);
         let measure = PaneMeasure {
             grid: (result.cols, result.rows),
             view: (result.view_cols, result.view_rows),
@@ -2439,8 +2714,8 @@ impl App {
         };
 
         // Right-click menu actions reuse the same paths as the keyboard
-        // shortcuts and the Export dialog. Copy-on-select: a finished drag goes
-        // straight to the clipboard, without waiting for Ctrl+C.
+        // shortcuts. Copy-on-select: a finished drag goes straight to the
+        // clipboard, without waiting for Ctrl+C.
         if result.copy_selection {
             self.copy_selection(ctx, at);
         }
@@ -2470,7 +2745,17 @@ impl App {
                         tab.view.clear_selection();
                     }
                 }
-                ContextAction::ExportScreen => self.panels.show_export = true,
+                ContextAction::Export(format, range) => self.export(range, format),
+                ContextAction::CopyRange(range) => {
+                    self.handle_request(ctx, UiRequest::CopyRange(range));
+                }
+                // Both go through the ordinary request path, which is what
+                // decides between sending at once and opening the dialog that
+                // asks for the parameters or the confirmation first.
+                ContextAction::RunMacro(m) => self.handle_request(ctx, UiRequest::RunMacro(m)),
+                ContextAction::RunNative(native) => {
+                    self.panels.pending_native = Some(panels::PendingNative::new(native));
+                }
                 ContextAction::Analyze(scope, panes) => self.analyze_with_claude(at, scope, panes),
                 ContextAction::ClearTerminal => self.clear_terminal(at),
                 // The layout of the tab this pane is in. Recorded rather than
@@ -2512,7 +2797,11 @@ impl App {
         // on a platform that does not report it, and unknown counts as focused
         // rather than leaving the terminal unable to type at all.
         let window_active = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-        if !result.response.has_focus() || self.panels.capture_shortcut || !window_active {
+        // Either of the two shortcut pickers - a macro's binding, or the macro
+        // manager's own chord - is listening, and the keys belong to whichever
+        // one it is.
+        let capturing = self.panels.macros.capture_shortcut || self.panels.capture_manager_shortcut;
+        if !result.response.has_focus() || capturing || !window_active {
             return measure;
         }
 
@@ -2727,6 +3016,7 @@ fn draw_pane(
     theme: &Theme,
     opts: &RenderOpts,
     role: terminal_view::PaneRole,
+    macros: &[MacroGroup],
 ) -> terminal_view::RenderResult {
     // Autologon status belongs next to the terminal it applies to.
     if let Some(note) = tab.autologon.status_note() {
@@ -2749,7 +3039,32 @@ fn draw_pane(
     }
 
     let uid = tab.uid;
-    terminal_view::show(ui, &tab.grid, &mut tab.view, theme, opts, uid, role)
+    terminal_view::show(ui, &tab.grid, &mut tab.view, theme, opts, uid, role, macros)
+}
+
+/// A square button carrying one of the app's own marks.
+///
+/// The alternative was a letter: the new-tab button was a `+` and the tab's
+/// close button a lowercase `x`, which at this size is a small letter next to a
+/// slightly larger one. A painted mark can be designed against its neighbours -
+/// see [`icons`] - and it cannot come out as a tofu box in a font that has no
+/// glyph for it.
+fn icon_button(ui: &mut egui::Ui, glyph: icons::Glyph) -> egui::Response {
+    let side = ui.spacing().interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(3.0), visuals.bg_fill);
+    }
+    icons::draw(
+        ui.painter(),
+        rect,
+        glyph,
+        visuals.fg_stroke.color,
+        visuals.bg_fill,
+    );
+    response
 }
 
 /// Loads the organisation file (if configured) and the personal one, and
@@ -2792,6 +3107,9 @@ impl eframe::App for App {
         let mut fit: Option<(usize, usize, egui::Vec2)> = None;
 
         self.track_window_geometry(ctx);
+        // Refilled as the panes draw, below, and read by the resize grips at
+        // the end of the frame.
+        self.pane_rects.clear();
 
         for tab in &mut self.tabs {
             tab.pump(&mut self.plugins);
@@ -2829,7 +3147,12 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             window_action = self.menu_bar(ui, &theme.window_buttons);
         });
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| self.tab_strip(ui));
+        // Not when the setting has moved them into the title bar, where
+        // `menu_bar` has already drawn them - that is what was putting the same
+        // tabs on screen twice.
+        if !self.settings.tabs_in_title_bar || self.tabs.is_empty() {
+            egui::TopBottomPanel::top("tabs").show(ctx, |ui| self.tab_strip(ui));
+        }
 
         if let Some(action) = window_action {
             // Close is the one action that may be refused; the rest are
@@ -2853,33 +3176,12 @@ impl eframe::App for App {
             });
         }
 
-        if self.panels.show_macros {
-            egui::SidePanel::right("macros")
-                .default_width(280.0)
-                .show(ctx, |ui| {
-                    // One scroll area around the whole panel rather than one
-                    // per section: the macro list, the details under it and the
-                    // IRIS utilities below that are one column of content, and
-                    // giving each a share of the height leaves every one of
-                    // them too short on a small window.
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if let Some(request) =
-                                panels::macros_panel(ui, &mut self.macro_groups, &mut self.panels)
-                            {
-                                requests.push(request);
-                            }
-                            ui.separator();
-                            if let Some(request) = panels::natives_panel(ui, &mut self.panels) {
-                                requests.push(request);
-                            }
-                        });
-                });
-        }
-
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(theme.background))
+            .frame(
+                egui::Frame::none()
+                    .fill(theme.background)
+                    .inner_margin(self.terminal_inset()),
+            )
             .show(ctx, |ui| {
                 if self.tabs.is_empty() {
                     let mut open = false;
@@ -3037,18 +3339,13 @@ impl eframe::App for App {
         // Last, and in a foreground layer: the panels and the terminal reach
         // the window edge, and the terminal senses drags of its own.
         if !self.settings.native_decorations {
-            chrome::resize_grips(ctx, "nit-main");
+            chrome::resize_grips(ctx, "nit-main", &self.pane_rects);
         }
 
-        if let Some(request) =
-            panels::macro_editor_dialog(ctx, &mut self.macro_groups, &mut self.panels)
-        {
-            requests.push(request);
-        }
         if let Some(request) = panels::pending_macro_dialog(ctx, &mut self.panels) {
             requests.push(request);
         }
-        if let Some(request) = panels::export_dialog(ctx, &mut self.panels) {
+        if let Some(request) = panels::pending_native_dialog(ctx, &mut self.panels) {
             requests.push(request);
         }
         if let Some(request) = panels::settings_dialog(
@@ -3084,6 +3381,25 @@ impl eframe::App for App {
         for action in theme_actions {
             self.apply_theme_action(ctx, action);
         }
+        // Beside the theme manager, and opened from the same section of the
+        // settings window.
+        let macro_actions = macro_manager::macro_manager(
+            ctx,
+            &mut self.panels.macros,
+            &mut self.macro_groups,
+            &theme.window_buttons,
+            native_decorations,
+        );
+        for action in macro_actions {
+            match action {
+                macro_manager::MacroAction::Save => {
+                    requests.push(UiRequest::SavePersonalMacros);
+                }
+                // Through the ordinary request path, so `confirm` and the
+                // parameter prompt apply exactly as they do to the menu.
+                macro_manager::MacroAction::Run(m) => requests.push(UiRequest::RunMacro(m)),
+            }
+        }
 
         for request in requests {
             self.handle_request(ctx, request);
@@ -3098,6 +3414,12 @@ impl eframe::App for App {
         // an idle prompt gives the frame no other reason to be redrawn.
         if self.settings.cursor_blink || self.tabs.iter().any(|t| t.session.is_some()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else if self.updates.working() {
+            // Nothing on screen is moving, but a thread is: without a frame to
+            // read it in, the check's answer and the download's progress would
+            // both sit in the channel unseen. Slower than the terminal's own
+            // rate, because all it has to keep up with is a number.
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
 

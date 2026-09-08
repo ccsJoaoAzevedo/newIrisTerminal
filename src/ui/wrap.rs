@@ -141,6 +141,38 @@ pub fn top_for_bottom(
     }
 }
 
+/// The top line a live, bottom-anchored view sits at.
+///
+/// Two things have to hold at once, and each is a bug the other way round.
+///
+/// The cursor has to be on screen: a terminal always has blank rows below the
+/// prompt - the screen is a fixed height and the prompt is somewhere up it -
+/// and they are worth a display row each. Counting them into the range is
+/// invisible while every line is one row tall, because then the whole screen
+/// fits; once one line wraps into thirty, they push the prompt off the top and
+/// leave the user scrolling up to find what they just ran. So the bottom of
+/// the range is the cursor's line.
+///
+/// And the screen has to be the *whole* of what a live view shows: history
+/// belongs above it, reached by scrolling. Anchoring on the cursor alone pulls
+/// scrollback down into the window to fill the rows the blanks would have
+/// taken - which is what made a clear-screen invisible. `W #` files the old
+/// screen into history and prints its new prompt near the top; a view that
+/// then drew forty lines of that history above the prompt showed exactly the
+/// screen the clear had just thrown away.
+///
+/// The larger of the two is both: never above the screen's own first line, and
+/// never so far down that the cursor falls off the bottom.
+pub fn live_top(
+    screen_top: usize,
+    cursor_line: usize,
+    rows: usize,
+    mode: Mode,
+    used: impl Fn(usize) -> usize,
+) -> usize {
+    top_for_bottom(cursor_line + 1, rows, mode, used).max(screen_top)
+}
+
 /// Which display row holds a given cell, if it is on screen.
 ///
 /// Answers for both modes: a clipped row's slice starts at the horizontal
@@ -226,6 +258,75 @@ mod tests {
             showing.iter().any(|s| s.line == cursor_line - 1),
             "and so should what it is answering"
         );
+    }
+
+    /// The regression behind "`W #` stopped clearing the screen".
+    ///
+    /// IRIS clears by filing the old screen into history and printing its new
+    /// prompt near the top of a blank one. Anchored on the cursor's line alone,
+    /// the window filled the rows below the prompt with the history that had
+    /// just been filed - so the clear put the same screen back, one line lower,
+    /// and looked like a command that did nothing.
+    #[test]
+    fn a_cleared_screen_shows_the_screen_and_not_the_history_it_just_filed() {
+        let rows = 40;
+        let mode = Mode::wrapping(100);
+        // 200 lines of history, then a 40-row screen holding a prompt on its
+        // second row and nothing else - which is what a screen looks like the
+        // moment after `W #`.
+        let screen_top = 200;
+        let total = screen_top + rows;
+        let cursor_line = screen_top + 1;
+        let used = move |line: usize| {
+            if line < screen_top || line == cursor_line {
+                6
+            } else {
+                0
+            }
+        };
+
+        // Anchored on the cursor alone, the window is 38 lines of history with
+        // the new prompt at the bottom: the bug, exactly as reported.
+        let cursor_only = top_for_bottom(cursor_line + 1, rows, mode, used);
+        assert!(
+            cursor_only < screen_top,
+            "this is the bug: the view reaches back into the history"
+        );
+
+        let top = live_top(screen_top, cursor_line, rows, mode, used);
+        assert_eq!(top, screen_top, "the cleared screen starts at its own top");
+        let showing = from_top(total, rows, top, mode, used);
+        assert!(
+            !showing.iter().any(|s| s.line < screen_top),
+            "and nothing that was filed into history is on screen"
+        );
+        assert_eq!(
+            showing.iter().position(|s| s.line == cursor_line),
+            Some(1),
+            "the prompt is on the second row, where IRIS printed it"
+        );
+    }
+
+    /// And the case `live_top` must not undo: the prompt stays on screen when
+    /// the lines above it wrap into more rows than the window has, even though
+    /// that means scrolling past the top of the screen.
+    #[test]
+    fn a_screen_taller_than_the_window_still_keeps_the_cursor_on_it() {
+        let rows = 47;
+        let mode = Mode::wrapping(102);
+        let screen_top = 100;
+        let cursor_line = screen_top + 3;
+        let used = move |line: usize| match line.checked_sub(screen_top) {
+            Some(0..=2) => 3000,
+            Some(3) => 8,
+            _ => 0,
+        };
+
+        let top = live_top(screen_top, cursor_line, rows, mode, used);
+        assert!(top > screen_top, "the top of the screen has to give way");
+        let showing = from_top(screen_top + rows, rows, top, mode, used);
+        assert!(showing.iter().any(|s| s.line == cursor_line));
+        assert!(showing.iter().any(|s| s.line == cursor_line - 1));
     }
 
     /// The ordinary screen must not move: while every line is one row tall the

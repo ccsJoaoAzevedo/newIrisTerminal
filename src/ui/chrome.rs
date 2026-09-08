@@ -13,10 +13,20 @@ use egui::{
 
 use crate::config::theme::{WindowButtonStyle, WindowButtons};
 use crate::i18n::tr;
+use crate::ui::icons::{self, Glyph};
 use crate::ui::shading::{darken, gloss, gradient, lighten, radial, white};
 
 /// How wide the grab area along each window edge is.
-const RESIZE_GRAB: f32 = 5.0;
+///
+/// Three points rather than the five it started at, because everything the
+/// grip overlaps is something else's: the terminal reaches three of the four
+/// window edges, and a grip sits in a foreground layer that outranks whatever
+/// is under it for hit-testing. At five, the terminal's first column could not
+/// be clicked at all - the pointer turned into a resize arrow and a drag
+/// resized the window instead of selecting the text. Three is still a band the
+/// mouse finds, and it is held clear of the terminal twice over: by the inset
+/// in [`crate::app::App::terminal_inset`], and by `keep_out` below.
+pub const RESIZE_GRAB: f32 = 3.0;
 
 /// Which control to draw.
 ///
@@ -30,6 +40,11 @@ enum Icon {
     Maximize,
     Restore,
     Close,
+    /// Opens the app's settings. Not a window control at all, but it sits in
+    /// the row with them - next to minimize - and it has to be painted in
+    /// whatever style the theme gives the others, or it would read as
+    /// something from a different program bolted onto the title bar.
+    Settings,
 }
 
 impl Icon {
@@ -39,6 +54,10 @@ impl Icon {
             Icon::Close => style.close,
             Icon::Minimize => style.minimize,
             Icon::Maximize | Icon::Restore => style.maximize,
+            // Deliberately not one of the three: a theme naming a colour for
+            // "minimize" is naming it for the window control, and a gear
+            // painted in it would claim to be one.
+            Icon::Settings => None,
         }
     }
 
@@ -48,6 +67,20 @@ impl Icon {
             Icon::Close => style.show_close,
             Icon::Minimize => style.show_minimize,
             Icon::Maximize | Icon::Restore => style.show_maximize,
+            // The way into Settings cannot be something a theme can take
+            // away: there would then be no way in at all.
+            Icon::Settings => true,
+        }
+    }
+
+    /// The mark this control is drawn with.
+    fn glyph(self) -> Glyph {
+        match self {
+            Icon::Minimize => Glyph::Bar,
+            Icon::Maximize => Glyph::Window,
+            Icon::Restore => Glyph::WindowStack,
+            Icon::Close => Glyph::Cross,
+            Icon::Settings => Glyph::Gear,
         }
     }
 }
@@ -108,38 +141,15 @@ fn paint_stroked(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowB
             .icon
             .unwrap_or_else(|| ui.visuals().widgets.inactive.fg_stroke.color)
     };
-    let stroke = Stroke::new(1.0_f32, colour);
-
-    // A small box in the middle of the hit area, so the icons come out the same
-    // size whatever the row height works out to.
-    let glyph = Rect::from_center_size(
-        rect.center(),
-        Vec2::splat((side_of(rect) * 0.36).round().max(6.0)),
-    );
-    match icon {
-        Icon::Minimize => {
-            painter.line_segment(
-                [
-                    Pos2::new(glyph.left(), glyph.center().y),
-                    Pos2::new(glyph.right(), glyph.center().y),
-                ],
-                stroke,
-            );
-        }
-        Icon::Maximize => {
-            painter.rect_stroke(glyph, 0.0, stroke);
-        }
-        Icon::Restore => {
-            // Two offset outlines, the usual "back to the previous size" mark.
-            painter.rect_stroke(glyph.translate(Vec2::new(2.0, -2.0)), 0.0, stroke);
-            painter.rect_filled(glyph, 0.0, ui.visuals().panel_fill);
-            painter.rect_stroke(glyph, 0.0, stroke);
-        }
-        Icon::Close => {
-            painter.line_segment([glyph.left_top(), glyph.right_bottom()], stroke);
-            painter.line_segment([glyph.right_top(), glyph.left_bottom()], stroke);
-        }
-    }
+    // What the restore mark's front window is filled with, so the copy behind
+    // it does not show through: the button's own background, which is the hover
+    // fill while the pointer is on it and the panel otherwise.
+    let behind = if hovered {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        ui.visuals().panel_fill
+    };
+    icons::draw(painter, rect, icon.glyph(), colour, behind);
 }
 
 /// Mac OS X's traffic light: a glossy bubble whose glyph appears under the
@@ -205,6 +215,17 @@ fn paint_aqua(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
     let stroke = Stroke::new(1.4_f32, darken(base, 0.30));
     let arm = radius * 0.46;
     match icon {
+        // Aqua never had one of these, so it is simply the app's own gear in
+        // Aqua's ink - drawn on hover like everything else in the row.
+        Icon::Settings => {
+            icons::draw(
+                painter,
+                Rect::from_center_size(center, Vec2::splat(radius * 2.0)),
+                Glyph::Gear,
+                darken(base, 0.30),
+                Color32::TRANSPARENT,
+            );
+        }
         Icon::Close => {
             let d = arm * 0.78;
             painter.line_segment(
@@ -315,6 +336,8 @@ fn paint_luna(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
     let stroke = Stroke::new(1.3_f32, colour);
     let glyph = Rect::from_center_size(tile.center(), Vec2::splat((side_of(rect) * 0.26).max(5.0)));
     match icon {
+        // Luna never had one either, and its glyphs are always on.
+        Icon::Settings => icons::draw(painter, tile, Glyph::Gear, colour, darken(base, 0.80)),
         Icon::Minimize => {
             // Luna's minimize sat on the baseline rather than in the middle.
             let y = glyph.bottom();
@@ -386,7 +409,11 @@ fn maximize_icon(ui: &Ui) -> (Icon, &'static str) {
 /// Called before anything else in the title bar, so they sit where a Mac puts
 /// them; the drag area is still claimed at the end by
 /// [`title_bar_controls`].
-pub fn leading_window_buttons(ui: &mut Ui, style: &WindowButtons) -> Option<WindowAction> {
+pub fn leading_window_buttons(
+    ui: &mut Ui,
+    style: &WindowButtons,
+    settings: Option<&mut bool>,
+) -> Option<WindowAction> {
     let mut action = None;
     if clicked(optional_button(ui, Icon::Close, tr("Close"), style)) {
         action = Some(WindowAction::Close);
@@ -398,7 +425,42 @@ pub fn leading_window_buttons(ui: &mut Ui, style: &WindowButtons) -> Option<Wind
     if clicked(optional_button(ui, icon, hint, style)) {
         action = Some(WindowAction::ToggleMaximize);
     }
+    // After the three, which in a left-hand group puts it beside minimize the
+    // way it is beside minimize on the right.
+    if let Some(open) = settings {
+        settings_toggle(ui, style, open);
+    }
     action
+}
+
+/// The gear on its own, for a window whose frame the system is drawing: there
+/// are then no controls of the app's for it to sit beside, and it is still the
+/// only way into Settings.
+///
+/// See [`settings_toggle`] for what it does.
+///
+/// A toggle rather than a button because that is what it replaced: clicking the
+/// control that opened a window is how everyone expects to close it again, and
+/// the pressed look is what says the window is already open somewhere.
+pub fn settings_button(ui: &mut Ui, style: &WindowButtons, open: &mut bool) {
+    settings_toggle(ui, style, open)
+}
+
+fn settings_toggle(ui: &mut Ui, style: &WindowButtons, open: &mut bool) {
+    let response = window_button(ui, Icon::Settings, tr("Settings"), style);
+    // Drawn over the button rather than by it: the three painters know nothing
+    // about a pressed state, and a gear that looks pressed while the window is
+    // open is worth more than making all three learn about one.
+    if *open {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            egui::Rounding::same(2.0),
+            Stroke::new(1.0_f32, ui.visuals().widgets.active.fg_stroke.color),
+        );
+    }
+    if response.clicked() {
+        *open = !*open;
+    }
 }
 
 /// Whether a control that may not be there was clicked.
@@ -459,11 +521,15 @@ pub fn drag_text(
 /// setting has them hidden, or the theme has already had them drawn on the left
 /// by [`leading_window_buttons`]. The drag area is claimed either way: without
 /// it the window could not be moved.
+///
+/// `settings` is the gear, drawn beside minimize when this is the group minimize
+/// is in; `None` for a window that has no settings to open.
 pub fn title_bar_controls(
     ui: &mut Ui,
     style: &WindowButtons,
     buttons: bool,
     window: &'static str,
+    settings: Option<&mut bool>,
 ) -> Option<WindowAction> {
     let mut action = None;
 
@@ -480,8 +546,18 @@ pub fn title_bar_controls(
                 action = Some(WindowAction::Minimize);
             }
         }
+        // Last in a right-to-left row, so it lands to the left of minimize -
+        // which is where it was asked for, and which keeps the three controls
+        // together at the corner where the pointer goes looking for them.
+        if let Some(open) = settings {
+            settings_toggle(ui, style, open);
+        }
 
-        // The gap between the buttons and the items already placed on the left.
+        // Everything between the buttons and whatever the caller has already
+        // put on the left, all of it: a title bar you can only take hold of by
+        // hitting its name is not one. What the caller placed - the tabs, when
+        // the setting puts them up here - has already advanced the row's
+        // cursor, so this is exactly the space they left.
         let rest = ui.available_rect_before_wrap();
         if rest.width() > 0.0 {
             // Keyed by the window that asked for the bar. Three of them draw
@@ -499,6 +575,32 @@ pub fn title_bar_controls(
     action
 }
 
+/// Makes an existing stretch of the row a handle for the window, without
+/// taking any space for it.
+///
+/// The space between two widgets is already there - it is the row's own item
+/// spacing - and this is what makes it drag the window rather than do nothing.
+/// Nothing is allocated: the caller has drawn what is on either side, and the
+/// gap between them is what is claimed. That is the whole point, because a gap
+/// wide enough to be worth allocating reads as a slot with something missing
+/// from it.
+///
+/// `draggable` is false while the system is drawing the frame, when the real
+/// title bar is doing the moving and a gap here is only a gap.
+pub fn drag_span(
+    ui: &mut Ui,
+    x: std::ops::Range<f32>,
+    draggable: bool,
+    window: &'static str,
+    tag: &'static str,
+) -> Option<WindowAction> {
+    if !draggable || x.end <= x.start {
+        return None;
+    }
+    let rect = Rect::from_x_y_ranges(x.start..=x.end, ui.min_rect().y_range());
+    drag_area(ui, rect, Id::new(("nit-titlebar-gap", window, tag)))
+}
+
 /// Carries out a title-bar action. Closing is left to the caller, which may
 /// want to ask first.
 pub fn apply(ctx: &Context, action: WindowAction) {
@@ -514,6 +616,10 @@ pub fn apply(ctx: &Context, action: WindowAction) {
 
 /// Puts a resize grip under the pointer when it is at the edge of `window`.
 ///
+/// `keep_out` is the rectangles that are somebody else's whatever the edge
+/// arithmetic says - the terminal panes, which reach the window edge and sense
+/// drags of their own.
+///
 /// Only one grip exists, and only while the pointer is actually within
 /// [`RESIZE_GRAB`] of an edge. Eight permanent ones seemed simpler, but a grip
 /// has to sit in a foreground layer to beat the panels and the terminal, which
@@ -522,7 +628,7 @@ pub fn apply(ctx: &Context, action: WindowAction) {
 /// every window for hit-testing. That is what stopped the mouse wheel reaching
 /// the Settings scroll area. Existing only under the pointer, at the very edge
 /// of the window, it cannot be in anything's way.
-pub fn resize_grips(ctx: &Context, window: &'static str) {
+pub fn resize_grips(ctx: &Context, window: &'static str, keep_out: &[Rect]) {
     // A maximized window has no edges to drag.
     if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
         return;
@@ -531,6 +637,15 @@ pub fn resize_grips(ctx: &Context, window: &'static str) {
     let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
         return;
     };
+    // Whatever the arithmetic below works out, a rectangle the caller has
+    // declared its own is not a resize handle. The terminal is the one that
+    // matters: it reaches three window edges, and a grip over its first column
+    // means that column cannot be clicked. Belt as well as braces - the inset
+    // already keeps the two apart - because the failure is silent and the
+    // person hitting it has no way to tell what took their click.
+    if keep_out.iter().any(|rect| rect.contains(pos)) {
+        return;
+    }
     let Some((direction, cursor)) = edge_at(ctx.screen_rect(), pos) else {
         return;
     };

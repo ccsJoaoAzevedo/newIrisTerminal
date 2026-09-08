@@ -1,7 +1,9 @@
 pub mod chrome;
 pub mod detach;
 pub mod fonts;
+pub mod icons;
 pub mod input;
+pub mod macro_manager;
 pub mod panels;
 pub mod shading;
 pub mod shortcut;
