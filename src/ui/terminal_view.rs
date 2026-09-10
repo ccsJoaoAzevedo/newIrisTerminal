@@ -38,6 +38,16 @@ pub struct RenderOpts {
     pub wrap: bool,
     /// Put a selection on the clipboard the moment the mouse is released.
     pub copy_on_select: bool,
+    /// Tell the session the grid is [`TERMINAL_COLS`] wide rather than as wide
+    /// as the window.
+    ///
+    /// Right for IRIS, which truncates a `Write` at the margin it was told and
+    /// so must never be told a small one. Wrong for anything that *draws* to
+    /// the width it is given: a shell's full-screen program fills 16384
+    /// columns with padding and box rules, and every one of those lines then
+    /// wraps into a hundred display rows of blanks. Shells therefore get the
+    /// window's own width, which is what they are drawing into anyway.
+    pub wide_grid: bool,
 }
 
 impl Default for RenderOpts {
@@ -51,6 +61,7 @@ impl Default for RenderOpts {
             syntax: true,
             wrap: true,
             copy_on_select: false,
+            wide_grid: true,
         }
     }
 }
@@ -432,7 +443,11 @@ pub fn show(
 
     let view_cols = (((available.x - bar_width) / cell.x).floor() as usize).max(1);
     let rows = (((available.y - h_bar_height) / cell.y).floor() as usize).max(1);
-    let grid_cols = TERMINAL_COLS.max(view_cols);
+    let grid_cols = if opts.wide_grid {
+        TERMINAL_COLS.max(view_cols)
+    } else {
+        view_cols
+    };
 
     let grid_size = Vec2::new(view_cols as f32 * cell.x, rows as f32 * cell.y);
     let (outer, _) = ui.allocate_exact_size(

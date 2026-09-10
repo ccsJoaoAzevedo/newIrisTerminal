@@ -56,8 +56,10 @@ impl Icon {
             Icon::Maximize | Icon::Restore => style.maximize,
             // Deliberately not one of the three: a theme naming a colour for
             // "minimize" is naming it for the window control, and a gear
-            // painted in it would claim to be one.
-            Icon::Settings => None,
+            // painted in it would claim to be one. It has a slot of its own
+            // instead, and falls back to the glyph colour when the theme is
+            // silent about it - which is where it was before the slot existed.
+            Icon::Settings => style.settings,
         }
     }
 

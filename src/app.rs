@@ -416,7 +416,13 @@ impl Tab {
         // launcher's own Terminal reaches it. Everything above this point is
         // identical for all three.
         let opened = match (self.profile.shell.as_ref(), self.profile.remote.as_ref()) {
-            (Some(shell), _) => Session::shell(&shell.program, &shell.args, cols, rows),
+            (Some(shell), _) => Session::shell(
+                &shell.program,
+                &shell.args,
+                shell.cwd.as_deref(),
+                cols,
+                rows,
+            ),
             (None, Some(remote)) => Session::telnet(&remote.address, remote.port, cols, rows),
             (None, None) => {
                 let launcher = launcher();
@@ -696,6 +702,14 @@ impl Tab {
         if cols == self.grid.cols && rows == self.grid.rows {
             return;
         }
+        // A minimized window measures as nothing, and the pane it holds then
+        // floors to a single cell. Resizing to that is what emptied a session
+        // on minimize: the grid reflowed everything into one column, and the
+        // far side redrew a one-cell screen over what had been there. Nothing
+        // this small is a size a user asked for, so it is not a size to obey.
+        if cols < 2 || rows < 2 {
+            return;
+        }
         self.grid.resize(cols, rows);
         if let Some(session) = self.session.as_mut() {
             let _ = session.resize(cols as u16, rows as u16);
@@ -776,6 +790,14 @@ pub struct App {
     /// Size the terminal was last drawn at. New sessions open at this size so
     /// their output is never truncated at a stale width.
     terminal_size: (u16, u16),
+    /// Whether the window is minimized right now.
+    ///
+    /// Read every frame and used to hold every session at the size it had: a
+    /// minimized window still draws, and the pane it draws measures as almost
+    /// nothing, so obeying that measurement reflowed the grid and told the far
+    /// side to redraw into a sliver. Coming back up then showed a session with
+    /// its output gone.
+    minimized: bool,
     /// Size of the window in character cells, as last drawn. Distinct from
     /// `terminal_size`, which is the wider grid IRIS is told about; this is the
     /// geometry the user is actually looking at and the one worth reporting.
@@ -902,6 +924,7 @@ impl App {
             panels: PanelState::default(),
             focused_tab: None,
             terminal_size: (FALLBACK_COLS, FALLBACK_ROWS),
+            minimized: false,
             view_size: (FALLBACK_COLS as usize, FALLBACK_ROWS as usize),
             status: None,
             status_at: None,
@@ -996,6 +1019,7 @@ impl App {
             syntax: self.settings.terminal_syntax_highlight,
             wrap: self.settings.wrap_lines,
             copy_on_select: self.settings.copy_on_select,
+            wide_grid: true,
         }
     }
 
@@ -1057,6 +1081,21 @@ impl App {
         }
     }
 
+    /// The size a session for `profile` should open at.
+    ///
+    /// A shell gets the window's own width and IRIS the wide grid, for the
+    /// reason `wide_grid` in [`terminal_view::RenderOpts`] gives. Both are
+    /// only the starting point: the first frame the tab is drawn in resizes it
+    /// to what the pane actually measured.
+    fn initial_size(&self, profile: &Profile) -> (u16, u16) {
+        let (cols, rows) = self.terminal_size;
+        if profile.is_shell() {
+            let view = (self.view_size.0.max(2)).min(u16::MAX as usize) as u16;
+            return (view, rows);
+        }
+        (cols, rows)
+    }
+
     /// Connects a new tab to whatever `new_tab_profile` currently names.
     pub fn open_new_tab(&mut self) {
         let profile = self.new_tab_profile.clone();
@@ -1064,7 +1103,7 @@ impl App {
     }
 
     pub fn open_tab(&mut self, profile: Profile) {
-        let (cols, rows) = self.terminal_size;
+        let (cols, rows) = self.initial_size(&profile);
         self.tabs
             .push(Tab::new(profile, &self.settings, cols, rows));
         self.active = self.tabs.len() - 1;
@@ -1306,7 +1345,7 @@ impl App {
         let mut pick: Option<Profile> = None;
         // The system bar brings its own controls, and the setting can turn the
         // app's off entirely.
-        let own_buttons = !self.settings.native_decorations && self.settings.show_window_buttons;
+        let own_buttons = self.settings.show_window_buttons;
         // Whether the tabs share this row. Read before the closure: it decides
         // both what goes in the middle of the bar and whether the session's own
         // line is drawn at all.
@@ -1334,7 +1373,7 @@ impl App {
                 ui.add_space(6.0);
             }
             let endpoint = self.new_tab_profile.endpoint();
-            let new_tab = icon_button(ui, icons::Glyph::Plus).on_hover_text(tr1(
+            let new_tab = icon_button(ui, icons::Glyph::Plus, buttons.new_tab).on_hover_text(tr1(
                 "New session on {} (Ctrl+T).\nRight-click to connect somewhere else.",
                 &endpoint,
             ));
@@ -1483,7 +1522,7 @@ impl App {
                 if let Some(asked) = chrome::drag_span(
                     ui,
                     new_tab_right..tabs_from,
-                    !self.settings.native_decorations,
+                    true,
                     "nit-main",
                     "before-tabs",
                 ) {
@@ -1507,13 +1546,11 @@ impl App {
                     };
                     let info = format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint());
                     // Reading matter, and nothing else: the window is dragged
-                    // by it like any other empty stretch of the bar. Left as a
-                    // plain label while the system draws the frame, which is
-                    // doing the moving itself.
+                    // by it like any other empty stretch of the bar.
                     if let Some(asked) = chrome::drag_text(
                         ui,
                         egui::RichText::new(info).weak(),
-                        !self.settings.native_decorations,
+                        true,
                         "nit-main",
                         "session",
                     ) {
@@ -1526,21 +1563,11 @@ impl App {
             // above did not take. Claimed even when the window controls are
             // hidden or already drawn on the left: without it there is nothing
             // to drag the window by.
-            if !self.settings.native_decorations {
-                let trailing = own_buttons && !buttons.left;
-                let gear = (!leading_buttons).then_some(&mut show_settings);
-                if let Some(asked) =
-                    chrome::title_bar_controls(ui, buttons, trailing, "nit-main", gear)
-                {
-                    action = Some(asked);
-                }
-            } else {
-                // The system is drawing the frame, so there are no window
-                // controls of the app's own for the gear to sit beside - but it
-                // is the only way into Settings, so it still has to be here.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    chrome::settings_button(ui, buttons, &mut show_settings);
-                });
+            let trailing = own_buttons && !buttons.left;
+            let gear = (!leading_buttons).then_some(&mut show_settings);
+            if let Some(asked) = chrome::title_bar_controls(ui, buttons, trailing, "nit-main", gear)
+            {
+                action = Some(asked);
             }
         });
         self.panels.show_settings = show_settings;
@@ -1566,6 +1593,7 @@ impl App {
     /// restored geometry was recorded before it was maximized, which is exactly
     /// what its own restore button would give back.
     fn track_window_geometry(&mut self, ctx: &Context) {
+        self.minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         ctx.input(|i| {
             let viewport = i.viewport();
             if viewport.minimized.unwrap_or(false) {
@@ -1747,10 +1775,10 @@ impl App {
     /// the close button. See [`TITLE_FREE_STRIP`] for the rest of it.
     fn title_bar_reserve(&self) -> f32 {
         // The gear is always there; the other three are the theme's to hide.
-        let buttons = if self.settings.native_decorations || !self.settings.show_window_buttons {
-            1
-        } else {
+        let buttons = if self.settings.show_window_buttons {
             4
+        } else {
+            1
         };
         let side = TITLE_CONTROL_SIDE;
         buttons as f32 * side + TITLE_FREE_STRIP
@@ -1780,8 +1808,61 @@ impl App {
         // Shrunk to the tabs rather than filling the row: in the title bar the
         // space left over is what the window is dragged by, and a scroll area
         // that claimed the whole width would take all of it.
+        // The strip's own bar follows the same setting as the terminal's, so
+        // "show scrollbars" means every scrollbar in the app rather than every
+        // scrollbar except this one. Off still scrolls - the wheel and a drag
+        // both work - it simply draws nothing along the bottom of the tabs.
+        let visibility = if self.settings.show_scrollbars {
+            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+        } else {
+            egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+        };
+
+        // The wheel over the strip, before the scroll area reads the input.
+        //
+        // egui turns a shifted wheel into horizontal scrolling for us, which
+        // left the plain wheel - the one that is actually under the finger -
+        // doing nothing at all over a row of tabs. The two are swapped back
+        // here: the plain wheel scrolls the strip, and shift walks the
+        // selection from tab to tab.
+        //
+        // Rewritten rather than handled afterwards so the scroll lands on the
+        // same frame it was rolled on, and consumed when it changes tabs so
+        // the strip does not also slide sideways under the pointer.
+        let mut step = 0.0_f32;
+        if ui.rect_contains_pointer(ui.available_rect_before_wrap()) {
+            ui.input_mut(|i| {
+                if i.modifiers.shift {
+                    // Already swapped by egui, so the shifted wheel arrives on
+                    // x. `raw` rather than the smoothed delta: smoothing
+                    // spreads one notch over several frames, which would walk
+                    // the selection several tabs from one flick.
+                    step = i.raw_scroll_delta.x;
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                } else {
+                    i.raw_scroll_delta = egui::vec2(i.raw_scroll_delta.y, 0.0);
+                    i.smooth_scroll_delta = egui::vec2(i.smooth_scroll_delta.y, 0.0);
+                }
+            });
+        }
+        if step != 0.0 && !self.tabs.is_empty() {
+            // Up is back, the way it is in a list. Wrapped at both ends: the
+            // wheel has no stop, and a selection that silently refuses to move
+            // reads as the gesture not working.
+            let last = self.tabs.len() - 1;
+            to_activate = Some(if step > 0.0 {
+                self.active.checked_sub(1).unwrap_or(last)
+            } else if self.active >= last {
+                0
+            } else {
+                self.active + 1
+            });
+        }
+
         egui::ScrollArea::horizontal()
             .auto_shrink([true, false])
+            .scroll_bar_visibility(visibility)
             .show(ui, |ui| {
             ui.horizontal(|ui| {
                 for index in 0..self.tabs.len() {
@@ -1799,6 +1880,14 @@ impl App {
                     }
                     if response.double_clicked() {
                         to_rename = Some(index);
+                    }
+                    // What every other tabbed program does, and the reason the
+                    // small cross is not the only way out: closing several
+                    // tabs in a row means aiming at a cross the width of a
+                    // character each time, and the middle button closes
+                    // whatever is under the pointer.
+                    if response.middle_clicked() {
+                        to_close = Some(index);
                     }
                     response.context_menu(|ui| {
                         if ui.button(tr("Rename...")).clicked() {
@@ -1849,7 +1938,7 @@ impl App {
                             ui.close_menu();
                         }
                     });
-                    if icon_button(ui, icons::Glyph::SmallCross)
+                    if icon_button(ui, icons::Glyph::SmallCross, None)
                         .on_hover_text(tr("Close this tab."))
                         .clicked()
                     {
@@ -1907,7 +1996,7 @@ impl App {
         if self.tabs.get(index).is_none_or(|tab| tab.split.is_some()) {
             return;
         }
-        let (cols, rows) = self.terminal_size;
+        let (cols, rows) = self.initial_size(&self.new_tab_profile.clone());
         let opened = Tab::new(self.new_tab_profile.clone(), &self.settings, cols, rows);
         self.tabs[index].split = Some(Split {
             dir,
@@ -2235,17 +2324,17 @@ impl App {
                 return;
             }
         };
-        match analyze::launch(&path) {
-            Ok(()) => self.set_status(tr1(
-                "Claude is opening with this output in context ({}). Ask it whatever you like.",
-                &path.display().to_string(),
-            )),
-            Err(e) => self.set_status(tr2(
-                "Could not start claude: {}. The output is in {}",
-                &format!("{e:#}"),
-                &path.display().to_string(),
-            )),
-        }
+        // A tab of its own rather than a window of the operating system's: the
+        // conversation is about what is on the terminal, so it belongs beside
+        // it. A `claude` that is not installed fails the way any other shell
+        // tab does - the tab opens and says what went wrong - which is more
+        // use than a status line, because the message is in front of the file
+        // it was going to read.
+        self.open_tab(analyze::tab_profile(&path));
+        self.set_status(tr1(
+            "Claude is opening with this output in context ({}). Ask it whatever you like.",
+            &path.display().to_string(),
+        ));
     }
 
     /// Carries out what the theme manager asked for.
@@ -2626,12 +2715,8 @@ impl App {
     /// terminal's favour whatever the arithmetic works out to.
     ///
     /// Nothing is held back at the top - the tab strip is there, not the
-    /// terminal - and nothing at all while the system draws the frame, which
-    /// brings its own borders and needs no grips.
+    /// terminal.
     fn terminal_inset(&self) -> egui::Margin {
-        if self.settings.native_decorations {
-            return egui::Margin::ZERO;
-        }
         let gutter = chrome::RESIZE_GRAB + 1.0;
         egui::Margin {
             left: gutter,
@@ -2664,6 +2749,11 @@ impl App {
         // beside a shell tab keeps its colours.
         if self.pane(at).is_some_and(|tab| tab.profile.is_shell()) {
             opts.syntax = false;
+            // A shell draws to the width it is told, so telling it the grid's
+            // 16384 columns makes every full-screen program lay itself out
+            // that wide and then wrap into screenfuls of padding. Only IRIS,
+            // which truncates instead of drawing, needs the wide margin.
+            opts.wide_grid = false;
         }
         let uid = match self.pane(at) {
             Some(tab) => tab.uid,
@@ -2702,8 +2792,10 @@ impl App {
         // This pane's own session, sized to this pane: a pane is a window onto
         // one session, and telling IRIS about the whole split area would
         // truncate its output at a width nothing is drawn at.
-        if let Some(tab) = self.pane_mut(at) {
-            tab.resize(result.cols, result.rows);
+        if !self.minimized {
+            if let Some(tab) = self.pane_mut(at) {
+                tab.resize(result.cols, result.rows);
+            }
         }
         self.pane_rects.push(result.response.rect);
         let measure = PaneMeasure {
@@ -3049,7 +3141,14 @@ fn draw_pane(
 /// slightly larger one. A painted mark can be designed against its neighbours -
 /// see [`icons`] - and it cannot come out as a tofu box in a font that has no
 /// glyph for it.
-fn icon_button(ui: &mut egui::Ui, glyph: icons::Glyph) -> egui::Response {
+/// `tint` is the theme's colour for this mark, when it names one. It wins over
+/// the widget colours whether or not the pointer is on the button: a theme
+/// picking out the `+` means it picked it out, not "unless you hover it".
+fn icon_button(
+    ui: &mut egui::Ui,
+    glyph: icons::Glyph,
+    tint: Option<egui::Color32>,
+) -> egui::Response {
     let side = ui.spacing().interact_size.y;
     let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
     let visuals = ui.style().interact(&response);
@@ -3061,7 +3160,7 @@ fn icon_button(ui: &mut egui::Ui, glyph: icons::Glyph) -> egui::Response {
         ui.painter(),
         rect,
         glyph,
-        visuals.fg_stroke.color,
+        tint.unwrap_or(visuals.fg_stroke.color),
         visuals.bg_fill,
     );
     response
@@ -3306,16 +3405,34 @@ impl eframe::App for App {
                 // screen follows the first pane, because one left at an old
                 // width would keep truncating its output at that width until it
                 // was next looked at.
-                self.terminal_size = (geometry.grid.0 as u16, geometry.grid.1 as u16);
-                self.view_size = shown;
+                //
+                // Width per session rather than one for all of them: a shell
+                // is told the window's width and IRIS the wide grid, and a
+                // background tab has to follow its own kind or it would be
+                // resized to whatever the tab on screen happens to be. See
+                // `wide_grid` in [`terminal_view::RenderOpts`].
+                let (_, rows) = geometry.grid;
+                let view_cols = geometry.view.0;
+                let minimized = self.minimized;
+                let wide = terminal_view::TERMINAL_COLS.max(view_cols);
+                // The wide grid rather than whatever the pane on screen was
+                // told: this is what a *new* session opens at, and a shell
+                // being active must not leave the next IRIS tab truncating at
+                // the window width.
+                if !minimized {
+                    self.terminal_size =
+                        (wide.min(u16::MAX as usize) as u16, geometry.grid.1 as u16);
+                    self.view_size = shown;
+                }
                 fit = Some((geometry.view.0, geometry.view.1, geometry.cell));
-                let (cols, rows) = geometry.grid;
+                let width_for = |shell: bool| if shell { view_cols } else { wide };
                 for (index, tab) in self.tabs.iter_mut().enumerate() {
-                    if index == active {
+                    if index == active || minimized {
                         continue;
                     }
-                    tab.resize(cols, rows);
+                    tab.resize(width_for(tab.profile.is_shell()), rows);
                     if let Some(split) = tab.split.as_mut() {
+                        let cols = width_for(split.tab.profile.is_shell());
                         split.tab.resize(cols, rows);
                     }
                 }
@@ -3338,9 +3455,7 @@ impl eframe::App for App {
 
         // Last, and in a foreground layer: the panels and the terminal reach
         // the window edge, and the terminal senses drags of its own.
-        if !self.settings.native_decorations {
-            chrome::resize_grips(ctx, "nit-main", &self.pane_rects);
-        }
+        chrome::resize_grips(ctx, "nit-main", &self.pane_rects);
 
         if let Some(request) = panels::pending_macro_dialog(ctx, &mut self.panels) {
             requests.push(request);
@@ -3364,14 +3479,12 @@ impl eframe::App for App {
         // before the requests are carried out, so a colour changed this frame is
         // on screen in the next one.
         let active_theme = self.settings.theme.clone();
-        let native_decorations = self.settings.native_decorations;
         let theme_actions = theme_manager::theme_manager(
             ctx,
             &mut self.panels.themes,
             &mut self.themes,
             &active_theme,
             &theme.window_buttons,
-            native_decorations,
         );
         // An edit to the theme in use has to show at once, which is the whole
         // point of editing it with the terminal behind the window.
@@ -3388,7 +3501,6 @@ impl eframe::App for App {
             &mut self.panels.macros,
             &mut self.macro_groups,
             &theme.window_buttons,
-            native_decorations,
         );
         for action in macro_actions {
             match action {
@@ -3405,7 +3517,7 @@ impl eframe::App for App {
             self.handle_request(ctx, request);
         }
 
-        if let Some((view_cols, view_rows, cell)) = fit {
+        if let Some((view_cols, view_rows, cell)) = fit.filter(|_| !self.minimized) {
             self.fit_window(ctx, view_cols, view_rows, cell);
         }
 

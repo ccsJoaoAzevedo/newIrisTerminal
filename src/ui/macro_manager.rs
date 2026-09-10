@@ -64,8 +64,27 @@ pub struct MacroManagerState {
     /// app has to stop claiming shortcuts for itself while it is set, or Ctrl+T
     /// would open a tab rather than be recorded.
     pub capture_shortcut: bool,
-    /// Group name for a macro about to be created.
-    new_group: String,
+    /// Which group the list is on, when one has been clicked.
+    ///
+    /// A group is a thing you can act on now - rename it, add a macro to it -
+    /// so it has a selection of its own beside the macro's. Selecting a macro
+    /// moves it to that macro's group, which is what makes "New macro" land
+    /// where the eye already is.
+    selected_group: Option<usize>,
+    /// The group being renamed, and the name as it is being typed.
+    ///
+    /// Kept out of the group itself for the same reason the macro editor keeps
+    /// a draft: a half-typed name is not a name, and abandoning the rename has
+    /// to leave the old one intact.
+    group_rename: Option<(usize, String)>,
+    /// A group being named for the first time, if New group has been pressed.
+    ///
+    /// Nothing exists on the list until the name is confirmed: creating the
+    /// group first and then offering to rename it left a group called "New
+    /// group" behind every time the field was cancelled, and an empty one at
+    /// that. The group and its first macro are made together, when the name
+    /// is.
+    new_group: Option<String>,
     /// A macro Delete has been pressed on, waiting on the confirmation that a
     /// deleted macro is not recoverable.
     confirm_delete: Option<(usize, usize)>,
@@ -79,6 +98,11 @@ impl MacroManagerState {
     /// not a gesture anyone means as "throw away what I just typed", and a
     /// modal asking about it every time would be worse than either.
     fn select(&mut self, at: Option<(usize, usize)>, groups: &mut [MacroGroup]) -> bool {
+        // The group follows the macro, so "New macro" and Rename act on the
+        // group whose macro is open rather than on whatever was clicked last.
+        if let Some((gi, _)) = at {
+            self.selected_group = Some(gi);
+        }
         if self.draft_of == at {
             self.selected = at;
             return false;
@@ -147,7 +171,6 @@ pub fn macro_manager(
     state: &mut MacroManagerState,
     groups: &mut Vec<MacroGroup>,
     buttons: &crate::config::theme::WindowButtons,
-    native_decorations: bool,
 ) -> Vec<MacroAction> {
     let mut actions: Vec<MacroAction> = Vec::new();
     if !state.open {
@@ -176,7 +199,6 @@ pub fn macro_manager(
         // for the body and the preview of what it would send.
         [960.0, 660.0],
         buttons,
-        native_decorations,
         // Nothing to remember across runs: the manager is opened to make one
         // change and closed again.
         None,
@@ -227,14 +249,45 @@ fn macro_list(
 
         let filter = state.filter.to_lowercase();
         let mut to_select: Option<(usize, usize)> = None;
+        // Group-level gestures, collected the same way the macro selection is:
+        // the list is drawn from a borrow of `groups`, so nothing can be moved
+        // or renamed until the loop has finished with it.
+        let mut rename_started: Option<usize> = None;
+        let mut rename_done: Option<(usize, String)> = None;
+        let mut rename_cancelled = false;
+        let mut add_to: Option<usize> = None;
+        let mut to_select_group: Option<usize> = None;
+        let mut create_group: Option<String> = None;
+        let mut create_cancelled = false;
 
         egui::ScrollArea::vertical()
             .id_source("macro-list")
             .max_height(380.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if groups.is_empty() {
+                if groups.is_empty() && state.new_group.is_none() {
                     ui.weak(tr("No macros defined."));
+                }
+                // The field New group opens, at the top of the list where the
+                // group itself will appear. Nothing has been created yet - see
+                // `new_group` - so it is drawn here rather than against a row.
+                if let Some(draft) = state.new_group.as_mut() {
+                    ui.horizontal(|ui| {
+                        let field = ui.add(
+                            egui::TextEdit::singleline(draft)
+                                .desired_width(150.0)
+                                .hint_text(tr("Group name")),
+                        );
+                        field.request_focus();
+                        let entered =
+                            field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button(tr("Confirm")).clicked() || entered {
+                            create_group = Some(draft.clone());
+                        }
+                        if ui.button(tr("Cancel")).clicked() {
+                            create_cancelled = true;
+                        }
+                    });
                 }
                 for (gi, group) in groups.iter().enumerate() {
                     let matching: Vec<(usize, &Macro)> = group
@@ -247,7 +300,11 @@ fn macro_list(
                                 || m.description.to_lowercase().contains(&filter)
                         })
                         .collect();
-                    if matching.is_empty() {
+                    // An empty group is still a group: it is what New group
+                    // has just made, and it has to be on the list to be
+                    // clicked, renamed, or given a macro. Only a filter hides
+                    // one, and then because it genuinely has no match.
+                    if matching.is_empty() && !(filter.is_empty() && group.macros.is_empty()) {
                         continue;
                     }
                     let name = if group.name.is_empty() {
@@ -262,7 +319,39 @@ fn macro_list(
                         Origin::Organization => format!("{name}  ({})", tr("org")),
                         Origin::Personal => name,
                     };
-                    egui::CollapsingHeader::new(title)
+                    // Renaming replaces the header outright rather than
+                    // editing in place under it: the field is the header for
+                    // as long as it is open, so there is no moment where two
+                    // names for the same group are on screen at once.
+                    if let Some((at, draft)) =
+                        state.group_rename.as_mut().filter(|(at, _)| *at == gi)
+                    {
+                        let at = *at;
+                        ui.horizontal(|ui| {
+                            let field = ui.add(
+                                egui::TextEdit::singleline(draft)
+                                    .desired_width(150.0)
+                                    .hint_text(tr("Group name")),
+                            );
+                            field.request_focus();
+                            let entered =
+                                field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui.button(tr("Rename")).clicked() || entered {
+                                rename_done = Some((at, draft.clone()));
+                            }
+                            if ui.button(tr("Cancel")).clicked() {
+                                rename_cancelled = true;
+                            }
+                        });
+                        continue;
+                    }
+                    let selected_group = state.selected_group == Some(gi);
+                    let title = if selected_group {
+                        egui::RichText::new(title).strong()
+                    } else {
+                        egui::RichText::new(title)
+                    };
+                    let header = egui::CollapsingHeader::new(title)
                         .id_source(("macro-group", gi))
                         .default_open(true)
                         .show(ui, |ui| {
@@ -289,6 +378,29 @@ fn macro_list(
                                 }
                             }
                         });
+                    // Clicking the group's name is how a group is acted on:
+                    // it is what the two buttons below then apply to, and
+                    // where the right-click menu's own entries land.
+                    if header.header_response.clicked() {
+                        to_select_group = Some(gi);
+                    }
+                    let editable_group = group.origin.is_editable();
+                    header.header_response.context_menu(|ui| {
+                        if ui
+                            .add_enabled(editable_group, egui::Button::new(tr("Rename group...")))
+                            .on_hover_text(tr(
+                                "Only your own groups; the organization's file is never written.",
+                            ))
+                            .clicked()
+                        {
+                            rename_started = Some(gi);
+                            ui.close_menu();
+                        }
+                        if ui.button(tr("New macro in this group")).clicked() {
+                            add_to = Some(gi);
+                            ui.close_menu();
+                        }
+                    });
                 }
             });
 
@@ -296,6 +408,61 @@ fn macro_list(
             if state.select(Some(at), groups) {
                 actions.push(MacroAction::Save);
             }
+        }
+        if let Some(gi) = to_select_group {
+            state.selected_group = Some(gi);
+        }
+        if let Some(gi) = rename_started {
+            let current = groups.get(gi).map(|g| g.name.clone()).unwrap_or_default();
+            state.selected_group = Some(gi);
+            state.group_rename = Some((gi, current));
+        }
+        if rename_cancelled {
+            state.group_rename = None;
+        }
+        if let Some((gi, name)) = rename_done {
+            state.group_rename = None;
+            if rename_group(groups, gi, &name) {
+                // Renaming can merge two groups into one, which moves every
+                // index after it. Nothing is left pointing into the old
+                // arrangement rather than guessing where it went.
+                state.select(None, groups);
+                state.selected_group = None;
+                actions.push(MacroAction::Save);
+            }
+        }
+        if create_cancelled {
+            state.new_group = None;
+        }
+        if let Some(name) = create_group {
+            state.new_group = None;
+            // A blank name is the one the list shows as "Macros", and two of
+            // those would be indistinguishable, so an unnamed group is given
+            // a name nothing else has.
+            let name = match name.trim() {
+                "" => unused_group_name(groups),
+                named => named.to_string(),
+            };
+            let gi = personal_group(groups, &name);
+            // Straight into an empty macro: a group with nothing in it is a
+            // heading, and the reason anyone makes one is to put a macro in
+            // it. This is the step the old flow made you take separately.
+            add_to = Some(gi);
+            state.selected_group = Some(gi);
+        }
+        if let Some(gi) = add_to.take() {
+            let gi = new_macro_group(groups, gi);
+            let at = add_macro(
+                groups,
+                gi,
+                Macro {
+                    origin: Origin::Personal,
+                    name: tr("New macro").to_string(),
+                    ..Macro::default()
+                },
+            );
+            state.select(Some(at), groups);
+            actions.push(MacroAction::Save);
         }
 
         ui.add_space(8.0);
@@ -323,18 +490,47 @@ fn macro_list(
             }
         }
 
+        // A group is picked by clicking it, not by typing its name. Typing it
+        // was the old way in, and it was a bad one: the name had to be spelled
+        // exactly, a typo silently made a second group beside the intended
+        // one, and there was no way at all to correct a name once written.
         ui.horizontal(|ui| {
-            ui.label(tr("New in group"));
-            ui.add(egui::TextEdit::singleline(&mut state.new_group).desired_width(90.0));
+            // The group in focus: the one that was clicked, or - exactly as
+            // Duplicate reads it - the group of the macro the editor is on.
+            let target = state
+                .selected_group
+                .or(state.selected.map(|(gi, _)| gi))
+                .and_then(|gi| Some((gi, groups.get(gi)?.name.clone())));
+            let hint = match target.as_ref() {
+                Some((_, name)) if !name.is_empty() => tr1("A new macro in {}.", name),
+                Some(_) => tr("A new macro in this group.").to_string(),
+                None => tr("Click a group first: a macro is always in one.").to_string(),
+            };
+            if ui
+                .add_enabled(target.is_some(), egui::Button::new(tr("New macro")))
+                .on_hover_text(hint)
+                .clicked()
+            {
+                if let Some((gi, _)) = target {
+                    add_to = Some(gi);
+                }
+            }
+            if ui
+                .button(tr("New group"))
+                .on_hover_text(tr("Groups are how the right-click menu is arranged."))
+                .clicked()
+            {
+                // Straight into the name field. Nothing is created until it is
+                // confirmed, and confirming makes the group and its first
+                // macro together.
+                state.new_group = Some(String::new());
+                state.group_rename = None;
+            }
         });
-        let named = !state.new_group.trim().is_empty();
-        if ui
-            .add_enabled(named, egui::Button::new(tr("New macro")))
-            .on_hover_text(tr("Groups are how the right-click menu is arranged."))
-            .clicked()
-        {
-            let name = state.new_group.trim().to_string();
-            let gi = personal_group(groups, &name);
+        // The button above is drawn after the list, so what it asks for is
+        // carried out here rather than a frame later.
+        if let Some(gi) = add_to {
+            let gi = new_macro_group(groups, gi);
             let at = add_macro(
                 groups,
                 gi,
@@ -406,6 +602,70 @@ fn copy_of(source: &Macro) -> Macro {
     // one that fires is whichever the loop happens to reach last.
     copy.key = None;
     copy
+}
+
+/// A name no personal group is using yet, for a group about to be created.
+///
+/// Numbered rather than left blank: an empty name is what the list shows as
+/// "Macros", and two of those side by side would be indistinguishable.
+fn unused_group_name(groups: &[MacroGroup]) -> String {
+    let base = tr("New group").to_string();
+    if !groups.iter().any(|g| g.name == base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|name| !groups.iter().any(|g| &g.name == name))
+        .unwrap_or(base)
+}
+
+/// The group a new macro should actually go into, given the one that was
+/// pointed at.
+///
+/// Its own index when the group is the user's; a personal group of the same
+/// name otherwise. The organisation's file is never written, so a macro cannot
+/// be added to one of its groups - it gets a group of its own beside it, which
+/// is exactly what Duplicate does.
+fn new_macro_group(groups: &mut Vec<MacroGroup>, gi: usize) -> usize {
+    match groups.get(gi) {
+        Some(group) if group.origin.is_editable() => gi,
+        Some(group) => {
+            let name = group.name.clone();
+            personal_group(groups, &name)
+        }
+        None => personal_group(groups, &unused_group_name(groups)),
+    }
+}
+
+/// Renames a personal group, reporting whether anything changed.
+///
+/// A name already taken by another personal group merges the two rather than
+/// leaving a duplicate: two groups under one name are one group as far as the
+/// right-click menu is concerned, and keeping them apart in the file only
+/// means the menu shows the heading twice.
+fn rename_group(groups: &mut Vec<MacroGroup>, gi: usize, name: &str) -> bool {
+    let name = name.trim().to_string();
+    let Some(group) = groups.get(gi) else {
+        return false;
+    };
+    // The organisation's file is never written, and a blank name is the one
+    // the list already shows as "Macros" - which would be a rename to nothing.
+    if !group.origin.is_editable() || name.is_empty() || group.name == name {
+        return false;
+    }
+    let existing = groups
+        .iter()
+        .position(|g| g.name == name && g.origin.is_editable());
+    match existing {
+        Some(into) if into != gi => {
+            let moved = groups.remove(gi);
+            // `remove` shifts everything after it down by one.
+            let into = if into > gi { into - 1 } else { into };
+            groups[into].macros.extend(moved.macros);
+        }
+        _ => groups[gi].name = name,
+    }
+    true
 }
 
 /// The index of the personal group called `name`, creating it if there is none.
@@ -672,6 +932,78 @@ mod tests {
                 }],
             },
         ]
+    }
+
+    /// The organisation's file is never written, so a group of its own cannot
+    /// be renamed - the manager greys the entry out, and this is the guard
+    /// behind that.
+    #[test]
+    fn an_organization_group_cannot_be_renamed() {
+        let mut groups = groups();
+        assert!(!rename_group(&mut groups, 0, "Anything"));
+        assert_eq!(groups[0].name, "Shared");
+    }
+
+    #[test]
+    fn renaming_a_personal_group_renames_it() {
+        let mut groups = groups();
+        assert!(rename_group(&mut groups, 1, "  Ours  "));
+        assert_eq!(groups[1].name, "Ours");
+    }
+
+    /// A name already in use is a merge rather than a second group under the
+    /// same heading: the right-click menu groups by name, so two would show as
+    /// one anyway - with the heading drawn twice.
+    #[test]
+    fn renaming_onto_an_existing_personal_group_merges_the_two() {
+        let mut groups = groups();
+        groups.push(MacroGroup {
+            name: "Other".into(),
+            origin: Origin::Personal,
+            macros: vec![Macro {
+                origin: Origin::Personal,
+                name: "Other one".into(),
+                ..Macro::default()
+            }],
+        });
+
+        assert!(rename_group(&mut groups, 2, "Mine"));
+        assert_eq!(groups.len(), 2, "the emptied group is gone");
+        let mine = groups.iter().find(|g| g.name == "Mine").unwrap();
+        assert_eq!(mine.macros.len(), 2, "both macros are in the one group");
+    }
+
+    /// Nothing is written to a shared group: a macro added to one lands in a
+    /// personal group of the same name, exactly as Duplicate does.
+    #[test]
+    fn a_new_macro_in_an_organization_group_gets_a_personal_one() {
+        let mut groups = groups();
+        let gi = new_macro_group(&mut groups, 0);
+        assert_ne!(gi, 0);
+        assert_eq!(groups[gi].name, "Shared");
+        assert!(groups[gi].origin.is_editable());
+    }
+
+    #[test]
+    fn a_new_macro_in_a_personal_group_stays_in_it() {
+        let mut groups = groups();
+        assert_eq!(new_macro_group(&mut groups, 1), 1);
+        assert_eq!(groups.len(), 2, "no group was made");
+    }
+
+    /// Two groups called "New group" would be indistinguishable in the list,
+    /// so the second one is numbered.
+    #[test]
+    fn a_new_group_gets_a_name_nothing_else_has() {
+        let mut groups = groups();
+        let first = unused_group_name(&groups);
+        groups.push(MacroGroup {
+            name: first.clone(),
+            origin: Origin::Personal,
+            macros: Vec::new(),
+        });
+        let second = unused_group_name(&groups);
+        assert_ne!(first, second);
     }
 
     /// Selecting one macro and then another writes the first one's edits back,

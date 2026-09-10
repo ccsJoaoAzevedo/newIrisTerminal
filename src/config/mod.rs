@@ -220,17 +220,10 @@ pub struct Settings {
     /// Open the default profile automatically at launch.
     pub open_on_start: bool,
     pub confirm_close_with_live_session: bool,
-    /// Keep the operating system's title bar and window border.
-    ///
-    /// Off by default: the app draws its own, which is what puts the tab strip
-    /// where the title bar would otherwise waste a row. An escape hatch for a
-    /// window manager the custom chrome misbehaves under.
-    pub native_decorations: bool,
     /// Draw the minimize / maximize / close controls in the app's own title
     /// bar. Off leaves the row to the tabs and the drag area: the window can
     /// still be moved, maximized by double-click, and closed with Ctrl+W or
-    /// Alt+F4. Ignored while the system title bar is in use, which brings its
-    /// own controls.
+    /// Alt+F4.
     pub show_window_buttons: bool,
     /// Put the tabs in the title bar, on the same row as the window controls,
     /// instead of on a strip of their own below it.
@@ -319,7 +312,6 @@ impl Default for Settings {
             default_profile: String::new(),
             open_on_start: true,
             confirm_close_with_live_session: true,
-            native_decorations: false,
             show_window_buttons: true,
             tabs_in_title_bar: false,
             save_terminal_size: false,

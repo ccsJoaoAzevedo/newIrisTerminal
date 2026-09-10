@@ -94,9 +94,15 @@ impl PtySession {
     /// Everything below the command is the same - a pseudo-terminal, a child,
     /// and a reader thread - which is the whole reason a shell can be a plugin
     /// that only declares a program. See [`crate::plugins::shells`].
-    pub fn spawn_shell(program: &Path, args: &[String], cols: u16, rows: u16) -> Result<Self> {
+    pub fn spawn_shell(
+        program: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
         let (pair, cols, rows) = open_pty(cols, rows)?;
-        let cmd = super::launcher::shell_command(program, args);
+        let cmd = super::launcher::shell_command(program, args, cwd);
         Self::from_command(
             pair,
             cmd,
@@ -312,8 +318,14 @@ impl Session {
 
     /// Opens a shell rather than an IRIS session. See
     /// [`crate::plugins::shells`].
-    pub fn shell(program: &Path, args: &[String], cols: u16, rows: u16) -> Result<Self> {
-        PtySession::spawn_shell(program, args, cols, rows).map(Session::Pty)
+    pub fn shell(
+        program: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
+        PtySession::spawn_shell(program, args, cwd, cols, rows).map(Session::Pty)
     }
 
     /// Opens a session on a remote server over Telnet.

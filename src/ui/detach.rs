@@ -49,8 +49,7 @@ pub struct Placement {
 /// the caller's "is this dialog showing" flag stays the one source of truth.
 ///
 /// `buttons` is the active theme's window-control style, so a detached window
-/// is framed like the main one; `native_decorations` is the same setting the
-/// main window follows, and hands the frame back to the system when it is on.
+/// is framed like the main one.
 ///
 /// The window opens at whatever `placement` restores, then in the middle of the
 /// main one, and after that wherever it was last dragged to - see
@@ -64,7 +63,6 @@ pub fn shell(
     open: &mut bool,
     size: [f32; 2],
     buttons: &WindowButtons,
-    native_decorations: bool,
     mut placement: Option<&mut Placement>,
     contents: impl FnOnce(&mut Ui),
 ) {
@@ -82,7 +80,7 @@ pub fn shell(
         .with_title(title)
         .with_inner_size(size)
         .with_min_inner_size([360.0, 240.0])
-        .with_decorations(native_decorations);
+        .with_decorations(false);
     // Only on the frame it opens. Asking for a position every frame would
     // fight the user dragging the window somewhere else.
     if let Some(position) = position {
@@ -111,7 +109,7 @@ pub fn shell(
             return;
         }
 
-        if !native_decorations {
+        {
             egui::TopBottomPanel::top(egui::Id::new((id, "title-bar"))).show(ctx, |ui| {
                 if let Some(action) = title_bar(ui, id, title, buttons) {
                     match action {
@@ -125,12 +123,10 @@ pub fn shell(
             });
         }
         egui::CentralPanel::default().show(ctx, contents);
-        if !native_decorations {
-            // Last, and in a foreground layer, for the same reason the main
-            // window does it last. Nothing to keep off: a dialog has no
-            // terminal in it reaching the window edge.
-            chrome::resize_grips(ctx, id, &[]);
-        }
+        // Last, and in a foreground layer, for the same reason the main
+        // window does it last. Nothing to keep off: a dialog has no
+        // terminal in it reaching the window edge.
+        chrome::resize_grips(ctx, id, &[]);
         remember_position(ctx, id);
         if let Some(placement) = placement.as_mut() {
             // Field by field: a frame that could report only one of the two -

@@ -163,13 +163,55 @@ fn modal<R>(
     contents: impl FnOnce(&mut Ui) -> R,
 ) {
     veil(ctx, id);
-    egui::Window::new(title)
+    let shown = egui::Window::new(title)
         .id(egui::Id::new(id))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(open)
         .show(ctx, contents);
+    // The veil and the window are both areas in the same layer order, and a
+    // click on an area brings it to the front of that order. Clicking the veil
+    // therefore buried the dialog underneath it: still painted, but no longer
+    // reachable by the pointer, so neither Send nor Cancel nor the title bar's
+    // close would answer and the dialog could not be dismissed at all. Lifting
+    // the window every frame keeps it above its own veil whatever was clicked.
+    if let Some(shown) = shown {
+        ctx.move_to_top(shown.response.layer_id);
+    }
+}
+
+/// Moves the keyboard on when Enter is pressed in a dialog field.
+///
+/// Enter in the last field runs the dialog instead, which is the whole point:
+/// a macro with one parameter is then type-value-Enter, without reaching for
+/// the mouse. Returns true when the dialog should be submitted.
+///
+/// `fields` is one response per field, in the order they were drawn. Tab
+/// already walks them; this makes Enter do the same thing, because a dialog
+/// that is a list of values to fill in is one people finish with Enter.
+fn advance_on_enter(ui: &Ui, fields: &[egui::Response]) -> bool {
+    let entered = ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if !entered {
+        return false;
+    }
+    // `lost_focus` rather than `has_focus`: a single-line field surrenders the
+    // keyboard the moment Enter reaches it, so by the time this runs the field
+    // that was typed into no longer holds focus - it is the one that just gave
+    // it up. Nothing else takes the keyboard away on the same frame as an
+    // Enter press.
+    let Some(at) = fields.iter().position(|f| f.lost_focus() || f.has_focus()) else {
+        // Enter with the keyboard somewhere else - on a button, say - is that
+        // widget's own business.
+        return false;
+    };
+    match fields.get(at + 1) {
+        Some(next) => {
+            next.request_focus();
+            false
+        }
+        None => true,
+    }
 }
 
 /// Puts the keyboard in the first field of a dialog that has just opened.
@@ -211,6 +253,7 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
             ui.separator();
         }
 
+        let mut fields = Vec::with_capacity(pending.source.params.len());
         for (index, param) in pending.source.params.iter().enumerate() {
             ui.horizontal(|ui| {
                 let prompt = if param.prompt.is_empty() {
@@ -228,9 +271,11 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
                     if index == 0 {
                         focus_first(&field, &mut pending.focus_first);
                     }
+                    fields.push(field);
                 }
             });
         }
+        let submitted = advance_on_enter(ui, &fields);
 
         ui.separator();
         ui.label(tr("Will send:"));
@@ -260,9 +305,16 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
             } else {
                 tr("Send")
             };
-            if ui.button(send_label).clicked() {
+            let send = ui.button(send_label);
+            // Enter in the last field sends - except on a macro marked as
+            // modifying data, where it only moves the keyboard onto the button.
+            // The yes/no is there to be answered deliberately, and a second
+            // Enter is deliberate in a way that finishing a field is not.
+            if send.clicked() || (submitted && !pending.source.confirm) {
                 request = Some(UiRequest::SendLines(preview.clone()));
                 close = true;
+            } else if submitted {
+                send.request_focus();
             }
             if ui.button(tr("Cancel")).clicked() {
                 close = true;
@@ -320,6 +372,7 @@ pub fn pending_native_dialog(ctx: &Context, state: &mut PanelState) -> Option<Ui
         &mut open,
         |ui| {
             ui.set_min_width(360.0);
+            let mut fields = Vec::with_capacity(native.params().len());
             for (index, param) in native.params().iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(tr(param.label));
@@ -329,9 +382,11 @@ pub fn pending_native_dialog(ctx: &Context, state: &mut PanelState) -> Option<Ui
                         if index == 0 {
                             focus_first(&field, &mut pending.focus_first);
                         }
+                        fields.push(field);
                     }
                 });
             }
+            let submitted = advance_on_enter(ui, &fields);
 
             let invocation = native.build(&pending.values);
             ui.separator();
@@ -342,7 +397,7 @@ pub fn pending_native_dialog(ctx: &Context, state: &mut PanelState) -> Option<Ui
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button(tr("Send")).clicked() {
+                if ui.button(tr("Send")).clicked() || submitted {
                     request = Some(UiRequest::RunNative(native, pending.values.clone()));
                     close = true;
                 }
@@ -512,9 +567,6 @@ pub fn settings_dialog(
     // Kept apart from `changed`: opening a folder is an action, not an edit,
     // and it must not make the app rewrite settings.toml.
     let mut action: Option<UiRequest> = None;
-    // Read before the closure borrows `settings`: the window's own frame is
-    // drawn around the very setting that decides whether it has one.
-    let native_decorations = settings.native_decorations;
 
     crate::ui::detach::shell(
         ctx,
@@ -523,7 +575,6 @@ pub fn settings_dialog(
         &mut open,
         [560.0, 680.0],
         buttons,
-        native_decorations,
         // A window of its own, so it reopens where and how it was left for
         // whichever of the two switches below is on.
         Some(placement),
@@ -793,18 +844,6 @@ pub fn settings_dialog(
                 }
 
                 section(ui, tr("Window"));
-                if ui
-                    .checkbox(
-                        &mut settings.native_decorations,
-                        tr("Use the system title bar"),
-                    )
-                    .on_hover_text(
-                        tr("Off by default: the app draws its own, which frees the row the system bar would take."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
                 if ui
                     .checkbox(
                         &mut settings.show_window_buttons,

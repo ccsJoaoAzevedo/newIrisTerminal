@@ -78,7 +78,7 @@ pub fn run() -> eframe::Result<()> {
         // The title still matters with the frame off: it is what the
         // taskbar and the window switcher show.
         .with_title("newIrisTerminal")
-        .with_decorations(settings.native_decorations)
+        .with_decorations(false)
         .with_resizable(true)
         // Define o ícone da janela e barra de tarefas aqui:
         .with_icon(Arc::new(load_icon()));

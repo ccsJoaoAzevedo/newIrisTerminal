@@ -142,6 +142,20 @@ pub struct WindowButtons {
     /// Fill behind the close glyph on hover. The one control with an
     /// irreversible effect, so it keeps a colour of its own.
     pub hover_close: Option<Color32>,
+    /// The gear that opens Settings.
+    ///
+    /// Its own slot rather than borrowing one of the window controls': a gear
+    /// painted in the minimize colour claims to be a window control, and on an
+    /// `aqua` theme it would come out as a fourth traffic light. Unset leaves
+    /// it following `icon`, which is where it was before there was a slot for
+    /// it at all.
+    pub settings: Option<Color32>,
+    /// The `+` that opens a session.
+    ///
+    /// Not a window control either - it is the app's own button, at the other
+    /// end of the row - and the two are the marks people actually aim at, so
+    /// both are worth a theme being able to pick out.
+    pub new_tab: Option<Color32>,
 }
 
 /// All three shown, stroked, on the right: what a theme that says nothing about
@@ -159,6 +173,8 @@ impl Default for WindowButtons {
             maximize: None,
             icon: None,
             hover_close: None,
+            settings: None,
+            new_tab: None,
         }
     }
 }
@@ -388,6 +404,11 @@ pub struct ThemeFile {
     pub window_button_icon: String,
     #[serde(default)]
     pub window_button_hover_close: String,
+    /// The gear and the `+`. Empty leaves both following `window_button_icon`.
+    #[serde(default)]
+    pub settings_icon: String,
+    #[serde(default)]
+    pub new_tab_icon: String,
     /// The terminal's scroll handle. Empty leaves it derived from the selection
     /// and foreground colours, which is what every theme did before this - and
     /// what still happens under the stroked button style, where there is no
@@ -458,6 +479,8 @@ impl Default for ThemeFile {
             window_button_maximize: String::new(),
             window_button_icon: String::new(),
             window_button_hover_close: String::new(),
+            settings_icon: String::new(),
+            new_tab_icon: String::new(),
             scrollbar_handle: String::new(),
             font_family: default_font_family(),
             font_size: default_font_size(),
@@ -498,6 +521,8 @@ fn window_buttons(file: &ThemeFile) -> WindowButtons {
         maximize: fill(&file.window_button_maximize, WindowButtonSlot::Maximize),
         icon: parse_hex(&file.window_button_icon),
         hover_close: parse_hex(&file.window_button_hover_close),
+        settings: parse_hex(&file.settings_icon),
+        new_tab: parse_hex(&file.new_tab_icon),
     }
 }
 
@@ -663,6 +688,8 @@ impl Theme {
             window_button_maximize: hex_or_empty(self.window_buttons.maximize),
             window_button_icon: hex_or_empty(self.window_buttons.icon),
             window_button_hover_close: hex_or_empty(self.window_buttons.hover_close),
+            settings_icon: hex_or_empty(self.window_buttons.settings),
+            new_tab_icon: hex_or_empty(self.window_buttons.new_tab),
             scrollbar_handle: hex_or_empty(self.scrollbar_handle),
             font_family: self.font_family.clone(),
             font_size: self.font_size,
@@ -1176,6 +1203,28 @@ mod tests {
             ..ThemeFile::default()
         });
         assert!(bare.window_buttons.close.is_none());
+    }
+
+    /// The gear and the `+` are the two marks a theme could not speak about
+    /// before, so both the file round trip and the silence of an older file
+    /// are worth pinning.
+    #[test]
+    fn the_gear_and_the_plus_round_trip_and_default_to_unset() {
+        let mut theme = Theme::from_file(&ThemeFile {
+            name: "T".into(),
+            ..ThemeFile::default()
+        });
+        assert!(
+            theme.window_buttons.settings.is_none(),
+            "an old file is silent"
+        );
+        assert!(theme.window_buttons.new_tab.is_none());
+
+        theme.window_buttons.settings = parse_hex("#3366cc");
+        theme.window_buttons.new_tab = parse_hex("#22aa55");
+        let back = Theme::from_file(&theme.to_file());
+        assert_eq!(back.window_buttons.settings, theme.window_buttons.settings);
+        assert_eq!(back.window_buttons.new_tab, theme.window_buttons.new_tab);
     }
 
     /// Hiding a button has to survive the file, and a theme file written

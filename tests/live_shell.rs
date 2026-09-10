@@ -93,7 +93,7 @@ fn every_shell_opens_and_answers() {
     let mut failed: Vec<String> = Vec::new();
     for shell in &shells {
         println!("\n=== {} ({}) ===", shell.name, shell.command_line());
-        let mut session = match Session::shell(&shell.program, &shell.args, 100, 30) {
+        let mut session = match Session::shell(&shell.program, &shell.args, None, 100, 30) {
             Ok(session) => session,
             Err(e) => {
                 failed.push(format!("{}: would not start ({e:#})", shell.name));

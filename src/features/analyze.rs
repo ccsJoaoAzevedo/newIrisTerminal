@@ -1,10 +1,15 @@
 //! Handing terminal output to Claude Code.
 //!
-//! The output is written to a file, and a `claude` session is opened in a
-//! terminal of its own with that file loaded into its context
+//! The output is written to a file, and a `claude` session is opened in a tab
+//! of its own with that file loaded into its context
 //! (`--append-system-prompt-file`). No question is asked on the user's behalf:
 //! the session comes up idle, knowing what is on the terminal, and waits for
 //! whatever the user actually wanted to ask about it.
+//!
+//! The tab is an ordinary shell tab - see [`tab_profile`] - so nothing here
+//! starts a process or waits on one. That was not always true: this used to
+//! open a console window of the operating system's, which put the
+//! conversation about the terminal somewhere other than the terminal.
 //!
 //! A file rather than an argument because a screen of IRIS output is routinely
 //! tens of kilobytes, which is past what Windows accepts on a command line.
@@ -18,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+use crate::config::profile::{Profile, ShellCommand};
 use crate::term::{syntax, Grid, Row};
 
 /// How much of the session to hand over.
@@ -279,93 +285,45 @@ fn free_path(dir: &Path) -> Result<PathBuf> {
 /// anything. With no prompt after it, `claude` comes up interactive and idle.
 const CONTEXT_FLAG: &str = "--append-system-prompt-file";
 
-/// Opens a Claude Code session in a terminal window of its own, with `path`
-/// already in its context.
+/// The profile that opens a Claude Code session on `path`, as a tab.
 ///
-/// A window rather than a captured child process: this is a conversation, and
-/// the point is that the user carries on with it after the terminal has handed
-/// it over. The app never waits on it and never reads its output.
-pub fn launch(path: &Path) -> Result<()> {
-    let dir = analysis_dir();
-
-    #[cfg(target_os = "windows")]
-    {
-        windows_command(path, &dir)
-            .spawn()
-            .context("starting claude in a new window")?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // Terminal.app takes a shell line, so the prompt has to survive one
-        // round of AppleScript quoting and one of shell quoting.
-        let script = format!(
-            "tell application \"Terminal\" to do script \"cd {} && claude {CONTEXT_FLAG} {}\"",
-            shell_quote(&dir.display().to_string()),
-            shell_quote(&path.display().to_string()),
-        );
-        std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .spawn()
-            .context("starting claude in Terminal.app")?;
-        Ok(())
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        // No single terminal is a safe bet on Linux, so the ones that are
-        // usually there are tried in turn. `x-terminal-emulator` is the
-        // Debian alternative and comes first for that reason.
-        let candidates = [
-            "x-terminal-emulator",
-            "gnome-terminal",
-            "konsole",
-            "xfce4-terminal",
-            "xterm",
-        ];
-        for program in candidates {
-            let spawned = std::process::Command::new(program)
-                .arg("-e")
-                .arg(format!(
-                    "claude {CONTEXT_FLAG} {}",
-                    shell_quote(&path.display().to_string())
-                ))
-                .current_dir(&dir)
-                .spawn();
-            if spawned.is_ok() {
-                return Ok(());
-            }
-        }
-        bail!("no terminal emulator found to run claude in");
+/// A tab rather than a window of the operating system's, which is what this
+/// used to open: the conversation is about what is on the terminal, and having
+/// it in the terminal is the difference between a second window to find on the
+/// task bar and a tab beside the session it is about. Everything a shell tab
+/// already does - the pseudo-terminal, the reader thread, the resize - applies
+/// unchanged, because a `claude` is a program in a terminal like any other.
+///
+/// The program is named bare rather than resolved: on Windows `claude` is a
+/// `.cmd` shim, which `CreateProcess` cannot start but the `cmd` wrapper a
+/// shell tab is already given resolves off PATH. And the file is passed by
+/// *name*, with the session started in the folder that holds it, because that
+/// command line has no way to quote a space - see `escape_for_cmd` in
+/// [`crate::pty::launcher`].
+pub fn tab_profile(path: &Path) -> Profile {
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(analysis_dir);
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    Profile {
+        name: CLAUDE.to_string(),
+        instance: CLAUDE.to_string(),
+        namespace: String::new(),
+        shell: Some(ShellCommand {
+            program: PathBuf::from(CLAUDE),
+            args: vec![CONTEXT_FLAG.to_string(), file],
+            cwd: Some(dir),
+        }),
+        ..Profile::default()
     }
 }
 
-/// The command that opens the session on Windows.
-///
-/// `start` is what detaches the window; the inner `cmd /k` is what keeps it
-/// open once the session ends, so an error from `claude` is readable instead of
-/// vanishing with the window. The empty string is `start`'s window title, which
-/// it would otherwise take from the first quoted argument - and the first
-/// quoted argument here is the path to the context file.
-///
-/// Built here rather than inline so a test can read the arguments back: it is
-/// the one part of this that is easy to get wrong and impossible to see.
-#[cfg(target_os = "windows")]
-fn windows_command(path: &Path, dir: &Path) -> std::process::Command {
-    let mut command = std::process::Command::new("cmd");
-    command
-        .args(["/c", "start", "", "cmd", "/k", "claude", CONTEXT_FLAG])
-        .arg(path)
-        .current_dir(dir);
-    command
-}
-
-/// Wraps a string in single quotes for a POSIX shell.
-#[cfg(unix)]
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
+/// The program, which is also what the tab is called.
+const CLAUDE: &str = "claude";
 
 #[cfg(test)]
 mod tests {
@@ -568,37 +526,43 @@ mod tests {
 
     /// The session must come up with the file loaded and *nothing* asked: no
     /// prompt argument, or it would answer a question the user never put.
-    #[cfg(target_os = "windows")]
     #[test]
-    fn the_windows_command_loads_the_file_and_asks_nothing() {
-        let dir = analysis_dir();
-        let path = Path::new("C:\\Program Files\\x\\session.md");
-        let command = windows_command(path, &dir);
-        let args: Vec<String> = command
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(command.get_program(), "cmd");
+    fn the_tab_loads_the_file_and_asks_nothing() {
+        let path = Path::new("/tmp/an analysis/session-20260101-120000.md");
+        let profile = tab_profile(path);
+        let shell = profile.shell.expect("it has to be a shell profile");
+        assert_eq!(shell.program, Path::new("claude"));
         assert_eq!(
-            args,
-            [
-                "/c",
-                "start",
-                "",
-                "cmd",
-                "/k",
-                "claude",
-                "--append-system-prompt-file",
-                "C:\\Program Files\\x\\session.md",
-            ]
+            shell.args,
+            ["--append-system-prompt-file", "session-20260101-120000.md"]
         );
-        // The path is the last word: anything after it would be read as the
+        // The file is the last word: anything after it would be read as the
         // prompt, and the session would start by answering it.
         assert_eq!(
-            args.last().map(String::as_str),
-            Some(path.to_str().unwrap())
+            shell.args.last().map(String::as_str),
+            Some("session-20260101-120000.md")
         );
-        assert_eq!(command.get_current_dir(), Some(dir.as_path()));
+    }
+
+    /// A space in the path is what a `cmd` command line cannot survive, so the
+    /// file is named bare and the session is started in its folder. This is
+    /// the pair that has to hold together, whatever the path looks like.
+    #[test]
+    fn the_file_is_named_bare_and_the_session_starts_beside_it() {
+        let path = Path::new("/tmp/an analysis/session-20260101-120000.md");
+        let shell = tab_profile(path).shell.unwrap();
+        assert_eq!(shell.cwd.as_deref(), path.parent());
+        assert!(
+            !shell.args.iter().any(|arg| arg.contains(' ')),
+            "nothing on the command line may carry a space"
+        );
+    }
+
+    /// A shell tab, so nothing IRIS-shaped runs against it: no autologon
+    /// typing a username at Claude, and no ObjectScript colouring.
+    #[test]
+    fn the_analysis_tab_is_a_shell_tab() {
+        assert!(tab_profile(Path::new("x.md")).is_shell());
     }
 
     /// The file is context, not a request: it must not read as a task, or the

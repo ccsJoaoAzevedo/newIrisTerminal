@@ -44,19 +44,27 @@ pub enum Glyph {
 
 impl Glyph {
     /// How much of the hit area's shorter side the mark occupies.
+    ///
+    /// Every mark was drawn a step larger in this pass: at the sizes below the
+    /// old ones the row read as a line of faint specks rather than as
+    /// controls, and the gear in particular was small enough that its teeth
+    /// were indistinguishable from noise.
     fn scale(self) -> f32 {
         match self {
             // Wider than tall: a minimize bar that is only as wide as a
             // maximize box reads as an underscore.
-            Glyph::Bar => 0.44,
-            Glyph::Window => 0.38,
+            Glyph::Bar => 0.50,
+            Glyph::Window => 0.44,
             // Room for the offset copy behind it.
-            Glyph::WindowStack => 0.34,
-            Glyph::Cross => 0.34,
+            Glyph::WindowStack => 0.40,
+            Glyph::Cross => 0.40,
             // The most detailed mark in the set, and the one that needs the
             // most room before its teeth stop being teeth.
-            Glyph::Gear => 0.52,
-            Glyph::Plus => 0.46,
+            Glyph::Gear => 0.60,
+            Glyph::Plus => 0.52,
+            // The one mark deliberately left where it was: it sits inside a
+            // tab, beside a label, and growing it would make closing a tab
+            // look like the thing the tab is for.
             Glyph::SmallCross => 0.40,
         }
     }
@@ -65,12 +73,16 @@ impl Glyph {
     ///
     /// Not scaled with the box: these are hairline marks on screen furniture,
     /// and a stroke that grows with the button turns the gear into a blob.
+    /// Heavier than they were, though - a 1.0-point outline on a high-DPI
+    /// screen is a grey suggestion of a line, and the window marks were the
+    /// hardest of the set to see.
     fn width(self) -> f32 {
         match self {
-            Glyph::Bar | Glyph::Plus => 1.4,
-            Glyph::Cross | Glyph::SmallCross => 1.3,
-            Glyph::Gear => 1.2,
-            Glyph::Window | Glyph::WindowStack => 1.0,
+            Glyph::Bar | Glyph::Plus => 1.8,
+            Glyph::Cross => 1.7,
+            Glyph::SmallCross => 1.3,
+            Glyph::Gear => 1.5,
+            Glyph::Window | Glyph::WindowStack => 1.3,
         }
     }
 }
@@ -147,21 +159,21 @@ fn cross(painter: &Painter, box_: Rect, stroke: Stroke) {
 }
 
 /// New tab.
+///
+/// The half-point offset goes on the centre, not on one endpoint of each arm.
+/// Putting it on the endpoints is what left the mark lopsided: the horizontal
+/// bar still ran from `c.x - arm` to `c.x + arm` while the stem had moved half
+/// a point right, so the left arm came out a point longer than the right one -
+/// small, and plainly visible next to a symmetrical `x`.
 fn plus(painter: &Painter, box_: Rect, stroke: Stroke) {
-    let c = box_.center().round();
+    let c = box_.center().round() + Vec2::splat(0.5);
     let arm = box_.width() / 2.0;
     painter.line_segment(
-        [
-            Pos2::new(c.x - arm, c.y + 0.5),
-            Pos2::new(c.x + arm, c.y + 0.5),
-        ],
+        [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
         stroke,
     );
     painter.line_segment(
-        [
-            Pos2::new(c.x + 0.5, c.y - arm),
-            Pos2::new(c.x + 0.5, c.y + arm),
-        ],
+        [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
         stroke,
     );
 }
@@ -221,7 +233,7 @@ mod tests {
             Glyph::SmallCross,
         ] {
             assert!(
-                glyph.scale() > 0.0 && glyph.scale() <= 0.6,
+                glyph.scale() > 0.0 && glyph.scale() <= 0.62,
                 "{glyph:?} would not fit its button"
             );
             assert!(glyph.width() >= 1.0, "{glyph:?} would be invisible");

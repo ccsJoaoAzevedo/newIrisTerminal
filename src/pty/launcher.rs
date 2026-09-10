@@ -125,10 +125,19 @@ fn announce_terminal(cmd: &mut CommandBuilder) {
 /// decoding on this side can rescue it; see [`crate::term::encoding`]. The
 /// shells that already speak UTF-8, PowerShell 7 among them, are unaffected by
 /// being told to.
-pub fn shell_command(program: &Path, args: &[String]) -> CommandBuilder {
+///
+/// `cwd` is the directory the program starts in, when the caller cares. Only
+/// the Claude analysis tab does: it runs in the folder holding the file it was
+/// handed, so the file can be named bare on a `cmd` command line that has no
+/// way to quote a space.
+pub fn shell_command(program: &Path, args: &[String], cwd: Option<&Path>) -> CommandBuilder {
     #[cfg(windows)]
     {
-        windows::shell_command(program, args)
+        let mut cmd = windows::shell_command(program, args);
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
+        cmd
     }
     #[cfg(not(windows))]
     {
@@ -137,6 +146,9 @@ pub fn shell_command(program: &Path, args: &[String]) -> CommandBuilder {
         let mut cmd = CommandBuilder::new(program);
         for arg in args {
             cmd.arg(arg);
+        }
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
         }
         announce_terminal(&mut cmd);
         cmd

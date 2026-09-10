@@ -178,7 +178,6 @@ pub fn theme_manager(
     themes: &mut Vec<Theme>,
     active: &str,
     buttons: &crate::config::theme::WindowButtons,
-    native_decorations: bool,
 ) -> Vec<ThemeAction> {
     let mut actions: Vec<ThemeAction> = Vec::new();
     if !state.open {
@@ -198,7 +197,6 @@ pub fn theme_manager(
         // nothing.
         [1240.0, 700.0],
         buttons,
-        native_decorations,
         // Nothing to remember across runs: the theme manager is opened to make
         // one change and closed again, and it opens over the terminal it is
         // changing either way.
@@ -553,6 +551,10 @@ fn editor(
                     Some(colour) => colour,
                     None => theme.ui_foreground,
                 };
+            // What the gear and the `+` fall back to, which is the glyph
+            // colour when the theme names one and the interface foreground
+            // otherwise. Read before `buttons` borrows the theme.
+            let buttons_icon = theme.window_buttons.icon.unwrap_or(theme.ui_foreground);
             let buttons = &mut theme.window_buttons;
             Grid::new("theme-buttons").num_columns(2).show(ui, |ui| {
                 use crate::config::theme::WindowButtonSlot as Slot;
@@ -601,6 +603,29 @@ fn editor(
                     "Close hover",
                     &mut buttons.hover_close,
                     theme.ui_foreground,
+                    editable,
+                    None,
+                ) {
+                    changed = true;
+                }
+                // The two marks that are not window controls, and the two
+                // people actually aim at every day. Unset, both follow the
+                // glyph colour above.
+                if optional_colour_row(
+                    ui,
+                    "Settings gear",
+                    &mut buttons.settings,
+                    buttons_icon,
+                    editable,
+                    None,
+                ) {
+                    changed = true;
+                }
+                if optional_colour_row(
+                    ui,
+                    "New tab +",
+                    &mut buttons.new_tab,
+                    buttons_icon,
                     editable,
                     None,
                 ) {

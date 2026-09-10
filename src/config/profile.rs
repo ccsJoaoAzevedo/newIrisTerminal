@@ -72,6 +72,15 @@ pub struct ShellCommand {
     pub program: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Directory to start the program in. `None` leaves it wherever the app
+    /// itself was started, which is what a shell from the Shells menu wants.
+    ///
+    /// Set by the Claude analysis tab, which runs in the folder holding the
+    /// file it was handed: naming the file bare is what keeps a space in the
+    /// path out of a `cmd` command line - see `escape_for_cmd` in
+    /// [`crate::pty::launcher`].
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Where a remote session connects to.
@@ -208,6 +217,7 @@ impl Profile {
             shell: Some(ShellCommand {
                 program: shell.program.clone(),
                 args: shell.args.clone(),
+                cwd: None,
             }),
             ..Profile::default()
         }
