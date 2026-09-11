@@ -665,16 +665,91 @@ mod tests {
         assert_eq!(grid.screen[0].to_text(), "ok");
     }
 
+    /// Growing taller adds the rows at the bottom and leaves history alone,
+    /// which is what the far side does with its own buffer. The line that
+    /// scrolled off is still directly above the screen either way - the view
+    /// draws history and screen as one stream - and staying in history is what
+    /// keeps it out of the way of the repaint that follows every resize.
     #[test]
-    fn growing_taller_pulls_lines_back_from_scrollback() {
+    fn growing_taller_keeps_the_history_it_has() {
         let mut grid = Grid::new(10, 2, 100);
         let mut parser = vte::Parser::new();
         advance(&mut parser, &mut grid, b"one\r\ntwo\r\nthree");
         assert_eq!(grid.scrollback.len(), 1);
 
         grid.resize(10, 3);
-        assert!(grid.scrollback.is_empty());
-        assert_eq!(grid.screen[0].to_text(), "one");
-        assert_eq!(grid.screen[2].to_text(), "three");
+        assert_eq!(grid.scrollback.len(), 1, "history is not unwound");
+        assert_eq!(grid.scrollback[0].to_text(), "one");
+        assert_eq!(grid.screen[0].to_text(), "two");
+        assert_eq!(grid.screen[1].to_text(), "three");
+        assert_eq!(grid.screen[2].to_text(), "", "the new row is at the bottom");
+    }
+
+    /// The cursor stays on the row the far side left it on.
+    ///
+    /// The other half of the same bug: lifting rows back out of scrollback
+    /// moved the cursor down one per row, so a session dragged short and then
+    /// tall had our cursor near the bottom while the pseudoconsole's was near
+    /// the top - and everything drawn by absolute position after that landed
+    /// on the wrong row.
+    #[test]
+    fn growing_taller_leaves_the_cursor_where_it_was() {
+        let mut grid = Grid::new(10, 2, 100);
+        let mut parser = vte::Parser::new();
+        advance(&mut parser, &mut grid, b"one\r\ntwo\r\nthree");
+        let before = grid.cursor.row;
+
+        grid.resize(10, 12);
+        assert_eq!(grid.cursor.row, before);
+    }
+
+    /// The whole of the reported fault, end to end: a screen of output, the
+    /// window dragged as short as it goes, then maximized - and the
+    /// pseudoconsole repainting over the top with the little it still holds.
+    /// Nothing may be lost, because by then our history is the only copy.
+    #[test]
+    fn a_session_squashed_and_then_maximized_keeps_its_output() {
+        let mut grid = Grid::new(20, 10, 100);
+        let mut parser = vte::Parser::new();
+        for n in 1..=9 {
+            advance(&mut parser, &mut grid, format!("line {n}\r\n").as_bytes());
+        }
+        advance(&mut parser, &mut grid, b"USER>");
+
+        // Down to nothing, and back out to a tall window.
+        grid.resize(20, 2);
+        grid.resize(20, 30);
+
+        // What a pseudoconsole sends afterwards. Not an erase-display, which
+        // files the screen away and would hide the fault: it homes the cursor
+        // and rewrites the screen a row at a time, each row erased to its end
+        // as it goes. Only the two rows it still holds have anything on them.
+        let mut repaint: Vec<u8> = b"\x1b[H".to_vec();
+        for row in 0..30 {
+            // The two rows the console still holds, at the top of the new
+            // screen - which is where a console that has grown keeps them.
+            if row == 0 {
+                repaint.extend_from_slice(b"line 9");
+            } else if row == 1 {
+                repaint.extend_from_slice(b"USER>");
+            }
+            repaint.extend_from_slice(b"\x1b[K");
+            if row < 29 {
+                repaint.extend_from_slice(b"\r\n");
+            }
+        }
+        advance(&mut parser, &mut grid, &repaint);
+
+        let text: Vec<String> = (0..grid.total_lines())
+            .filter_map(|line| grid.line(line))
+            .map(|row| row.to_text().trim_end().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        for n in 1..=9 {
+            assert!(
+                text.contains(&format!("line {n}")),
+                "line {n} was lost: {text:?}"
+            );
+        }
     }
 }

@@ -828,12 +828,17 @@ impl Grid {
 
     /// Resize the screen, preserving as much content as possible.
     ///
-    /// Growing taller pulls lines back out of scrollback rather than padding
-    /// with blanks, so enlarging the window reveals history instead of empty
-    /// space. Shrinking pushes the top lines into scrollback. Width changes
-    /// truncate/pad each row; full re-wrapping of soft-wrapped paragraphs is
-    /// deliberately not attempted — IRIS full-screen routines repaint on
-    /// resize anyway, and a naive re-wrap corrupts their layout.
+    /// Shrinking pushes the top lines into scrollback; growing adds the new
+    /// rows at the bottom and leaves history where it is. That is what the far
+    /// side does with its own buffer, and matching it is the point: the screen
+    /// is the far side's to paint, and anything we put on a row it believes is
+    /// empty gets erased by its next repaint. Nothing is hidden by this - the
+    /// view draws history and screen as one stream, so a line in scrollback is
+    /// still the line directly above the screen.
+    ///
+    /// Width changes truncate/pad each row; full re-wrapping of soft-wrapped
+    /// paragraphs is deliberately not attempted — IRIS full-screen routines
+    /// repaint on resize anyway, and a naive re-wrap corrupts their layout.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -876,17 +881,25 @@ impl Grid {
                 }
             }
             std::cmp::Ordering::Greater => {
+                // Blank rows at the bottom, and history left where it is.
+                //
+                // Pulling lines back out of scrollback is what a terminal that
+                // owns its buffer does, and it is wrong here: the buffer
+                // belongs to the far side. A pseudoconsole that has grown
+                // keeps its content at the top, keeps the cursor on the row it
+                // was on, and adds the new rows below - so a line lifted back
+                // onto the screen sits where the far side believes nothing is,
+                // and its next repaint erases it. Having just been taken out
+                // of scrollback, it is then gone for good.
+                //
+                // That is what emptied a session dragged short and then
+                // maximized: every row the shrink had filed away was pulled
+                // back onto the screen, the repaint wiped the screen, and the
+                // transcript went with it. Left in scrollback the same rows
+                // are still there, directly above the screen, because the view
+                // draws history and screen as one stream.
                 for _ in 0..rows - self.rows {
-                    if let Some(mut row) = self.scrollback.pop_back() {
-                        // Only clamped, never padded: a screen row is as
-                        // long as what has been written into it, and `print`
-                        // grows it from there.
-                        row.narrow_to(cols);
-                        self.screen.insert(0, row);
-                        self.cursor.row += 1;
-                    } else {
-                        self.screen.push(Row::new());
-                    }
+                    self.screen.push(Row::new());
                 }
             }
             std::cmp::Ordering::Equal => {}
@@ -1019,19 +1032,16 @@ mod tests {
         assert_eq!(grid.screen[0].to_text(), "abc  def");
     }
 
-    /// A row promoted back onto the screen out of scrollback stays as short as
-    /// what is on it, and is printed into all the same: the write grows it.
-    /// The old shape of this was to pad it back out to full width, which is
-    /// what a margin of 16384 made unaffordable.
+    /// A row stays as short as what is on it - a resize pads nothing - and is
+    /// printed into all the same, far to the right: the write grows it. The
+    /// old shape of this was to pad every row out to full width, which is what
+    /// a margin of 16384 made unaffordable.
     #[test]
-    fn a_row_promoted_out_of_scrollback_is_printed_into_without_being_padded() {
+    fn a_short_row_is_printed_into_without_being_padded() {
         let mut grid = Grid::new(200, 2, 100);
         for ch in "hi".chars() {
             grid.print(ch);
         }
-        grid.line_feed();
-        grid.line_feed();
-        assert!(!grid.scrollback.is_empty());
 
         grid.resize(200, 4);
         for row in &grid.screen {
