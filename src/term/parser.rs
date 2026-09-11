@@ -527,6 +527,64 @@ mod tests {
         assert_eq!(grid.cursor.row, 1);
     }
 
+    /// `cls` and `clear` in a shell, byte for byte as a Windows pseudoconsole
+    /// sends them: the same homing, row-by-row erase as IRIS's `W #` - and then
+    /// an `ESC [ 3 J`, which it appends to every clear-screen it relays.
+    ///
+    /// Obeyed literally that deleted the saved lines the sweep had just filed,
+    /// and the history above them with it: one `cls` and the transcript of the
+    /// whole session was gone, in a terminal whose entire point on the IRIS
+    /// side is that a clear-screen loses nothing.
+    #[test]
+    fn the_clear_a_shell_sends_keeps_the_transcript() {
+        let mut grid = Grid::new(20, 4, 100);
+        let mut parser = vte::Parser::new();
+        advance(&mut parser, &mut grid, b"one\r\ntwo\r\nthree\r\nC:>cls");
+        assert_eq!(grid.scrollback.len(), 0);
+
+        advance(
+            &mut parser,
+            &mut grid,
+            b"\x1b[H\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[3J\x1b[H C:>",
+        );
+
+        let history: Vec<String> = grid.scrollback.iter().map(|r| r.to_text()).collect();
+        assert_eq!(
+            history,
+            vec![
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+                "C:>cls".to_string(),
+            ],
+            "the trailing ED 3 ate the transcript the clear had just filed"
+        );
+    }
+
+    /// The other side of that: an `ESC [ 3 J` that is not the tail of a clear
+    /// is a program asking for the saved lines to go, and it still gets them.
+    #[test]
+    fn an_ed_3_of_its_own_still_drops_the_history() {
+        let mut grid = Grid::new(20, 4, 100);
+        let mut parser = vte::Parser::new();
+        advance(
+            &mut parser,
+            &mut grid,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive",
+        );
+        assert!(!grid.scrollback.is_empty(), "nothing to drop");
+
+        advance(&mut parser, &mut grid, b"\x1b[3J");
+        assert!(
+            grid.scrollback.is_empty(),
+            "a deliberate ED 3 left history behind: {:?}",
+            grid.scrollback
+                .iter()
+                .map(|r| r.to_text())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// A purge that is armed and never used must not ambush the next ordinary
     /// clear-screen.
     #[test]

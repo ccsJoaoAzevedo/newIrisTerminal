@@ -185,8 +185,8 @@ const PT_BR: &[(&str, &str)] = &[
     ("Claude is opening with this output in context ({}). Ask it whatever you like.",
      "O Claude está abrindo com esta saída no contexto ({}). Pergunte o que quiser."),
     ("Clear terminal and scrollback", "Limpar terminal e histórico de rolagem"),
-    ("Ctrl+Delete. Unlike IRIS's own clear-screen, this really does throw the history away. At an idle prompt it sends W # so IRIS puts its next prompt back at the top; the echo and the old screen are dropped rather than kept.",
-     "Ctrl+Delete. Diferente do clear-screen do próprio IRIS, este realmente descarta o histórico. Em um prompt inativo envia W # para que o IRIS volte a colocar o próximo prompt no topo; o eco e a tela antiga são descartados em vez de guardados."),
+    ("Ctrl+Delete. Unlike a clear-screen from the session itself, this really does throw the history away. It asks the far side to clear - W # at an idle IRIS prompt, Ctrl+L in a shell - so the next prompt goes back to the top; the echo and the old screen are dropped rather than kept.",
+     "Ctrl+Delete. Diferente do clear-screen da própria sessão, este realmente descarta o histórico. Ele pede que o outro lado limpe a tela - W # em um prompt inativo do IRIS, Ctrl+L em um shell - para que o próximo prompt volte ao topo; o eco e a tela antiga são descartados em vez de guardados."),
 
     // Settings: sections and appearance.
     ("Appearance", "Aparência"),

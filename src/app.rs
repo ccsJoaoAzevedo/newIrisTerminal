@@ -375,6 +375,37 @@ pub struct Tab {
 /// with a later one and resurrect its focus or selection state.
 static NEXT_TAB_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// What makes `program` clear its own screen, for [`Tab::request_clear`].
+///
+/// Ctrl+L everywhere it is understood, which is every shell with a line editor
+/// worth the name: PSReadLine binds it in both PowerShells, and readline binds
+/// it in `bash`, `zsh` and `fish`. A keystroke rather than a command line is
+/// what lets the gesture work with something already half typed - the shell
+/// clears the screen and paints the line back, losing nothing.
+///
+/// `cmd.exe` is the exception: its line editor has no such binding and echoes
+/// `^L` as a character, so it gets the command instead, with an Escape in front
+/// to empty the input line first - which is what Escape does there, and what
+/// keeps `cls` from being appended to a half-typed command.
+///
+/// Hence a list rather than one string: the Escape has to be a write of its
+/// own. A pseudoconsole turns what it reads back into key presses, and an
+/// Escape with more bytes behind it in the same read is the start of a
+/// sequence rather than the key - so sent in one piece it is swallowed, and
+/// `cls` lands on the end of whatever was typed. Two writes are two reads even
+/// back to back, with no pause between them.
+fn clear_gesture(program: &std::path::Path) -> &'static [&'static [u8]] {
+    let is_cmd = program
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("cmd"));
+    if is_cmd {
+        &[b"\x1b", b"cls\r"]
+    } else {
+        &[b"\x0c"]
+    }
+}
+
 impl Tab {
     pub fn new(profile: Profile, settings: &Settings, cols: u16, rows: u16) -> Self {
         let log = open_log(&profile, settings);
@@ -675,27 +706,40 @@ impl Tab {
         }
     }
 
-    /// Asks IRIS to clear its own screen, the way typing `W #` would, and
-    /// arranges for the clear that comes back to drop the transcript instead of
-    /// filing it.
+    /// Asks the far side to clear its own screen - the way typing `W #` would
+    /// in IRIS, or Ctrl+L in a shell - and arranges for the clear that comes
+    /// back to drop the transcript instead of filing it.
     ///
     /// The terminal cannot do this on its own. The far side keeps its own idea
     /// of where the cursor is and repaints by absolute position, so a grid
     /// cleared behind its back leaves the next prompt painted back down at the
-    /// row it had reached, with blank rows above it. `W #` is what resets that
-    /// idea. Nothing of it stays on screen: the echoed command and the pre-clear
-    /// screen are both dropped by the purge.
+    /// row it had reached, with blank rows above it. That goes double for a
+    /// shell on Windows, where the pseudoconsole owns a screen buffer of its
+    /// own and only ever sends the difference between it and the last one: a
+    /// screen wiped here is a screen it believes is still there, so it repaints
+    /// nothing and the tab stays blank until something scrolls. Asking is what
+    /// resets that idea. Nothing of it stays on screen: the echo of the ask and
+    /// the pre-clear screen are both dropped by the purge.
     ///
-    /// Only ever called at an idle prompt - see
+    /// On IRIS this is only ever called at an idle prompt - see
     /// [`App::clear_active_terminal`], which is what keeps the command from
     /// being swallowed as input by a `read` or appended to a half-typed line.
+    /// A shell has no such restriction, because what it is sent is a
+    /// keystroke rather than a command line.
     pub fn request_clear(&mut self) {
         if self.session.is_none() {
             return;
         }
         self.grid.purge_history_on_next_clear();
         self.clear_asked = Some(std::time::Instant::now());
-        self.send_lines(&["W #".to_string()]);
+        match self.profile.shell.as_ref() {
+            Some(shell) => {
+                for write in clear_gesture(&shell.program) {
+                    self.send(write);
+                }
+            }
+            None => self.send_lines(&["W #".to_string()]),
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -1044,15 +1088,15 @@ impl App {
     /// cursor is and repaints by absolute position, so a screen wiped behind
     /// its back gets the next prompt painted back down at the row it had
     /// reached, with the cleared rows blank above it. The only thing that
-    /// resets that idea is a clear-screen from IRIS, so at an idle prompt the
-    /// clear is asked of IRIS - and the echoed command and the pre-clear screen
-    /// are both dropped, so nothing of it is left on screen or in the
-    /// scrollback.
+    /// resets that idea is a clear-screen from the far side itself, so the
+    /// clear is asked of it - of IRIS at an idle prompt, of a shell at any
+    /// moment at all - and the echo of the ask and the pre-clear screen are
+    /// both dropped, so nothing of it is left on screen or in the scrollback.
     ///
-    /// Anywhere else - mid-line, mid-routine, or on a session that has ended -
-    /// the command could be swallowed as input or appended to what is being
-    /// typed, so the grid is cleared locally instead, and the prompt stays
-    /// where IRIS left it.
+    /// Anywhere else - mid-line or mid-routine on IRIS, or on a session that
+    /// has ended - the command could be swallowed as input or appended to what
+    /// is being typed, so the grid is cleared locally instead, and the prompt
+    /// stays where IRIS left it.
     ///
     /// Nothing is said about any of this in the status line. The gesture is a
     /// frequent one, and a note that appears under every clear costs a row of
@@ -1071,10 +1115,15 @@ impl App {
         tab.view.clear_selection();
         tab.view.scroll_to_bottom();
 
-        // An idle prompt: IRIS is reading a command line and nothing has been
-        // typed on it yet.
-        let idle_prompt = lineedit::current(&tab.grid).is_some_and(|line| line.is_empty());
-        if tab.session.is_some() && idle_prompt {
+        // Safe to ask the far side to clear itself: on IRIS that means an
+        // idle prompt - it is reading a command line and nothing has been
+        // typed on it yet - because the ask is a command line of its own. A
+        // shell is sent a keystroke instead, which no `read` can swallow and
+        // nothing half typed can absorb, so there is no moment at which it is
+        // the wrong thing to send.
+        let can_ask = tab.profile.is_shell()
+            || lineedit::current(&tab.grid).is_some_and(|line| line.is_empty());
+        if tab.session.is_some() && can_ask {
             tab.request_clear();
         } else {
             tab.grid.hard_reset();
@@ -3594,6 +3643,29 @@ pub fn discover_instances() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ctrl+Delete asks the far side to clear itself, and what a shell answers
+    /// to is the shell's business: Ctrl+L wherever a line editor binds it, and
+    /// the command for `cmd.exe`, whose does not - with the Escape that empties
+    /// its input line kept as a write of its own.
+    #[test]
+    fn a_shell_is_asked_to_clear_the_way_that_shell_understands() {
+        use std::path::Path;
+
+        assert_eq!(
+            clear_gesture(Path::new("C:/Program Files/PowerShell/7/pwsh.exe")),
+            [b"\x0c".as_slice()]
+        );
+        assert_eq!(
+            clear_gesture(Path::new("/usr/bin/bash")),
+            [b"\x0c".as_slice()]
+        );
+        assert_eq!(
+            clear_gesture(Path::new("C:/Windows/System32/cmd.exe")),
+            [b"\x1b".as_slice(), b"cls\r".as_slice()],
+            "cmd echoes a Ctrl+L rather than acting on it"
+        );
+    }
 
     /// A tab with no session behind it. Closing a pane is about which session
     /// ends up in the tab, and needs no IRIS to answer.

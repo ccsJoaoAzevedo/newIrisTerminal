@@ -819,7 +819,7 @@ pub fn show(
         });
         if ui
             .button(tr("Clear terminal and scrollback"))
-            .on_hover_text(tr("Ctrl+Delete. Unlike IRIS's own clear-screen, this really does throw the history away. At an idle prompt it sends W # so IRIS puts its next prompt back at the top; the echo and the old screen are dropped rather than kept."))
+            .on_hover_text(tr("Ctrl+Delete. Unlike a clear-screen from the session itself, this really does throw the history away. It asks the far side to clear - W # at an idle IRIS prompt, Ctrl+L in a shell - so the next prompt goes back to the top; the echo and the old screen are dropped rather than kept."))
             .clicked()
         {
             context_action = Some(ContextAction::ClearTerminal);

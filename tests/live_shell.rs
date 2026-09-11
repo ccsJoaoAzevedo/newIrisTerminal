@@ -129,3 +129,115 @@ fn every_shell_opens_and_answers() {
         failed.join("\n  ")
     );
 }
+
+/// What a typed `clear` or `cls` does to the transcript, and what the app's own
+/// clear gesture does to the screen.
+///
+/// Both halves are the bug this exists for. A Windows pseudoconsole ends every
+/// clear-screen it relays with `ESC [ 3 J`, and obeying that deleted the whole
+/// session's history the moment anyone typed `cls`. The gesture, meanwhile,
+/// used to send IRIS's `W #` at a shell, which is not a command any shell has.
+///
+/// The bytes the gesture sends are spelled out here rather than imported -
+/// `clear_gesture` is private to the app - so they have to be kept in step with
+/// [`new_iris_terminal::app`]. That is the point: this is the test that says
+/// whether they still work on the shells this machine actually has.
+#[test]
+#[ignore = "starts a process per shell"]
+fn clearing_a_shell_keeps_the_transcript_and_empties_the_screen() {
+    let shells = shells::available();
+    if shells.is_empty() {
+        println!("no shells on this machine; nothing to clear");
+        return;
+    }
+
+    let mut failed: Vec<String> = Vec::new();
+    for shell in &shells {
+        println!("\n=== {} ===", shell.name);
+        let is_cmd = shell
+            .program
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("cmd"));
+        let Ok(mut session) = Session::shell(&shell.program, &shell.args, None, 80, 12) else {
+            failed.push(format!("{}: would not start", shell.name));
+            continue;
+        };
+        let mut grid = Grid::new(80, 12, 500);
+        pump(&mut session, &mut grid, Duration::from_secs(4));
+
+        // Something to lose: more lines than the screen holds, so the top of it
+        // is already in the scrollback before anything is cleared.
+        for n in 0..20 {
+            let _ = session.write_str(&format!("echo nit-line-{n}\r"));
+        }
+        pump(&mut session, &mut grid, Duration::from_secs(6));
+        let before = grid.scrollback.len();
+        if before == 0 {
+            // Nothing echoed twenty lines back, so this entry is not a command
+            // interpreter sitting at a prompt - a plugin pointing at a
+            // full-screen program is still a shell the menu can open, and
+            // clearing it means nothing. `every_shell_opens_and_answers` is
+            // what holds a real shell that has gone quiet to account.
+            println!("  not a shell at a prompt; nothing to clear");
+            session.request_halt();
+            continue;
+        }
+
+        // Half one: the shell's own clear. The screen goes, the history stays.
+        let _ = session.write_str(if is_cmd { "cls\r" } else { "clear\r" });
+        pump(&mut session, &mut grid, Duration::from_secs(6));
+        if grid.scrollback.len() < before {
+            failed.push(format!(
+                "{}: the clear ate the transcript ({} lines of history left of {before})",
+                shell.name,
+                grid.scrollback.len()
+            ));
+        }
+
+        // Half two: the app's gesture, with something half typed to make sure
+        // what it sends cannot be glued onto the end of it.
+        let _ = session.write_str("echo half-typed");
+        pump(&mut session, &mut grid, Duration::from_secs(3));
+        grid.purge_history_on_next_clear();
+        if is_cmd {
+            // The Escape is a write of its own or the pseudoconsole reads it as
+            // the start of a sequence and swallows it.
+            let _ = session.write(b"\x1b");
+            let _ = session.write(b"cls\r");
+        } else {
+            let _ = session.write(b"\x0c");
+        }
+        pump(&mut session, &mut grid, Duration::from_secs(6));
+        session.request_halt();
+
+        let screen: Vec<String> = grid
+            .screen
+            .iter()
+            .map(|row| row.cells.iter().map(|cell| cell.ch).collect())
+            .collect();
+        println!("{}", screen.join("\n").trim_end());
+        if screen.iter().any(|row| row.contains("nit-line-")) {
+            failed.push(format!(
+                "{}: the gesture left the old screen up",
+                shell.name
+            ));
+        }
+        // The prompt is painted near the top by the far side itself, which is
+        // the whole reason the clear is asked of it rather than done here.
+        if screen[..4].iter().all(|row| row.trim().is_empty()) {
+            failed.push(format!(
+                "{}: nothing came back after the gesture",
+                shell.name
+            ));
+        }
+    }
+
+    assert!(
+        failed.is_empty(),
+        "{} of {} shell(s) cleared wrongly:\n  {}",
+        failed.len(),
+        shells.len(),
+        failed.join("\n  ")
+    );
+}

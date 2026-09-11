@@ -112,6 +112,27 @@ fn announce_terminal(cmd: &mut CommandBuilder) {
     cmd.env("TERM", "vt100");
 }
 
+/// The environment a *shell* is expected to find instead.
+///
+/// A shell does not read `TERM` directly - it looks the name up in terminfo,
+/// and the databases shells ship with no longer carry the entry IRIS is told
+/// about. Git Bash's holds `xterm`, `cygwin` and `screen` and nothing else, so
+/// being told `vt100` left it with no terminal description at all: `clear`
+/// exited 1 having cleared nothing, and Ctrl+L in `bash` did nothing either,
+/// both of them for want of a name they could look up.
+///
+/// `xterm-256color` is the entry all of them have, and the colours are the
+/// reason for that spelling over bare `xterm`: a shell picks its prompt and its
+/// `ls` colours from what terminfo says the terminal can do.
+///
+/// What it licenses that the grid does not model - alt screen, mouse
+/// reporting, bracketed paste - is ignored rather than drawn, and on Windows it
+/// does not even reach us: the pseudoconsole renders those itself and hands
+/// back an ordinary repaint.
+fn announce_shell_terminal(cmd: &mut CommandBuilder) {
+    cmd.env("TERM", "xterm-256color");
+}
+
 /// The command that starts a shell rather than an IRIS session.
 ///
 /// Here rather than in [`crate::plugins::shells`] for the reason this module
@@ -150,7 +171,7 @@ pub fn shell_command(program: &Path, args: &[String], cwd: Option<&Path>) -> Com
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
-        announce_terminal(&mut cmd);
+        announce_shell_terminal(&mut cmd);
         cmd
     }
 }
@@ -361,7 +382,7 @@ mod windows {
             for arg in args {
                 cmd.arg(arg);
             }
-            announce_terminal(&mut cmd);
+            announce_shell_terminal(&mut cmd);
             return cmd;
         };
 
@@ -375,7 +396,7 @@ mod windows {
         cmd.arg("/c");
         cmd.arg(format!("chcp 65001>nul & {line}"));
         cmd.env("PATH", prepend_to_path(dir));
-        announce_terminal(&mut cmd);
+        announce_shell_terminal(&mut cmd);
         cmd
     }
 

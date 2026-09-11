@@ -199,6 +199,12 @@ pub struct Grid {
     repaint_until: Option<std::time::Instant>,
     /// Set by [`Grid::purge_history_on_next_clear`].
     purge_on_clear: bool,
+    /// The screen has just been cleared and nothing has been printed since.
+    ///
+    /// A Windows pseudoconsole ends every clear-screen with `ESC [ 3 J` - see
+    /// [`Grid::erase_in_display`] - and this is what tells that one apart from
+    /// a program asking for the history to be dropped on its own account.
+    screen_cleared: bool,
     /// Bumped on every mutation so the UI can skip repainting an idle tab.
     pub revision: u64,
 }
@@ -230,6 +236,7 @@ impl Grid {
             clear: None,
             repaint_until: None,
             purge_on_clear: false,
+            screen_cleared: false,
             revision: 0,
         }
     }
@@ -343,6 +350,10 @@ impl Grid {
             self.line_feed();
             self.pending_wrap = false;
         }
+
+        // Whatever came before, the screen is being written on again, so a
+        // later `ESC [ 3 J` is not the tail of a clear-screen.
+        self.screen_cleared = false;
 
         let (row, col) = (self.cursor.row, self.cursor.col);
         self.destroying_row(row);
@@ -481,7 +492,8 @@ impl Grid {
     /// off, so blanking those rows in place is what made the transcript
     /// disappear: nothing had ever been pushed into history, and there was
     /// nothing left to scroll back to. Only mode 3 - the sequence whose whole
-    /// purpose is to drop the history - actually throws it away.
+    /// purpose is to drop the history - throws it away, and only when it is
+    /// asked for on its own account rather than as the tail of a clear.
     pub fn erase_in_display(&mut self, mode: u16) {
         let (row, col) = (self.cursor.row, self.cursor.col);
         match mode {
@@ -513,13 +525,27 @@ impl Grid {
                 // a row at a time.
                 self.cancel_clear();
                 if mode == 3 {
-                    self.scrollback.clear();
+                    // ED 3 drops the saved lines, and a program that sends it
+                    // out of the blue gets exactly that.
+                    //
+                    // A Windows pseudoconsole, though, ends *every*
+                    // clear-screen with it: `cls`, `clear` and `Clear-Host`
+                    // all arrive as a row-by-row erase down the screen and
+                    // then this. Obeying it there would delete the transcript
+                    // the clear had just filed away - and the history above it
+                    // - so a shell tab lost everything to a command that on
+                    // the IRIS side loses nothing. Straight after a clear it
+                    // is part of that clear, and the transcript stays.
+                    if !self.screen_cleared {
+                        self.scrollback.clear();
+                    }
                 } else {
                     self.archive_screen();
                 }
                 for r in 0..self.rows {
                     self.screen[r] = Row::new();
                 }
+                self.screen_cleared = true;
             }
         }
         self.touch();
@@ -646,6 +672,7 @@ impl Grid {
 
     /// Hands a completed sweep to the scrollback.
     fn file_sweep(&mut self, sweep: ClearSweep) {
+        self.screen_cleared = true;
         if self.purging() {
             return;
         }
@@ -667,6 +694,7 @@ impl Grid {
     /// clears a 50-row screen holding three lines should cost three lines of
     /// history, not fifty blank ones.
     fn archive_screen(&mut self) {
+        self.screen_cleared = true;
         if self.purging() {
             return;
         }
@@ -1170,10 +1198,11 @@ mod tests {
         assert!(grid.scrollback.is_empty());
     }
 
-    /// ED 3 is the sequence that means "and drop the saved lines", and the
-    /// gesture behind Ctrl+Delete.
+    /// ED 3 means "and drop the saved lines" - but only when it is asked for
+    /// on its own account. Straight after a clear-screen it is the tail of
+    /// that clear, which is how a Windows pseudoconsole spells one.
     #[test]
-    fn ed_3_and_hard_reset_drop_the_history() {
+    fn ed_3_drops_the_history_only_when_it_is_not_part_of_a_clear() {
         let mut grid = Grid::new(20, 3, 100);
         for ch in "gone".chars() {
             grid.print(ch);
@@ -1181,13 +1210,28 @@ mod tests {
         grid.erase_in_display(2);
         assert_eq!(grid.scrollback.len(), 1);
 
+        // Part of the clear that has just happened: the screen it filed stays.
+        grid.erase_in_display(3);
+        assert_eq!(grid.scrollback.len(), 1);
+
+        // Printing ends the clear, so the next one is a program asking.
+        for ch in "again".chars() {
+            grid.print(ch);
+        }
         grid.erase_in_display(3);
         assert!(grid.scrollback.is_empty());
+    }
 
+    /// The gesture behind Ctrl+Delete takes the history with it, always.
+    #[test]
+    fn hard_reset_drops_the_history() {
+        let mut grid = Grid::new(20, 3, 100);
         for ch in "gone".chars() {
             grid.print(ch);
         }
         grid.erase_in_display(2);
+        assert_eq!(grid.scrollback.len(), 1);
+
         grid.hard_reset();
         assert!(grid.scrollback.is_empty());
         assert_eq!(grid.screen[0].to_text(), "");
