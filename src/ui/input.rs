@@ -205,6 +205,56 @@ fn control_char(key: Key) -> Option<u8> {
     }
 }
 
+/// The character that closes `open`, when `open` is one a selection can be
+/// wrapped in.
+///
+/// The set an editor treats this way: the two quotes and the three brackets.
+/// Deliberately not every paired character - `<` is a comparison far more often
+/// than it is a bracket, and wrapping a selection in it would be wrong nearly
+/// every time it was typed.
+pub fn surround_pair(open: char) -> Option<char> {
+    Some(match open {
+        '"' => '"',
+        '\'' => '\'',
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        _ => return None,
+    })
+}
+
+/// `line` with `from..to` wrapped in `open` and its closing character.
+///
+/// Columns are absolute grid columns and `start` is the column the typed text
+/// begins at, because that is the shape everything on the command line is
+/// measured in. Returns the new text and the span the selection should cover
+/// afterwards, which is the same text one column further right: keeping it
+/// selected is what lets a second quote or bracket wrap the same thing again,
+/// exactly as it does in an editor.
+pub fn surround(
+    text: &str,
+    start: usize,
+    from: usize,
+    to: usize,
+    open: char,
+) -> Option<(String, (usize, usize))> {
+    let close = surround_pair(open)?;
+    let chars: Vec<char> = text.chars().collect();
+    let from = from.checked_sub(start)?;
+    let to = to.checked_sub(start)?;
+    if from >= to || to > chars.len() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len() + 2);
+    out.extend(&chars[..from]);
+    out.push(open);
+    out.extend(&chars[from..to]);
+    out.push(close);
+    out.extend(&chars[to..]);
+    Some((out, (start + from + 1, start + to + 1)))
+}
+
 /// Whether Insert and Delete are physically down right now.
 ///
 /// On Windows, egui-winit treats Ctrl+Insert as copy and Shift+Delete as cut
@@ -443,6 +493,74 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
 /// what IRIS treats as end-of-line, and a stray LF would submit twice.
 pub fn sanitize_paste(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
+}
+
+#[cfg(test)]
+mod surround_tests {
+    use super::*;
+
+    /// The gesture as asked for: a global name picked off the screen, quoted in
+    /// one keystroke rather than retyped.
+    #[test]
+    fn a_quote_wraps_the_selection_instead_of_replacing_it() {
+        // `set x=^GLOBAL` typed at column 8, with `^GLOBAL` selected.
+        let text = "set x=^GLOBAL";
+        let (line, span) = surround(text, 8, 14, 21, '"').expect("should wrap");
+        assert_eq!(line, "set x=\"^GLOBAL\"");
+        assert_eq!(
+            span,
+            (15, 22),
+            "the same characters, one column right of where they were"
+        );
+    }
+
+    /// And wrapping what is already wrapped, which is what keeping the
+    /// selection is for.
+    #[test]
+    fn wrapping_twice_nests_the_pairs() {
+        let (once, span) = surround("a", 0, 0, 1, '(').expect("should wrap");
+        assert_eq!(once, "(a)");
+        let (twice, _) = surround(&once, 0, span.0, span.1, '[').expect("should wrap");
+        assert_eq!(twice, "([a])");
+    }
+
+    #[test]
+    fn every_pair_closes_with_its_own_character() {
+        assert_eq!(surround_pair('('), Some(')'));
+        assert_eq!(surround_pair('['), Some(']'));
+        assert_eq!(surround_pair('{'), Some('}'));
+        assert_eq!(surround_pair('"'), Some('"'));
+        assert_eq!(surround_pair('\''), Some('\''));
+    }
+
+    /// Anything else typed over a selection is a replacement, which is the
+    /// behaviour every text field has and the one this must not change.
+    #[test]
+    fn an_ordinary_character_is_not_a_wrapping_one() {
+        assert_eq!(surround_pair('x'), None);
+        assert_eq!(surround_pair('<'), None, "a comparison far more often");
+        assert_eq!(surround_pair(')'), None, "a closing bracket wraps nothing");
+        assert!(surround("abc", 0, 0, 2, 'x').is_none());
+    }
+
+    /// A selection that is empty, inverted, or reaches past the text is not
+    /// something to wrap - and must not panic on the way to saying so.
+    #[test]
+    fn a_span_that_is_not_a_selection_wraps_nothing() {
+        assert!(surround("abc", 0, 1, 1, '(').is_none(), "empty");
+        assert!(surround("abc", 0, 2, 1, '(').is_none(), "inverted");
+        assert!(surround("abc", 0, 0, 9, '(').is_none(), "past the end");
+        assert!(surround("abc", 8, 2, 5, '(').is_none(), "before the prompt");
+    }
+
+    /// Columns are characters, not bytes: the accented text the ERP is full of
+    /// must not be cut in half.
+    #[test]
+    fn columns_are_counted_in_characters() {
+        let (line, span) = surround("ação", 0, 1, 3, '(').expect("should wrap");
+        assert_eq!(line, "a(çã)o");
+        assert_eq!(span, (2, 4));
+    }
 }
 
 #[cfg(test)]

@@ -779,6 +779,18 @@ pub fn settings_dialog(
                 }
                 if ui
                     .checkbox(
+                        &mut settings.surround_selection,
+                        tr("Quotes and brackets wrap the selection"),
+                    )
+                    .on_hover_text(tr(
+                        "On: typing \" ' ( [ or { over selected text on the command line puts the pair around it instead of replacing it, the way an editor does - so selecting a global name and pressing \" quotes it, and the text stays selected to be wrapped again. Off: the character replaces the selection. Only applies to a selection inside the line being typed; one in the scrollback is highlighted text and is never edited.",
+                    ))
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(
                         &mut settings.recall_mid_line,
                         tr("Up and Down recall from anywhere on the line"),
                     )

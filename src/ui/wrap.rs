@@ -7,6 +7,11 @@
 //! That is what this module works out, and it is why everything that used to be
 //! `top_line + screen_row` goes through here instead.
 //!
+//! The unit throughout is the **display row**, not the logical line — see
+//! [`Top`]. One line of a wide grid is routinely tall enough to fill the window
+//! several times over, and a view that could only be positioned on whole lines
+//! could not be stopped anywhere inside one.
+//!
 //! Two modes, the pair a text editor offers:
 //!
 //! - **wrap**: a long line continues on the next display row, breaking at the
@@ -62,7 +67,34 @@ impl Mode {
     }
 }
 
-/// The display rows filling a viewport of `rows`, starting at `top_line`.
+/// Where the top edge of the viewport sits.
+///
+/// A logical line *and* how many of that line's own display rows are above the
+/// edge, which is the whole point: a line is not an indivisible unit once it
+/// wraps. A `zwrite` of a wide global is one line that takes two hundred
+/// display rows, and an anchor that could only name the line could only ever
+/// show the first rows of it or skip the whole thing. That is what made a
+/// wheel notch jump a screenful of output at a time, with no way to stop
+/// anywhere inside a long line and read it.
+///
+/// `skip` is always less than the line's height, so the ordering derived here -
+/// by line, then by row within it - is the order the rows are on screen in, and
+/// `min` against the bottom-most position is a valid clamp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Top {
+    pub line: usize,
+    pub skip: usize,
+}
+
+impl Top {
+    /// The top of a line, which is where every position in clip mode sits and
+    /// where a line that has not been scrolled into starts.
+    pub fn line(line: usize) -> Self {
+        Top { line, skip: 0 }
+    }
+}
+
+/// The display rows filling a viewport of `rows`, starting at `top`.
 ///
 /// `used` gives the used width of a logical line. It is a closure rather than a
 /// slice because it is only asked about the lines on screen: measuring all ten
@@ -70,17 +102,20 @@ impl Mode {
 pub fn from_top(
     total: usize,
     rows: usize,
-    top_line: usize,
+    top: Top,
     mode: Mode,
     used: impl Fn(usize) -> usize,
 ) -> Vec<Segment> {
     let mut out = Vec::with_capacity(rows);
-    let mut line = top_line;
+    let mut line = top.line;
+    // Only the first line is entered part-way; every line after it starts at
+    // its own first row.
+    let mut skip = top.skip;
 
     while out.len() < rows && line < total {
         if mode.wrap {
             let height = mode.rows_for(used(line));
-            for segment in 0..height {
+            for segment in skip.min(height)..height {
                 if out.len() == rows {
                     break;
                 }
@@ -90,55 +125,121 @@ pub fn from_top(
                 });
             }
         } else {
+            // Every line is one row tall, so there is no part of one to skip.
             out.push(Segment {
                 line,
                 start: mode.offset,
             });
         }
+        skip = 0;
         line += 1;
     }
 
     out
 }
 
-/// The logical line that has to be at the top for the last line to sit on the
-/// bottom row — the largest vertical scroll offset there is.
+/// Where the top has to be for the last line to end on the bottom row — the
+/// furthest down the view can be scrolled.
 ///
 /// Walks back from the end adding line heights, so it costs one measurement per
 /// visible row rather than one per line in the scrollback.
-pub fn top_for_bottom(
-    total: usize,
-    rows: usize,
-    mode: Mode,
-    used: impl Fn(usize) -> usize,
-) -> usize {
+pub fn top_for_bottom(total: usize, rows: usize, mode: Mode, used: impl Fn(usize) -> usize) -> Top {
     if total == 0 || rows == 0 {
-        return 0;
+        return Top::default();
     }
     if !mode.wrap {
         // Every line is exactly one row, so there is nothing to accumulate.
-        return total.saturating_sub(rows);
+        return Top::line(total.saturating_sub(rows));
     }
 
     let mut budget = rows;
     let mut line = total;
-    while line > 0 {
+    // `budget > 0` as well as `line > 0`: a viewport that is exactly full has
+    // nothing left to give the line above, and without this the next line
+    // would be entered with a zero budget and reported as the top with all of
+    // its rows skipped - one line further back than the view really reaches.
+    while line > 0 && budget > 0 {
         let height = mode.rows_for(used(line - 1));
         if height > budget {
-            break;
+            // Only part of this line fits. Its *last* `budget` rows are the
+            // ones that belong on screen: the bottom of the view is the end of
+            // the output, and on a line taller than the window that end is the
+            // tail of the line rather than its head.
+            return Top {
+                line: line - 1,
+                skip: height - budget,
+            };
         }
         budget -= height;
         line -= 1;
     }
 
-    // A single line taller than the whole viewport fits nowhere, and returning
-    // `total` would leave the screen blank. Showing the start of that line is
-    // not ideal - the end is what you were waiting for - but it beats nothing.
-    if line == total {
-        total - 1
-    } else {
-        line
+    // Either the budget ran out on a line boundary or the transcript did.
+    // Whole lines both ways, so nothing of the top line is above the edge.
+    Top::line(line)
+}
+
+/// Moves the top of the view `delta` display rows, downwards when positive.
+///
+/// Display rows rather than logical lines, so one wheel notch moves one row of
+/// what is on screen however long the line under it happens to be. Clamped at
+/// both ends of the transcript; the caller clamps against the live bottom,
+/// which it is the only one that knows.
+pub fn step(total: usize, from: Top, delta: i64, mode: Mode, used: impl Fn(usize) -> usize) -> Top {
+    if total == 0 {
+        return Top::default();
     }
+    let last = total - 1;
+    if !mode.wrap {
+        let line = (from.line as i64 + delta).clamp(0, last as i64) as usize;
+        return Top::line(line);
+    }
+
+    let height = |line: usize| mode.rows_for(used(line)).max(1);
+    let mut at = Top {
+        line: from.line.min(last),
+        skip: from.skip,
+    };
+    at.skip = at.skip.min(height(at.line) - 1);
+
+    let mut left = delta;
+    while left > 0 {
+        // Rows still below the top edge on this line, not counting the one it
+        // is already on.
+        let room = (height(at.line) - 1 - at.skip) as i64;
+        if room >= left {
+            at.skip += left as usize;
+            break;
+        }
+        if at.line == last {
+            // The end of the transcript: sit on the last row there is.
+            at.skip = height(at.line) - 1;
+            break;
+        }
+        // The rest of this line, plus the step onto the next.
+        left -= room + 1;
+        at.line += 1;
+        at.skip = 0;
+    }
+
+    let mut left = -delta;
+    while left > 0 {
+        if at.skip as i64 >= left {
+            at.skip -= left as usize;
+            break;
+        }
+        if at.line == 0 {
+            at.skip = 0;
+            break;
+        }
+        // What is left of this line above the edge, plus the step onto the
+        // previous one, which is entered at its *last* row.
+        left -= at.skip as i64 + 1;
+        at.line -= 1;
+        at.skip = height(at.line) - 1;
+    }
+
+    at
 }
 
 /// The top line a live, bottom-anchored view sits at.
@@ -169,8 +270,8 @@ pub fn live_top(
     rows: usize,
     mode: Mode,
     used: impl Fn(usize) -> usize,
-) -> usize {
-    top_for_bottom(cursor_line + 1, rows, mode, used).max(screen_top)
+) -> Top {
+    top_for_bottom(cursor_line + 1, rows, mode, used).max(Top::line(screen_top))
 }
 
 /// Which display row holds a given cell, if it is on screen.
@@ -225,21 +326,22 @@ mod tests {
             _ => 0,
         };
 
-        // Anchored on the whole grid, the blank rows take up the whole budget
-        // and the prompt lands on the *first* row of the window, with nothing
-        // above it and forty blank rows below - which is the bug, exactly as
-        // reported: every command put the new prompt at the top, and seeing
-        // its output meant scrolling up.
+        // Anchored on the whole grid, the forty-odd blank rows below the prompt
+        // eat the window and all but the last few rows of the output are pushed
+        // off the top - which is the bug, as reported: every command put the new
+        // prompt near the top of the window, and reading what it answered meant
+        // scrolling up.
         let whole = top_for_bottom(47, rows, mode, used);
         let showing = from_top(47, rows, whole, mode, used);
-        assert_eq!(
-            showing.first().map(|s| s.line),
-            Some(cursor_line),
-            "this is the bug: the prompt is the top row"
+        let of_the_output = showing.iter().filter(|s| s.line == cursor_line - 1).count();
+        assert!(
+            of_the_output <= 3,
+            "this is the bug: barely any of the output is still on screen, \
+             not {of_the_output} rows of it"
         );
         assert!(
-            !showing.iter().any(|s| s.line == cursor_line - 1),
-            "and the output it answered is off the top of the window"
+            showing.iter().any(|s| s.line == cursor_line),
+            "with the prompt at the top of the window"
         );
 
         // Anchored on the cursor's line, the prompt is on screen with the
@@ -255,8 +357,8 @@ mod tests {
             "the prompt should be on screen"
         );
         assert!(
-            showing.iter().any(|s| s.line == cursor_line - 1),
-            "and so should what it is answering"
+            showing.iter().filter(|s| s.line == cursor_line - 1).count() > 3,
+            "and so should the output it is answering, not just its tail"
         );
     }
 
@@ -289,12 +391,16 @@ mod tests {
         // the new prompt at the bottom: the bug, exactly as reported.
         let cursor_only = top_for_bottom(cursor_line + 1, rows, mode, used);
         assert!(
-            cursor_only < screen_top,
+            cursor_only < Top::line(screen_top),
             "this is the bug: the view reaches back into the history"
         );
 
         let top = live_top(screen_top, cursor_line, rows, mode, used);
-        assert_eq!(top, screen_top, "the cleared screen starts at its own top");
+        assert_eq!(
+            top,
+            Top::line(screen_top),
+            "the cleared screen starts at its own top"
+        );
         let showing = from_top(total, rows, top, mode, used);
         assert!(
             !showing.iter().any(|s| s.line < screen_top),
@@ -323,7 +429,10 @@ mod tests {
         };
 
         let top = live_top(screen_top, cursor_line, rows, mode, used);
-        assert!(top > screen_top, "the top of the screen has to give way");
+        assert!(
+            top > Top::line(screen_top),
+            "the top of the screen has to give way"
+        );
         let showing = from_top(screen_top + rows, rows, top, mode, used);
         assert!(showing.iter().any(|s| s.line == cursor_line));
         assert!(showing.iter().any(|s| s.line == cursor_line - 1));
@@ -339,8 +448,11 @@ mod tests {
         let cursor_line = 3;
         let used = move |line: usize| if line <= cursor_line { 40 } else { 0 };
 
-        assert_eq!(top_for_bottom(cursor_line + 1, rows, mode, used), 0);
-        let showing = from_top(47, rows, 0, mode, used);
+        assert_eq!(
+            top_for_bottom(cursor_line + 1, rows, mode, used),
+            Top::default()
+        );
+        let showing = from_top(47, rows, Top::default(), mode, used);
         assert_eq!(showing.len(), rows, "the blank rows are still drawn");
         assert_eq!(showing[cursor_line].line, cursor_line);
     }
@@ -381,11 +493,21 @@ mod tests {
             Segment { line: 43, start: 0 },
             Segment { line: 44, start: 0 },
         ];
-        assert_eq!(from_top(100, 5, 40, Mode::wrapping(90), flat(90)), expected);
-        assert_eq!(from_top(100, 5, 40, clipping(90, 0), flat(90)), expected);
+        let top = Top::line(40);
+        assert_eq!(
+            from_top(100, 5, top, Mode::wrapping(90), flat(90)),
+            expected
+        );
+        assert_eq!(from_top(100, 5, top, clipping(90, 0), flat(90)), expected);
 
-        assert_eq!(top_for_bottom(100, 5, Mode::wrapping(90), flat(90)), 95);
-        assert_eq!(top_for_bottom(100, 5, clipping(90, 0), flat(90)), 95);
+        assert_eq!(
+            top_for_bottom(100, 5, Mode::wrapping(90), flat(90)),
+            Top::line(95)
+        );
+        assert_eq!(
+            top_for_bottom(100, 5, clipping(90, 0), flat(90)),
+            Top::line(95)
+        );
     }
 
     #[test]
@@ -393,7 +515,7 @@ mod tests {
         // 200 characters in a 90-column window: 90, 90, then 20.
         let used = |line: usize| if line == 1 { 200 } else { 10 };
         assert_eq!(
-            from_top(4, 6, 0, Mode::wrapping(90), used),
+            from_top(4, 6, Top::default(), Mode::wrapping(90), used),
             vec![
                 Segment { line: 0, start: 0 },
                 Segment { line: 1, start: 0 },
@@ -413,7 +535,7 @@ mod tests {
     fn a_long_line_stays_on_one_row_when_clipping() {
         let used = |line: usize| if line == 1 { 200 } else { 10 };
         assert_eq!(
-            from_top(4, 6, 0, clipping(90, 45), used),
+            from_top(4, 6, Top::default(), clipping(90, 45), used),
             vec![
                 Segment { line: 0, start: 45 },
                 Segment { line: 1, start: 45 },
@@ -428,7 +550,7 @@ mod tests {
     #[test]
     fn the_layout_stops_at_the_row_count() {
         assert_eq!(
-            from_top(10, 2, 0, Mode::wrapping(90), flat(500)),
+            from_top(10, 2, Top::default(), Mode::wrapping(90), flat(500)),
             vec![
                 Segment { line: 0, start: 0 },
                 Segment { line: 0, start: 90 },
@@ -439,37 +561,129 @@ mod tests {
     #[test]
     fn scrolling_to_the_bottom_accounts_for_wrapped_lines() {
         // Every line takes two rows, so six rows hold three lines.
-        assert_eq!(top_for_bottom(100, 6, Mode::wrapping(90), flat(180)), 97);
+        assert_eq!(
+            top_for_bottom(100, 6, Mode::wrapping(90), flat(180)),
+            Top::line(97)
+        );
 
         // Mixed heights: the last line takes 3 rows, the two before it 1 each.
         let used = |line: usize| if line == 9 { 200 } else { 10 };
-        assert_eq!(top_for_bottom(10, 5, Mode::wrapping(90), used), 7);
+        assert_eq!(
+            top_for_bottom(10, 5, Mode::wrapping(90), used),
+            Top::line(7)
+        );
 
         // Clipping ignores the heights entirely.
-        assert_eq!(top_for_bottom(10, 5, clipping(90, 0), used), 5);
+        assert_eq!(top_for_bottom(10, 5, clipping(90, 0), used), Top::line(5));
     }
 
     #[test]
     fn a_short_history_starts_at_the_first_line() {
-        assert_eq!(top_for_bottom(3, 40, Mode::wrapping(90), flat(10)), 0);
-        assert_eq!(top_for_bottom(0, 40, Mode::wrapping(90), flat(10)), 0);
-        assert_eq!(top_for_bottom(3, 40, clipping(90, 0), flat(10)), 0);
+        assert_eq!(
+            top_for_bottom(3, 40, Mode::wrapping(90), flat(10)),
+            Top::default()
+        );
+        assert_eq!(
+            top_for_bottom(0, 40, Mode::wrapping(90), flat(10)),
+            Top::default()
+        );
+        assert_eq!(
+            top_for_bottom(3, 40, clipping(90, 0), flat(10)),
+            Top::default()
+        );
     }
 
-    /// Returning `total` here would leave the viewport empty.
+    /// A line taller than the whole viewport is anchored on its *end*, which is
+    /// the half of it anyone waiting for output is waiting for. Before the top
+    /// could name a row this could only show the first three rows of a hundred.
     #[test]
-    fn a_line_taller_than_the_viewport_still_shows_something() {
+    fn a_line_taller_than_the_viewport_shows_its_end() {
         let mode = Mode::wrapping(10);
+        // The last line is 1000 characters: a hundred rows, of which three fit.
         let top = top_for_bottom(4, 3, mode, flat(1000));
-        assert_eq!(top, 3);
-        assert_eq!(from_top(4, 3, top, mode, flat(1000)).len(), 3);
+        assert_eq!(top, Top { line: 3, skip: 97 });
+        let showing = from_top(4, 3, top, mode, flat(1000));
+        assert_eq!(showing.len(), 3);
+        assert_eq!(
+            showing.last().map(|s| s.start),
+            Some(990),
+            "the bottom row is the last ten characters of the line"
+        );
+    }
+
+    /// The bug this whole type exists for: a wheel notch over a line that wraps
+    /// into a hundred rows moves one row, not a hundred.
+    #[test]
+    fn one_notch_moves_one_display_row_inside_a_tall_line() {
+        let mode = Mode::wrapping(10);
+        // Line 1 is 1000 characters - a hundred display rows.
+        let used = |line: usize| if line == 1 { 1000 } else { 5 };
+        let at = Top { line: 1, skip: 0 };
+
+        assert_eq!(step(4, at, 1, mode, used), Top { line: 1, skip: 1 });
+        assert_eq!(step(4, at, 40, mode, used), Top { line: 1, skip: 40 });
+        // Past the end of the line and onto the next one: 99 rows left below
+        // the top edge, so the hundredth step leaves the line.
+        assert_eq!(step(4, at, 100, mode, used), Top::line(2));
+    }
+
+    /// And back the other way, which enters a tall line at its last row rather
+    /// than its first.
+    #[test]
+    fn stepping_up_enters_a_tall_line_at_its_bottom() {
+        let mode = Mode::wrapping(10);
+        let used = |line: usize| if line == 1 { 1000 } else { 5 };
+
+        assert_eq!(
+            step(4, Top::line(2), -1, mode, used),
+            Top { line: 1, skip: 99 },
+            "one row up from the line after it is its last row"
+        );
+        assert_eq!(
+            step(4, Top::line(2), -3, mode, used),
+            Top { line: 1, skip: 97 }
+        );
+        // All the way through it and onto the line before.
+        assert_eq!(step(4, Top::line(2), -101, mode, used), Top::line(0));
+    }
+
+    /// Neither end of the transcript can be stepped past.
+    #[test]
+    fn stepping_stops_at_both_ends() {
+        let mode = Mode::wrapping(10);
+        assert_eq!(step(5, Top::line(0), -50, mode, flat(5)), Top::default());
+        assert_eq!(step(5, Top::line(4), 50, mode, flat(5)), Top::line(4));
+        assert_eq!(step(0, Top::default(), 5, mode, flat(5)), Top::default());
+    }
+
+    /// Clipping has one row per line, so a step is a line either way.
+    #[test]
+    fn stepping_while_clipping_moves_whole_lines() {
+        let mode = clipping(10, 0);
+        assert_eq!(step(100, Top::line(40), 5, mode, flat(500)), Top::line(45));
+        assert_eq!(step(100, Top::line(40), -5, mode, flat(500)), Top::line(35));
+    }
+
+    /// A view entered part-way down a line starts on that row, not at the top
+    /// of the line.
+    #[test]
+    fn the_layout_starts_at_the_row_the_top_names() {
+        let mode = Mode::wrapping(10);
+        assert_eq!(
+            from_top(3, 3, Top { line: 0, skip: 2 }, mode, flat(100)),
+            vec![
+                Segment { line: 0, start: 20 },
+                Segment { line: 0, start: 30 },
+                Segment { line: 0, start: 40 },
+            ]
+        );
     }
 
     #[test]
     fn a_cell_is_found_on_the_row_its_slice_is_on() {
         let mode = Mode::wrapping(90);
         let used = |line: usize| if line == 1 { 200 } else { 10 };
-        let segments = from_top(4, 6, 0, mode, used);
+        let segments = from_top(4, 6, Top::default(), mode, used);
 
         assert_eq!(row_of(&segments, mode, 0, 5), Some(0));
         assert_eq!(row_of(&segments, mode, 1, 0), Some(1));
@@ -492,7 +706,7 @@ mod tests {
     #[test]
     fn a_column_scrolled_off_to_the_left_is_not_on_screen() {
         let mode = clipping(90, 100);
-        let segments = from_top(3, 3, 0, mode, flat(300));
+        let segments = from_top(3, 3, Top::default(), mode, flat(300));
 
         assert_eq!(row_of(&segments, mode, 0, 99), None, "left of the view");
         assert_eq!(row_of(&segments, mode, 0, 100), Some(0));

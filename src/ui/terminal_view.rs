@@ -14,6 +14,7 @@ use crate::features::natives::Native;
 use crate::i18n::tr;
 use crate::term::cell::{Cell, Color};
 use crate::term::{lineedit, palette, syntax, Attrs, Grid};
+use crate::ui::search;
 use crate::ui::wrap;
 
 /// Everything about how the grid should be drawn that is not the grid itself.
@@ -43,8 +44,8 @@ pub struct RenderOpts {
     ///
     /// Right for IRIS, which truncates a `Write` at the margin it was told and
     /// so must never be told a small one. Wrong for anything that *draws* to
-    /// the width it is given: a shell's full-screen program fills 16384
-    /// columns with padding and box rules, and every one of those lines then
+    /// the width it is given: a shell's full-screen program fills every one of
+    /// those columns with padding and box rules, and each of those lines then
     /// wraps into a hundred display rows of blanks. Shells therefore get the
     /// window's own width, which is what they are drawing into anyway.
     pub wide_grid: bool,
@@ -80,21 +81,31 @@ impl Default for RenderOpts {
 /// written to (see [`crate::term::grid::Row`]), so the margin is a number the
 /// far side is told, not an allocation.
 ///
-/// 16384 rather than something larger because of where the console stops.
-/// A pseudoconsole resized to exactly 32767 columns - `SHRT_MAX` - stops
-/// answering altogether: the session comes up as a black screen that ignores
-/// every key, which is what `tests/live_width.rs` measures and pins. 32000
-/// still worked, but sitting inside a thousand columns of an undocumented
-/// cliff in someone else's process is not worth the characters; half of
-/// `SHRT_MAX` is far past any real line and demonstrably fast at every window
-/// height. What it costs is that a `Write` of more than 16384 characters is
-/// still cut - IRIS itself stops at 32767 - which nothing in the ERP produces.
+/// 32000 because that is as far as the stack goes, and the margin is the whole
+/// of what survives. Measured against a real instance: a `Write` of a million
+/// characters arrives as exactly `cols` of them and the rest is discarded,
+/// whatever `cols` is - 120 columns gives 120 characters, 16384 gives 16384.
+/// The margin is therefore not a comfort setting, it is the line length limit,
+/// and every column of it is one more character of a `zwrite` that can be read
+/// back.
+///
+/// The ceiling above it is the console's, not ours. A pseudoconsole resized to
+/// exactly 32767 columns - `SHRT_MAX` - stops answering altogether: the session
+/// comes up as a black screen that ignores every key, which is what
+/// `tests/live_width.rs` measures and pins. 32000 leaves most of a thousand
+/// columns of clearance under that cliff and is demonstrably fast at every
+/// window height. IRIS's own limit is 32767, so there is nothing meaningful
+/// left above it either.
+///
+/// A line longer than this cannot be recovered on a console session at any
+/// setting - it is gone before it is sent, and exporting or copying the
+/// transcript cannot bring back what never arrived.
 ///
 /// The one other thing the claim costs: anything positioning itself by the
 /// width it is told - the `^%G` utility, a full-screen editor, a routine
 /// drawing a rule across the screen - has a wrong idea of how wide the screen
 /// is. That was already true at 512.
-pub const TERMINAL_COLS: usize = 16384;
+pub const TERMINAL_COLS: usize = 32000;
 
 /// Width of the scrollback scrollbar, in points.
 const SCROLLBAR_WIDTH: f32 = 10.0;
@@ -109,8 +120,11 @@ const MIN_THUMB_HEIGHT: f32 = 24.0;
 pub enum ScrollAnchor {
     #[default]
     Bottom,
-    /// Absolute index of the top visible line, counting from oldest scrollback.
-    At(usize),
+    /// Where the top of the view sits, as a line and a row within it. See
+    /// [`wrap::Top`]: on a grid this wide one logical line routinely fills the
+    /// window many times over, so naming only the line would make a wheel
+    /// notch jump the whole of it.
+    At(wrap::Top),
 }
 
 /// A text selection in absolute line coordinates.
@@ -183,6 +197,16 @@ pub struct ViewState {
     /// per tab so scrolling sideways in one does not move another.
     pub h_offset: usize,
     pub selection: Option<Selection>,
+    /// Ctrl+F: what is being looked for in this tab's transcript, and where it
+    /// was found. See [`crate::ui::search`].
+    pub search: search::Search,
+    /// A cell to bring on screen before the next frame is laid out.
+    ///
+    /// Set by whatever moved to a hit, carried out by [`show`], which is the
+    /// only place that knows how wide the window is and therefore which display
+    /// row the cell is on. Taken when it is honoured, so it moves the view once
+    /// rather than pinning it there.
+    pub reveal: Option<(usize, usize)>,
     /// Cell the current drag started on, kept because the selection itself is
     /// normalised and so forgets which end the pointer left behind.
     drag_anchor: Option<(usize, usize)>,
@@ -241,6 +265,21 @@ impl ViewState {
             end: (last, width),
         });
     }
+}
+
+/// Why a run of columns is drawn on a coloured ground, if it is.
+///
+/// One value rather than a pair of flags, because they are mutually exclusive
+/// and the run-batching compares whatever this is: two flags would have let a
+/// selected hit and a plain selection batch together and then paint in two
+/// different colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Highlight {
+    None,
+    Selected,
+    /// A search hit, but not the one being looked at.
+    Hit,
+    CurrentHit,
 }
 
 /// Size of one character cell for the given font.
@@ -515,9 +554,37 @@ pub fn show(
     // where both halves of that are argued - including the clear-screen this
     // was getting wrong.
     let max_top = wrap::live_top(grid.scrollback.len(), cursor_line, rows, mode, used);
-    let top_line = match state.anchor {
+
+    // A hit to bring on screen, now that the layout is known. Put a third of
+    // the way down the window rather than on the top row, so what is around it
+    // is readable - which is usually the point of having found it.
+    if let Some((line, col)) = state.reveal.take() {
+        let row_in_line = if mode.wrap {
+            col / mode.view_cols.max(1)
+        } else {
+            0
+        };
+        let at = wrap::Top {
+            line,
+            skip: row_in_line,
+        };
+        let above = (rows / 3) as i64;
+        let wanted = wrap::step(total, at, -above, mode, used).min(max_top);
+        state.anchor = if wanted >= max_top {
+            ScrollAnchor::Bottom
+        } else {
+            ScrollAnchor::At(wanted)
+        };
+        // Clipped lines are reached sideways instead, so the column has to be
+        // brought into the view the same way.
+        if !opts.wrap && (col < state.h_offset || col >= state.h_offset + view_cols) {
+            state.h_offset = col.saturating_sub(view_cols / 3);
+        }
+    }
+
+    let top = match state.anchor {
         ScrollAnchor::Bottom => max_top,
-        ScrollAnchor::At(line) => line.min(max_top),
+        ScrollAnchor::At(at) => at.min(max_top),
     };
 
     // How far sideways there is to go. The grid keeps this as a high-water
@@ -534,7 +601,7 @@ pub fn show(
         offset: state.h_offset,
         ..mode
     };
-    let segments = wrap::from_top(total, rows, top_line, mode, used);
+    let segments = wrap::from_top(total, rows, top, mode, used);
 
     let mouse = handle_mouse(
         ui,
@@ -542,13 +609,15 @@ pub fn show(
         state,
         rect,
         cell,
-        top_line,
+        top,
         grid,
         max_top,
         max_h_offset,
         &segments,
         mode,
         opts.copy_on_select,
+        total,
+        &used,
     );
 
     // Where the cursor is, in grid coordinates, when it is visible and its cell
@@ -566,6 +635,11 @@ pub fn show(
     } else {
         None
     };
+
+    // Read once for the frame: `paint_row` borrows the search's hits, so the
+    // one hit that is drawn differently cannot be read out of `state` while
+    // that borrow is alive.
+    let current_hit = state.search.current_match();
 
     // One scan per logical line, reusing one buffer for the frame. A wrapped
     // line arrives as several consecutive segments, and rescanning it for each
@@ -592,6 +666,7 @@ pub fn show(
         let hide_glyph_at = cursor_at
             .filter(|(row, _, _)| *row == screen_row && opts.cursor_style == CursorStyle::Block)
             .map(|(_, _, col)| col);
+        let hits = state.search.on_line(segment.line);
         paint_row(
             &painter,
             row,
@@ -602,7 +677,9 @@ pub fn show(
             rect.left(),
             cell,
             theme,
-            state,
+            state.selection,
+            hits,
+            current_hit,
             &font,
             hide_glyph_at,
             &overrides,
@@ -670,7 +747,9 @@ pub fn show(
             Pos2::new(rect.right(), rect.top()),
             Pos2::new(outer.right(), rect.bottom()),
         );
-        scrollbar(ui, track, state, theme, tab_uid, total, rows, max_top);
+        scrollbar(
+            ui, track, state, theme, tab_uid, total, rows, max_top, mode, &used,
+        );
 
         if h_bar_height > 0.0 {
             let track = Rect::from_min_max(
@@ -1159,12 +1238,26 @@ fn autoscroll_lines(over: f32, cell_y: f32) -> i64 {
     }
 }
 
-/// Moves the anchor by whole lines and re-pins to the bottom on arrival.
+/// Moves the anchor by whole display rows and re-pins to the bottom on arrival.
 ///
-/// Line-quantised on purpose: the terminal scrolls by rows, not pixels, so a
-/// fractional offset would only ever be rounded away.
-fn scroll_lines(state: &mut ViewState, from: usize, lines: i64, max_top: usize) {
-    let next = (from as i64 - lines).clamp(0, max_top as i64) as usize;
+/// Row-quantised on purpose: the terminal scrolls by rows, not pixels, so a
+/// fractional offset would only ever be rounded away. Display rows rather than
+/// logical lines is the whole of the fix for output that could not be read:
+/// one notch over a `zwrite` that wraps two hundred times used to skip the
+/// entire thing, so the only way to see the middle of a long line was to export
+/// the transcript.
+fn scroll_lines(
+    state: &mut ViewState,
+    from: wrap::Top,
+    lines: i64,
+    max_top: wrap::Top,
+    total: usize,
+    mode: wrap::Mode,
+    used: &dyn Fn(usize) -> usize,
+) {
+    // A positive `lines` means "towards the history", which is backwards
+    // through the transcript.
+    let next = wrap::step(total, from, -lines, mode, used).min(max_top);
     state.anchor = if next >= max_top {
         ScrollAnchor::Bottom
     } else {
@@ -1186,7 +1279,9 @@ fn scrollbar(
     tab_uid: u64,
     total: usize,
     rows: usize,
-    max_top: usize,
+    max_top: wrap::Top,
+    mode: wrap::Mode,
+    used: &dyn Fn(usize) -> usize,
 ) {
     let painter = ui.painter_at(track);
     // The track is drawn even with nothing to scroll, so the reserved strip
@@ -1197,7 +1292,7 @@ fn scrollbar(
         palette::blend(theme.background, theme.foreground, 0.07),
     );
 
-    if max_top == 0 {
+    if max_top == wrap::Top::default() {
         return;
     }
 
@@ -1222,11 +1317,22 @@ fn scrollbar(
         } else {
             0.0
         };
-        let line = (wanted * max_top as f32).round() as usize;
-        state.anchor = if line >= max_top {
+        // Whole lines, except when the whole transcript is one line taller
+        // than the window - a single enormous `zwrite` - and there are no lines
+        // to interpolate over. Then the bar runs through that line's own rows,
+        // which is the only way it can reach the end at all.
+        let at = if max_top.line == 0 {
+            wrap::Top {
+                line: 0,
+                skip: (wanted * max_top.skip as f32).round() as usize,
+            }
+        } else {
+            wrap::Top::line((wanted * max_top.line as f32).round() as usize)
+        };
+        state.anchor = if at >= max_top {
             ScrollAnchor::Bottom
         } else {
-            ScrollAnchor::At(line)
+            ScrollAnchor::At(at)
         };
     }
 
@@ -1235,14 +1341,14 @@ fn scrollbar(
     // is exactly where people reach to scroll.
     let current = match state.anchor {
         ScrollAnchor::Bottom => max_top,
-        ScrollAnchor::At(line) => line.min(max_top),
+        ScrollAnchor::At(at) => at.min(max_top),
     };
     if response.hovered() {
         let scroll = ui.input(|i| i.raw_scroll_delta.y);
         let cell_y = track.height() / rows.max(1) as f32;
         let lines = (scroll / cell_y.max(1.0)).round() as i64;
         if lines != 0 {
-            scroll_lines(state, current, lines, max_top);
+            scroll_lines(state, current, lines, max_top, total, mode, used);
         }
     }
 
@@ -1250,8 +1356,20 @@ fn scrollbar(
     // which was worked out before the drag above could move it.
     let progress = match state.anchor {
         ScrollAnchor::Bottom => 1.0,
-        ScrollAnchor::At(line) => line.min(max_top) as f32 / max_top as f32,
-    };
+        ScrollAnchor::At(at) => {
+            let at = at.min(max_top);
+            if max_top.line == 0 {
+                at.skip as f32 / max_top.skip.max(1) as f32
+            } else {
+                // The fraction of the line the top sits inside is counted too,
+                // so the thumb keeps moving while a line taller than the window
+                // is being scrolled through rather than sticking until it ends.
+                let height = mode.rows_for(used(at.line)).max(1) as f32;
+                (at.line as f32 + at.skip as f32 / height) / max_top.line as f32
+            }
+        }
+    }
+    .clamp(0.0, 1.0);
     let thumb = Rect::from_min_size(
         Pos2::new(track.left() + 1.0, track.top() + span * progress),
         Vec2::new((track.width() - 2.0).max(1.0), thumb_height),
@@ -1293,7 +1411,12 @@ fn paint_row(
     left: f32,
     cell: Vec2,
     theme: &Theme,
-    state: &ViewState,
+    selection: Option<Selection>,
+    // Search hits on this logical line, and the one of them being looked at.
+    // Drawn behind the text like a selection, and in a stronger colour for the
+    // current one so that stepping through them can be followed.
+    hits: &[search::Match],
+    current_hit: Option<search::Match>,
     font: &FontId,
     // Column whose glyph the cursor will draw itself, if it is on this row.
     hide_glyph_at: Option<usize>,
@@ -1303,11 +1426,10 @@ fn paint_row(
     overrides: &[Option<Color32>],
 ) {
     let to = (from + view_cols).min(row.cells.len());
-    let selection = state.selection;
 
     // Everything about how one column looks, in one place, so the run-batching
     // below compares exactly what it draws.
-    let appearance = |col: usize| -> (Color32, Color32, bool) {
+    let appearance = |col: usize| -> (Color32, Color32, Highlight) {
         let cell = &row.cells[col];
         let (mut fg, bg) = palette::resolve(cell, theme);
         if let Some(Some(colour)) = overrides.get(col) {
@@ -1318,8 +1440,18 @@ fn paint_row(
                 fg = *colour;
             }
         }
-        let selected = selection.is_some_and(|s| s.contains(line_index, col));
-        (fg, bg, selected)
+        // A selection the user made wins over a hit the search found: the
+        // selection is what the next Ctrl+C will copy, and it must be visible.
+        let highlight = if selection.is_some_and(|s| s.contains(line_index, col)) {
+            Highlight::Selected
+        } else if current_hit.is_some_and(|m| m.covers(line_index, col)) {
+            Highlight::CurrentHit
+        } else if hits.iter().any(|m| m.covers(line_index, col)) {
+            Highlight::Hit
+        } else {
+            Highlight::None
+        };
+        (fg, bg, highlight)
     };
 
     if from >= to {
@@ -1329,7 +1461,7 @@ fn paint_row(
     let mut col = from;
     let mut look = appearance(from);
     while col < to {
-        let (fg, bg, selected) = look;
+        let (fg, bg, highlight) = look;
 
         // Extend the run while appearance is unchanged, so a line of plain
         // text becomes one background rect instead of `cols` of them. Each
@@ -1338,7 +1470,7 @@ fn paint_row(
         let mut end = col + 1;
         while end < to {
             let next = appearance(end);
-            if next != (fg, bg, selected) {
+            if next != (fg, bg, highlight) {
                 look = next;
                 break;
             }
@@ -1350,7 +1482,17 @@ fn paint_row(
             Vec2::new((end - col) as f32 * cell.x, cell.y),
         );
 
-        let effective_bg = if selected { theme.selection } else { bg };
+        let effective_bg = match highlight {
+            Highlight::None => bg,
+            Highlight::Selected => theme.selection,
+            // Derived from the selection colour rather than being settings of
+            // their own: a theme that has been made readable has already
+            // decided what highlighted text looks like in it, and two more
+            // colours to keep in step across eleven themes would be two more
+            // ways for one of them to come out unreadable.
+            Highlight::Hit => palette::blend(theme.selection, theme.foreground, 0.22),
+            Highlight::CurrentHit => palette::blend(theme.selection, theme.foreground, 0.55),
+        };
         if effective_bg != theme.background {
             painter.rect_filled(run_rect, 0.0, effective_bg);
         }
@@ -1439,13 +1581,15 @@ fn handle_mouse(
     state: &mut ViewState,
     rect: Rect,
     cell: Vec2,
-    top_line: usize,
+    top: wrap::Top,
     grid: &Grid,
-    max_top: usize,
+    max_top: wrap::Top,
     max_h_offset: usize,
     segments: &[wrap::Segment],
     mode: wrap::Mode,
     copy_on_select: bool,
+    total: usize,
+    used: &dyn Fn(usize) -> usize,
 ) -> MouseOutcome {
     let mut outcome = MouseOutcome::default();
     // Wheel scrolling through scrollback.
@@ -1477,7 +1621,7 @@ fn handle_mouse(
         };
         let lines = (vertical / cell.y).round() as i64;
         if lines != 0 {
-            scroll_lines(state, top_line, lines, max_top);
+            scroll_lines(state, top, lines, max_top, total, mode, used);
         }
     }
 
@@ -1492,7 +1636,7 @@ fn handle_mouse(
         match segments.get(row.min(segments.len().saturating_sub(1))) {
             Some(segment) => (segment.line, (segment.start + offset).min(last)),
             // Nothing laid out at all, which means an empty grid.
-            None => (top_line, (mode.offset + offset).min(last)),
+            None => (top.line, (mode.offset + offset).min(last)),
         }
     };
     // The cell under the pointer, for dragging out a selection.
@@ -1582,7 +1726,7 @@ fn handle_mouse(
             };
             if over != 0.0 {
                 let lines = autoscroll_lines(over, cell.y);
-                scroll_lines(state, top_line, lines, max_top);
+                scroll_lines(state, top, lines, max_top, total, mode, used);
                 // An idle terminal draws no frame of its own, and without one
                 // the scroll would stop the moment the pointer stopped moving.
                 ui.ctx().request_repaint();
@@ -1769,21 +1913,61 @@ mod tests {
     #[test]
     fn scrolling_to_the_end_re_pins_to_the_live_output() {
         let mut state = ViewState::default();
+        // Every line one row tall, so a row is a line and the arithmetic is the
+        // same one this test has always asserted.
+        let short = |_: usize| 10usize;
+        let mode = wrap::Mode::wrapping(80);
+        let top = wrap::Top::line;
 
         // A positive wheel delta means "towards the history".
-        scroll_lines(&mut state, 100, 3, 100);
-        assert_eq!(state.anchor, ScrollAnchor::At(97));
+        scroll_lines(&mut state, top(100), 3, top(100), 200, mode, &short);
+        assert_eq!(state.anchor, ScrollAnchor::At(top(97)));
 
-        scroll_lines(&mut state, 97, -3, 100);
+        scroll_lines(&mut state, top(97), -3, top(100), 200, mode, &short);
         assert_eq!(state.anchor, ScrollAnchor::Bottom, "should follow again");
 
         // Past the oldest line clamps instead of underflowing.
-        scroll_lines(&mut state, 2, 40, 100);
-        assert_eq!(state.anchor, ScrollAnchor::At(0));
+        scroll_lines(&mut state, top(2), 40, top(100), 200, mode, &short);
+        assert_eq!(state.anchor, ScrollAnchor::At(top(0)));
 
         // Nothing scrolled off at all: the only valid anchor is Bottom.
-        scroll_lines(&mut state, 0, 5, 0);
+        scroll_lines(
+            &mut state,
+            wrap::Top::default(),
+            5,
+            wrap::Top::default(),
+            1,
+            mode,
+            &short,
+        );
         assert_eq!(state.anchor, ScrollAnchor::Bottom);
+    }
+
+    /// The report this was built for: a line long enough to wrap into far more
+    /// rows than the window has could not be read, because every notch of the
+    /// wheel skipped the whole line and landed on the command before or after
+    /// it. Now a notch is a row.
+    #[test]
+    fn the_wheel_walks_through_a_line_that_wraps_instead_of_over_it() {
+        let mut state = ViewState::default();
+        let mode = wrap::Mode::wrapping(100);
+        // One 200,000-character line in the middle: two thousand display rows.
+        let used = |line: usize| if line == 1 { 200_000 } else { 8 };
+        let max_top = wrap::Top {
+            line: 1,
+            skip: 1990,
+        };
+
+        // Three notches back from the bottom stay inside that same line.
+        scroll_lines(&mut state, max_top, 3, max_top, 3, mode, &used);
+        assert_eq!(
+            state.anchor,
+            ScrollAnchor::At(wrap::Top {
+                line: 1,
+                skip: 1987
+            }),
+            "the wheel should move three rows, not jump off the line"
+        );
     }
 
     #[test]

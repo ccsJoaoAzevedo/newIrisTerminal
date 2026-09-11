@@ -22,6 +22,7 @@ use crate::ui::panels::WARNING;
 const RESERVED: &[(&str, Key)] = &[
     ("Ctrl+T", Key::T),
     ("Ctrl+W", Key::W),
+    ("Ctrl+F", Key::F),
     ("Ctrl+Tab", Key::Tab),
     ("Ctrl+Plus", Key::Plus),
     ("Ctrl+Equals", Key::Equals),

@@ -373,6 +373,10 @@ pub struct Tab {
 
 /// Source of [`Tab::uid`]. Never reused, so a closed tab's id cannot collide
 /// with a later one and resurrect its focus or selection state.
+/// How wide the find bar is, so it can be floated against the right edge of the
+/// terminal the way an editor puts one.
+const FIND_BAR_WIDTH: f32 = 460.0;
+
 static NEXT_TAB_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// What makes `program` clear its own screen, for [`Tab::request_clear`].
@@ -780,6 +784,17 @@ fn cursor_bytes(columns: i64, app_cursor: bool) -> Vec<u8> {
 /// `None` unless the whole selection sits inside the line being typed: a
 /// selection that reaches into the scrollback is highlighted text, and there is
 /// nothing in IRIS's read buffer that corresponds to it.
+/// The one character `text` holds, or `None` if it holds anything else.
+///
+/// A frame's worth of typing is usually one keystroke, but it need not be: two
+/// characters can land in the same frame, and an input method commits whole
+/// words. Only a lone character can be the one that asked to wrap a selection.
+fn one_char(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    chars.next().is_none().then_some(first)
+}
+
 fn selection_in_line(tab: &Tab, line: crate::term::LineEdit) -> Option<(usize, usize)> {
     let at = tab.grid.scrollback.len() + tab.grid.cursor.row;
     let (from, to) = tab.view.selection?.span_on(at)?;
@@ -945,8 +960,17 @@ impl App {
             });
 
         // Read before `settings` is moved into the app.
+        let mut restore = settings.restored_settings_placement();
+        // Same rule as the main window in `crate::run`: a position saved on a
+        // monitor that is no longer attached is dropped, and the window opens
+        // in the middle of the main one instead. The Settings window is the
+        // worse half of that bug - there is no taskbar entry to drag it back
+        // by, so an unreachable one cannot be closed either.
+        restore.position = restore
+            .position
+            .filter(|position| crate::ui::monitors::reachable(*position, restore.size));
         let settings_placement = crate::ui::detach::Placement {
-            restore: settings.restored_settings_placement(),
+            restore,
             seen: crate::ui::detach::Geometry::default(),
         };
 
@@ -1259,6 +1283,74 @@ impl App {
         }
     }
 
+    /// The view of the pane the keyboard is in, which is where a find bar
+    /// belongs: a search is made in one transcript, not in all of them.
+    fn focused_view(&self) -> Option<&terminal_view::ViewState> {
+        let tab = self.tabs.get(self.active)?;
+        Some(&tab.pane(tab.focus)?.view)
+    }
+
+    fn focused_view_mut(&mut self) -> Option<&mut terminal_view::ViewState> {
+        let tab = self.tabs.get_mut(self.active)?;
+        let focus = tab.focus;
+        Some(&mut tab.pane_mut(focus)?.view)
+    }
+
+    /// Draws the find bar over the terminal, when there is one to draw.
+    ///
+    /// Floated over the output rather than given a strip of the window: a strip
+    /// would take rows away from the grid, and changing the grid's height
+    /// resizes the pseudoconsole and makes IRIS repaint - so opening the find
+    /// bar would disturb the very screen it was opened to read.
+    fn find_bar(&mut self, ctx: &Context, theme: &Theme, over: egui::Rect) {
+        let active = self.active;
+        let Some(tab) = self.tabs.get_mut(active) else {
+            return;
+        };
+        let focus = tab.focus;
+        let Some(pane) = tab.pane_mut(focus) else {
+            return;
+        };
+        if !pane.view.search.open {
+            return;
+        }
+
+        // Against this frame's grid, so the hits the bar counts are the hits
+        // the terminal has just drawn. Skipped when nothing has changed - see
+        // `Search::refresh`.
+        let search = &mut pane.view.search;
+        search.refresh(&pane.grid);
+
+        let mut action = None;
+        egui::Area::new(egui::Id::new(("nit-find", active)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(
+                (over.right() - FIND_BAR_WIDTH).max(over.left()),
+                over.top() + 6.0,
+            ))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(theme.background)
+                    .show(ui, |ui| {
+                        action = crate::ui::search::bar(ui, search, theme);
+                    });
+            });
+
+        match action {
+            Some(crate::ui::search::Action::Close) => pane.view.search.close(),
+            Some(crate::ui::search::Action::Reveal) => {
+                if let Some(hit) = pane.view.search.current_match() {
+                    pane.view.reveal = Some((hit.line, hit.from));
+                }
+            }
+            None => {}
+        }
+        // The bar is drawn after the grid it highlights, so a query typed this
+        // frame is only painted over the output on the next one. An idle
+        // terminal draws no frame of its own, so one has to be asked for.
+        ctx.request_repaint();
+    }
+
     /// Whether the active terminal currently owns the keyboard.
     ///
     /// Macro shortcuts are gated on this. `Ctrl+Shift+G` is a shortcut when
@@ -1336,6 +1428,32 @@ impl App {
         // gesture that is meant to destroy the transcript. Gated on the
         // terminal having focus so it stays "delete word" in a text field.
         let terminal_focus = self.terminal_has_focus(ctx);
+
+        // Ctrl+F searches this tab's transcript. Taken while the terminal has
+        // focus and also while the find bar already has it, because Ctrl+F in
+        // an editor starts a fresh search rather than doing nothing the second
+        // time - and no text field the app has uses the chord for anything.
+        let find_open = self.focused_view().is_some_and(|view| view.search.open);
+        if (terminal_focus || find_open) && consume_exact(ctx, cmd, Key::F) {
+            if let Some(view) = self.focused_view_mut() {
+                view.search.open();
+            }
+        }
+        // F3 walks the hits without going back to the bar first, which is the
+        // other half of how every editor does this. Only once a search has been
+        // opened: F3 on its own is a key IRIS is entitled to.
+        if find_open {
+            let forward = consume_exact(ctx, Modifiers::NONE, Key::F3);
+            let back = consume_exact(ctx, Modifiers::SHIFT, Key::F3);
+            if forward || back {
+                if let Some(view) = self.focused_view_mut() {
+                    view.search.step(forward);
+                    if let Some(hit) = view.search.current_match() {
+                        view.reveal = Some((hit.line, hit.from));
+                    }
+                }
+            }
+        }
         if terminal_focus && consume_exact(ctx, Modifiers::CTRL, Key::Delete) {
             self.clear_active_terminal();
         }
@@ -2615,6 +2733,60 @@ impl App {
         self.move_cursor(at, columns);
     }
 
+    /// Wraps the selected part of the command line in `open` and its closing
+    /// character, leaving the same text selected.
+    ///
+    /// The whole line is rewritten rather than the two characters inserted in
+    /// place. Inserting would mean trusting IRIS to be in insert rather than
+    /// replace mode, which it never reports - see `Grid::insert_mode` - and
+    /// getting that wrong would silently eat the two characters either side of
+    /// the selection. Retyping the line is the same thing `App::recall` does
+    /// and needs no such guess.
+    ///
+    /// Answers whether it happened, so the caller knows not to also type the
+    /// character that asked for it.
+    fn surround_selection(&mut self, at: At, open: char) -> bool {
+        let Some(tab) = self.pane(at) else {
+            return false;
+        };
+        let Some(line) = lineedit::current(&tab.grid) else {
+            return false;
+        };
+        let Some((from, to)) = selection_in_line(tab, line) else {
+            return false;
+        };
+        let Some(text) = lineedit::typed_text(&tab.grid) else {
+            return false;
+        };
+        let Some((wrapped, span)) = input::surround(&text, line.start, from, to, open) else {
+            return false;
+        };
+        let app_cursor = tab.grid.app_cursor_keys;
+        let encoding = tab.profile.wire_encoding();
+        let row = tab.grid.scrollback.len() + tab.grid.cursor.row;
+
+        // To the end of the line, rub the whole of it out, then type it back
+        // with the pair in place - one write, so the line is never half-way
+        // between the two versions.
+        let mut wire = cursor_bytes(line.end as i64 - line.cursor as i64, app_cursor);
+        wire.extend(std::iter::repeat_n(0x7f, line.len()));
+        wire.extend_from_slice(&encoding.encode(&wrapped));
+        let wire = self.plugins.on_input(&wire);
+
+        if let Some(tab) = self.pane_mut(at) {
+            tab.send(&wire);
+            // The same characters, one column further right, so typing a second
+            // quote or bracket wraps what is already wrapped.
+            tab.view.selection = Some(crate::ui::terminal_view::Selection {
+                start: (row, span.0),
+                end: (row, span.1),
+            });
+            tab.recall_step = None;
+            tab.view.scroll_to_bottom();
+        }
+        true
+    }
+
     /// Rubs the selected part of the command line out of IRIS's read buffer.
     ///
     /// Rubout erases the character *before* the cursor, so the cursor is walked
@@ -2799,7 +2971,7 @@ impl App {
         if self.pane(at).is_some_and(|tab| tab.profile.is_shell()) {
             opts.syntax = false;
             // A shell draws to the width it is told, so telling it the grid's
-            // 16384 columns makes every full-screen program lay itself out
+            // full margin makes every full-screen program lay itself out
             // that wide and then wrap into screenfuls of padding. Only IRIS,
             // which truncates instead of drawing, needs the wide margin.
             opts.wide_grid = false;
@@ -2983,10 +3155,29 @@ impl App {
                 tab.view.clear_selection();
             }
         }
-        // A selection inside the command line behaves the way one in a text
-        // field does: an erase key takes it out, and so does typing or pasting
-        // over it, before the new text goes in behind it.
-        let replaced = input_ctx.selected_span.is_some() && !action.select_line && {
+        // A quote or an opening bracket typed over a selection wraps it rather
+        // than replacing it, the way an editor does - so picking a global name
+        // off the screen and quoting it is one keystroke. Only a single
+        // character typed on its own: a paste is a replacement whatever it
+        // happens to start with.
+        let surrounded = self.settings.surround_selection
+            && input_ctx.selected_span.is_some()
+            && !action.select_line
+            && action.paste.is_none()
+            && one_char(&action.text)
+                .and_then(input::surround_pair)
+                .is_some()
+            && self.surround_selection(at, one_char(&action.text).unwrap_or(' '));
+        if surrounded {
+            // The line has been rewritten and the selection moved with it; the
+            // character that asked for it must not also be typed.
+            action.text.clear();
+        }
+
+        // A selection inside the command line otherwise behaves the way one in
+        // a text field does: an erase key takes it out, and so does typing or
+        // pasting over it, before the new text goes in behind it.
+        let replaced = !surrounded && input_ctx.selected_span.is_some() && !action.select_line && {
             !action.text.is_empty() || action.paste.is_some()
         };
         if action.erase_selection || replaced {
@@ -3324,6 +3515,9 @@ impl eframe::App for App {
             });
         }
 
+        // Where the find bar floats, filled in once the central panel knows how
+        // much room it has.
+        let mut terminal_rect = egui::Rect::NOTHING;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -3331,6 +3525,7 @@ impl eframe::App for App {
                     .inner_margin(self.terminal_inset()),
             )
             .show(ctx, |ui| {
+                terminal_rect = ui.max_rect();
                 if self.tabs.is_empty() {
                     let mut open = false;
                     ui.centered_and_justified(|ui| {
@@ -3486,6 +3681,8 @@ impl eframe::App for App {
                     }
                 }
             });
+
+        self.find_bar(ctx, &theme, terminal_rect);
 
         // The panes have finished drawing, so the tabs can move again.
         if let Some(asked) = self.pending_layout.take() {

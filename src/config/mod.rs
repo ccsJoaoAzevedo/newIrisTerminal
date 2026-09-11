@@ -177,6 +177,17 @@ pub struct Settings {
     /// mid-line - which is what to turn off if the cursor being back in the
     /// middle of a line means you were editing it rather than done with it.
     pub recall_mid_line: bool,
+    /// Typing a quote or an opening bracket over a selection wraps the
+    /// selection in it instead of replacing it, the way an editor does.
+    ///
+    /// Off, the selection is replaced by the character typed, which is what a
+    /// plain text field does and what this app did before. On is the editor
+    /// behaviour: selecting a global name and pressing `"` quotes it.
+    ///
+    /// Only ever applies to a selection that lies inside the line being typed -
+    /// see `selection_in_line`. A selection in the scrollback is highlighted
+    /// text and nothing else, so typing over it is not an edit of anything.
+    pub surround_selection: bool,
     /// Keep the commands typed at an IRIS prompt in a file, so Up recalls what
     /// was typed in earlier sessions and not only in this one.
     ///
@@ -298,6 +309,7 @@ impl Default for Settings {
             status_timeout_secs: 8,
             copy_on_select: true,
             recall_mid_line: true,
+            surround_selection: true,
             save_command_history: true,
             show_pid: true,
             show_namespace_in_tab: true,

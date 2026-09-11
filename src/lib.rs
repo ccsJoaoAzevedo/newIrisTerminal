@@ -70,7 +70,14 @@ pub fn run() -> eframe::Result<()> {
         let (cols, rows) = settings.default_geometry();
         estimated_inner_size(&settings, cols, rows)
     });
-    let position = settings.restored_window_position();
+    // Dropped when it no longer lands on a monitor that is attached: a window
+    // closed on a second screen would otherwise reopen where that screen used to
+    // be, and on a laptop on its own that is a window with no way to reach it -
+    // nor, since it is saved the same way, the Settings window. `centered`
+    // below then takes over, which is what the setting being off already does.
+    let position = settings
+        .restored_window_position()
+        .filter(|position| ui::monitors::reachable(*position, settings.restored_window_size()));
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(inner_size)

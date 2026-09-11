@@ -31,7 +31,12 @@ Built in Rust with egui. Interface in English and Brazilian Portuguese.
 * **Line editing at the prompt:** Home/End, Ctrl+Left/Right by word, click to
   place the cursor, Ctrl+A to select, double-click for a word, triple-click for
   a line. Built entirely from keys IRIS acts on, since IRIS owns the read
-  buffer.
+  buffer. Typing `"`, `'`, `(`, `[` or `{` over a selection wraps it in the pair
+  instead of replacing it, the way an editor does — so a global name picked off
+  the screen is quoted in one keystroke.
+* **Find in the transcript:** Ctrl+F searches everything the session has
+  printed, scrollback included. Enter and Shift+Enter — or F3 — walk the hits,
+  every one is highlighted, and the view scrolls to the one being looked at.
 * **Command history that outlives the session:** Up offers a tab the commands
   typed at its own prompt first, then the ones earlier runs left behind. Lines a
   macro sent are never offered back.

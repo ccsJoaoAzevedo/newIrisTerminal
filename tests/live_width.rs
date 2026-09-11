@@ -178,6 +178,72 @@ fn a_command_far_longer_than_the_window_is_accepted_and_echoed_whole() {
     );
 }
 
+/// What the margin actually buys, measured rather than assumed.
+///
+/// A `Write` far longer than the margin arrives as exactly `cols` characters
+/// and the rest is discarded - not wrapped, not delayed, gone before it is
+/// sent. Measured at 120 columns and at [`TERMINAL_COLS`] against a real
+/// instance: each gives back its own width to the character.
+///
+/// This is the whole reason the margin is as wide as the console will take it.
+/// It is also the answer to "why does a million-character line stop": it stops
+/// at the margin, and no setting on this side can recover a tail that IRIS
+/// never wrote. A session that needs more has to break the line itself.
+#[test]
+#[ignore = "needs a local IRIS instance"]
+fn a_write_past_the_margin_is_cut_at_the_margin_and_the_rest_discarded() {
+    // Narrow, so the cut is reached in a fraction of the time and the number
+    // it is cut at is unmistakably the margin rather than a buffer somewhere.
+    const NARROW: u16 = 120;
+    let instance = std::env::var("IRIS_TEST_INSTANCE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| launcher().discover().into_iter().next().map(|i| i.name))
+        .expect("no IRIS instance found");
+    let spec = LaunchSpec {
+        instance,
+        ..LaunchSpec::default()
+    };
+    let session =
+        PtySession::spawn(launcher().as_ref(), &spec, NARROW, 24).expect("spawning a session");
+    let mut live = Live {
+        session,
+        grid: Grid::new(NARROW as usize, 24, 500),
+        vte: vte::Parser::new(),
+        raw: Vec::new(),
+    };
+    assert!(
+        live.wait_for(">", Duration::from_secs(20)),
+        "never reached a prompt"
+    );
+
+    // Twenty thousand characters asked for on a 120-column line, written a
+    // thousand at a time so nothing here needs long strings.
+    live.raw.clear();
+    live.send_line(
+        "set c=$TRANSLATE($JUSTIFY(\"\",1000),\" \",\"X\") for i=1:1:20 { write c } write !,\"[[E\"_\"ND]]\"",
+    );
+    assert!(
+        live.wait_for("[[END]]", Duration::from_secs(30)),
+        "the command never finished"
+    );
+
+    let text = String::from_utf8_lossy(&live.raw).to_string();
+    let longest = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .collect::<String>()
+        .split(|c| c != 'X')
+        .map(|run| run.len())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        longest, NARROW as usize,
+        "a line is cut at the margin, exactly: 20000 characters were asked for \
+         on a {NARROW}-column terminal and {longest} arrived"
+    );
+}
+
 /// The app does not open a session at its final size: a tab is spawned at a
 /// fallback geometry and resized to the real one on the first frame. A width a
 /// session can be *spawned* at therefore says nothing about a width it can be
