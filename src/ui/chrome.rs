@@ -25,7 +25,7 @@ use crate::ui::shading::{darken, gloss, gradient, lighten, radial, white};
 /// be clicked at all - the pointer turned into a resize arrow and a drag
 /// resized the window instead of selecting the text. Three is still a band the
 /// mouse finds, and it is held clear of the terminal twice over: by the inset
-/// in [`crate::app::App::terminal_inset`], and by `keep_out` below.
+/// in `App::terminal_inset`, and by `keep_out` below.
 pub const RESIZE_GRAB: f32 = 3.0;
 
 /// Which control to draw.
@@ -439,7 +439,7 @@ pub fn leading_window_buttons(
 /// are then no controls of the app's for it to sit beside, and it is still the
 /// only way into Settings.
 ///
-/// See [`settings_toggle`] for what it does.
+/// See `settings_toggle` for what it does.
 ///
 /// A toggle rather than a button because that is what it replaced: clicking the
 /// control that opened a window is how everyone expects to close it again, and

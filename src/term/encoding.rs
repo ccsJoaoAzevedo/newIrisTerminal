@@ -192,7 +192,7 @@ impl Encoding {
 
 /// Lenient on the way in, exact on the way out.
 ///
-/// See [`Encoding::from_name`]: a name this build does not have loads as the
+/// See `Encoding::from_name`: a name this build does not have loads as the
 /// default and is written back as the default the next time the settings are
 /// saved, which is what retires `cp850-doubled` from the profiles that still
 /// carry it.

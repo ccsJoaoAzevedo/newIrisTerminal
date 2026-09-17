@@ -472,7 +472,7 @@ impl Grid {
         }
     }
 
-    /// Widest line printed so far, in columns. See [`Grid::widest`].
+    /// Widest line printed so far, in columns. See `Grid::widest`.
     pub fn widest_line(&self) -> usize {
         self.widest
     }

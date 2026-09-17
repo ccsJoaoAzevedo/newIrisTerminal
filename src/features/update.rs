@@ -15,7 +15,7 @@
 //! assets from a host of their own, and a Squid with per-host rules will answer
 //! `407` for that one and pass `api.github.com` anonymously. That is why there
 //! is a proxy user in the settings and a password in the credential store —
-//! see [`proxy_credentials`] — and why a refusal now says which of the two it
+//! see `proxy_credentials` — and why a refusal now says which of the two it
 //! was. Only Basic authentication: neither `ureq` nor the `curl.exe` Windows
 //! ships can do NTLM, so a proxy that insists on it is one the app cannot get
 //! past, and the dialog offers the browser instead.
@@ -230,7 +230,7 @@ fn proxy_user() -> String {
 /// Read rather than configured: the machines this runs on are handed their
 /// proxy by policy, and a second place to configure it is a second place for it
 /// to be wrong. The *credentials* are configured, because there is nowhere to
-/// read those from - see [`proxy_credentials`].
+/// read those from - see `proxy_credentials`.
 pub fn system_proxy() -> Option<String> {
     for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
         if let Ok(value) = std::env::var(key) {

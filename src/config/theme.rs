@@ -441,7 +441,7 @@ fn yes() -> bool {
 }
 
 /// Everything empty and nothing claimed. Only useful as the base of a struct
-/// update — [`with_syntax`] and the tests — never as a theme in its own right.
+/// update — `with_syntax` and the tests — never as a theme in its own right.
 impl Default for ThemeFile {
     fn default() -> Self {
         ThemeFile {

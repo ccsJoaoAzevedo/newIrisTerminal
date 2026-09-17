@@ -516,7 +516,7 @@ const RETIRED_SAMPLES: [&str; 1] = [r#"<?xml version="1.0" encoding="utf-8"?>
 /// still exactly as shipped.
 ///
 /// Called before loading. A file the user has touched is never rewritten - see
-/// [`RETIRED_SAMPLES`].
+/// `RETIRED_SAMPLES`.
 pub fn ensure_personal_file(path: &Path) {
     match std::fs::read_to_string(path) {
         Ok(text) => {

@@ -53,7 +53,7 @@ pub struct Placement {
 ///
 /// The window opens at whatever `placement` restores, then in the middle of the
 /// main one, and after that wherever it was last dragged to - see
-/// [`opening_position`]. A caller with nothing to remember passes `None` and
+/// `opening_position`. A caller with nothing to remember passes `None` and
 /// gets the last two.
 #[allow(clippy::too_many_arguments)]
 pub fn shell(

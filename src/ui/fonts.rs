@@ -45,6 +45,21 @@ pub fn monospace_families() -> Vec<String> {
     names
 }
 
+/// Bumped every time the terminal font is replaced.
+///
+/// `FontFamily::Monospace` is redefined by each install, so the same [`FontId`]
+/// can mean a different face before and after one. Anything caching per-glyph
+/// work has to be able to tell that apart, and the [`FontId`] alone cannot.
+///
+/// [`FontId`]: egui::FontId
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Which set of faces is installed right now. Only ever compared, never read
+/// for meaning.
+pub fn generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Registers `family` as the terminal font, returning whether it worked.
 ///
 /// An empty name means "egui's bundled monospace", which is always available
@@ -54,6 +69,7 @@ pub fn monospace_families() -> Vec<String> {
 pub fn install(ctx: &Context, family: &str) -> bool {
     if family.is_empty() || family == "monospace" {
         ctx.set_fonts(FontDefinitions::default());
+        GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
 
@@ -88,6 +104,7 @@ pub fn install(ctx: &Context, family: &str) -> bool {
         .insert(0, TERMINAL_FONT.to_owned());
 
     ctx.set_fonts(defs);
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
 

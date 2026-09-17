@@ -485,6 +485,7 @@ fn spawn_reader(
                             // Receiver dropped — the tab is gone.
                             return;
                         }
+                        crate::pty::wake();
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
@@ -492,6 +493,7 @@ fn spawn_reader(
             }
             closed.store(true, Ordering::Relaxed);
             let _ = tx.send(SessionEvent::Closed);
+            crate::pty::wake();
         })
         .expect("spawning the PTY reader thread");
 }

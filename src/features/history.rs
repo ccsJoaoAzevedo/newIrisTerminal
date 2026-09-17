@@ -176,6 +176,24 @@ pub fn push_recent(entries: &mut Vec<String>, command: &str) -> bool {
     true
 }
 
+/// Splits a sanitised paste into the commands it is about to submit.
+///
+/// A paste carrying line breaks presses Enter for the user, once per break.
+/// The text before the first break finishes the line already on the prompt, so
+/// it comes back on its own - the caller has to read the screen to complete
+/// it. Every break after that ends a whole command. Whatever follows the last
+/// break is not submitted at all: it sits on the line waiting for an Enter the
+/// user has yet to press, so it is left out here and recorded then.
+///
+/// `None` when the paste has no break in it, which submits nothing.
+pub fn pasted_commands(text: &str) -> Option<(&str, Vec<&str>)> {
+    let (first, rest) = text.split_once('\r')?;
+    let mut whole: Vec<&str> = rest.split('\r').collect();
+    // The tail after the final break, submitted only by a later Enter.
+    whole.pop();
+    Some((first, whole))
+}
+
 /// Where Up lands, one step back from `at` through `len` candidates.
 ///
 /// `Some(Some(step))` is a command to put on the line and `Some(None)` the line
@@ -195,6 +213,32 @@ pub fn step_forward(at: Option<usize>) -> Option<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paste_without_a_break_submits_nothing() {
+        assert!(pasted_commands("write 1").is_none());
+    }
+
+    #[test]
+    fn the_text_before_the_first_break_completes_the_line_on_screen() {
+        let (first, rest) = pasted_commands("bc\rw 2\r").expect("a break submits");
+        assert_eq!(first, "bc");
+        assert_eq!(rest, vec!["w 2"]);
+    }
+
+    #[test]
+    fn three_pasted_lines_submit_three_commands() {
+        let (first, rest) = pasted_commands("w 1\rw 2\rw 3\r").expect("a break submits");
+        assert_eq!(first, "w 1");
+        assert_eq!(rest, vec!["w 2", "w 3"]);
+    }
+
+    #[test]
+    fn an_unterminated_last_line_waits_for_its_own_enter() {
+        let (first, rest) = pasted_commands("w 1\rw 2\rw 3").expect("a break submits");
+        assert_eq!(first, "w 1");
+        assert_eq!(rest, vec!["w 2"]);
+    }
 
     fn tempdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nit-history-{tag}-{}", std::process::id()));

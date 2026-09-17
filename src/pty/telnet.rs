@@ -463,10 +463,11 @@ impl TelnetSession {
                                 }
                                 // A chunk that was pure protocol is not silence:
                                 // sending it would only wake the UI for nothing.
-                                if !decoded.data.is_empty()
-                                    && tx.send(SessionEvent::Output(decoded.data)).is_err()
-                                {
-                                    return;
+                                if !decoded.data.is_empty() {
+                                    if tx.send(SessionEvent::Output(decoded.data)).is_err() {
+                                        return;
+                                    }
+                                    crate::pty::wake();
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -475,6 +476,7 @@ impl TelnetSession {
                     }
                     closed.store(true, Ordering::Relaxed);
                     let _ = tx.send(SessionEvent::Closed);
+                    crate::pty::wake();
                 })
                 .context("spawning the Telnet reader thread")?;
         }
