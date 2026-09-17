@@ -4,11 +4,7 @@ A terminal emulator for InterSystems IRIS — Windows, Linux and macOS.
 
 ## 📖 Overview
 
-**newIrisTerminal** drives IRIS sessions through a real pseudo-terminal, so
-full-screen routines such as `^%G` page correctly instead of being flattened
-into line-oriented output.
-
-Built in Rust with egui. Interface in English and Brazilian Portuguese.
+**newIrisTerminal** drives IRIS sessions through a real pseudo-terminal. Built in Rust with egui. Interface in English and Brazilian Portuguese.
 
 ## ✨ Highlights
 
