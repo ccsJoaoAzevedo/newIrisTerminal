@@ -45,6 +45,21 @@ pub struct InputContext {
     /// The session has asked for application cursor keys, so an arrow goes out
     /// as `ESC O A` rather than `ESC [ A`. See [`cursor_key`].
     pub app_cursor_keys: bool,
+    /// The session is a local shell rather than an IRIS one. Not derivable
+    /// from `line`: a shell never shows an IRIS prompt, so without this it is
+    /// indistinguishable from a routine painting its own screen.
+    pub shell: bool,
+}
+
+impl InputContext {
+    /// Who is reading what this terminal sends. See [`Reader`].
+    fn reader(&self) -> Reader {
+        match (self.shell, self.line) {
+            (true, _) => Reader::Shell,
+            (false, Some(line)) => Reader::IrisPrompt(line),
+            (false, None) => Reader::IrisRoutine,
+        }
+    }
 }
 
 /// Which way through the command history a key press asked to go.
@@ -95,11 +110,63 @@ fn motion_for(key: &Key, modifiers: &Modifiers) -> Option<(Motion, bool)> {
     Some((motion, modifiers.shift))
 }
 
+/// Who is reading the keystrokes on the far side.
+///
+/// The three readers want different bytes for the same key, and guessing from
+/// "is there an IRIS prompt on this row" alone is what sent a shell the wrong
+/// erase byte: a shell has no IRIS prompt either, and looked like a routine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reader {
+    /// IRIS's own line editor, at a prompt, reading the line it carries.
+    IrisPrompt(LineEdit),
+    /// An IRIS routine painting its own screen, reading raw keystrokes
+    /// through `RCar^%SMW` and matching them against the ERP's keyboard
+    /// table - see [`key_bytes`].
+    IrisRoutine,
+    /// A local shell. It does its own line editing everywhere, and speaks the
+    /// plain VT spellings a terminal is expected to send.
+    Shell,
+}
+
+impl Reader {
+    /// The command line, where the far side has one this terminal can read.
+    fn line(self) -> Option<LineEdit> {
+        match self {
+            Reader::IrisPrompt(line) => Some(line),
+            _ => None,
+        }
+    }
+
+    /// Whether the ERP's keyboard table is what will read these bytes, rather
+    /// than a terminal's own idea of what a key is spelled like.
+    fn erp(self) -> bool {
+        !matches!(self, Reader::Shell)
+    }
+}
+
 /// Bytes for a key press, or `None` when the key is not something we send.
 ///
-/// `line` is the command line under the cursor, when there is one; Home and End
-/// are built out of arrow keys against it, because IRIS does the line editing
-/// and does not act on the Home/End sequences a VT terminal sends.
+/// Most keys are spelled the same whoever is reading, because the xterm tilde
+/// forms and the ERP's own keyboard table agree on them. Four do not, and
+/// `reader` is what picks between them:
+///
+/// | key | IRIS | shell |
+/// | --- | --- | --- |
+/// | Backspace, off a prompt | `BS` | `DEL` |
+/// | Home | `ESC [ 1 ~` | `ESC [ H` |
+/// | End | `ESC [ 4 ~` | `ESC [ F` |
+/// | F5 | `ESC O T` | `ESC [ 1 5 ~` |
+///
+/// The IRIS column is `^%SM(301,"KeyTr")`, the table `RCar^%SMW` matches
+/// against for the device type the ERP's Telnet device is configured as
+/// ("Cache Terminal Versao 5.2"). A sequence that is not in it is not
+/// misread, it is not recognised at all - `RCar` hands back the bare `ESC`,
+/// which `%CSLE` treats as "leave the field", and the rest of the sequence
+/// arrives as typed text.
+///
+/// At an IRIS prompt Home and End are built out of arrow keys against the
+/// line instead, because IRIS does the line editing there and does not act on
+/// the Home/End sequences a VT terminal sends.
 ///
 /// `app_cursor` is DECCKM: with it set the far side expects `ESC O A` where it
 /// would otherwise expect `ESC [ A`, and the wrong one is not misread but
@@ -107,34 +174,51 @@ fn motion_for(key: &Key, modifiers: &Modifiers) -> Option<(Motion, bool)> {
 pub fn key_bytes(
     key: Key,
     modifiers: &Modifiers,
-    line: Option<LineEdit>,
+    reader: Reader,
     app_cursor: bool,
 ) -> Option<Vec<u8>> {
     // Application shortcuts are handled by the caller, not sent to IRIS.
     let ctrl = modifiers.ctrl;
+    let line = reader.line();
+
+    // DECCKM is honoured everywhere a terminal's own conventions hold. Inside
+    // an IRIS routine they do not: that keyboard table spells every arrow
+    // `ESC [ <letter>` and has no entry for the `ESC O` form at all, which is
+    // why the arrows went dead inside a routine on IRIS 2023 - the version
+    // that turns the mode on.
+    let app_cursor = app_cursor && reader != Reader::IrisRoutine;
 
     let bytes: Vec<u8> = match key {
         // IRIS expects CR for "line entered"; sending LF leaves it waiting.
         Key::Enter => vec![b'\r'],
         Key::Tab => vec![b'\t'],
         Key::Escape => vec![0x1b],
-        // DEL, not BS — this is what terminfo's kbs maps to and what IRIS
-        // erase handling expects.
-        Key::Backspace => vec![0x7f],
+        // DEL everywhere a line editor is reading, BS inside an IRIS routine.
+        // IRIS's own line editor erases on DEL, which is what terminfo's kbs
+        // maps to, and so does a shell - where BS is Ctrl+Backspace and rubs
+        // out the whole word. But the ERP's field editor erases on `%=8`
+        // alone (`%CSLE`), and 127 falls through its printable range
+        // (`%>31,%<128`) to be *inserted* as a character, so a backspace in a
+        // routine typed a stray glyph instead of rubbing one out.
+        Key::Backspace => match reader {
+            Reader::IrisRoutine => vec![0x08],
+            _ => vec![0x7f],
+        },
         Key::Delete => b"\x1b[3~".to_vec(),
         Key::Insert => b"\x1b[2~".to_vec(),
         // Walked to with arrow keys when we can see where the line begins and
-        // ends. `\x1b[H` and `\x1b[F` are kept for the case we cannot: they are
-        // what a VT terminal sends, and a full-screen routine may act on them.
+        // ends, and otherwise spelled the way whoever is reading expects.
         Key::Home => match line {
             Some(line) => {
                 cursor_key(app_cursor, b'D').repeat(line.cursor.saturating_sub(line.start))
             }
-            None => cursor_key(app_cursor, b'H'),
+            None if reader.erp() => b"\x1b[1~".to_vec(),
+            None => b"\x1b[H".to_vec(),
         },
         Key::End => match line {
             Some(line) => cursor_key(app_cursor, b'C').repeat(line.end.saturating_sub(line.cursor)),
-            None => cursor_key(app_cursor, b'F'),
+            None if reader.erp() => b"\x1b[4~".to_vec(),
+            None => b"\x1b[F".to_vec(),
         },
         Key::PageUp => b"\x1b[5~".to_vec(),
         Key::PageDown => b"\x1b[6~".to_vec(),
@@ -142,10 +226,16 @@ pub fn key_bytes(
         Key::ArrowDown => cursor_key(app_cursor, b'B'),
         Key::ArrowRight => cursor_key(app_cursor, b'C'),
         Key::ArrowLeft => cursor_key(app_cursor, b'D'),
+        // F1-F4 are the PF keys (`ESC O <letter>`) and F6 up are the xterm
+        // tilde forms, which both worlds agree on. F5 is the one key of the
+        // twelve where they differ: `^%SM(301,"KeyTr")` carries the PF-key
+        // alphabet one letter further, where a terminal has already moved on
+        // to the tilde forms.
         Key::F1 => b"\x1bOP".to_vec(),
         Key::F2 => b"\x1bOQ".to_vec(),
         Key::F3 => b"\x1bOR".to_vec(),
         Key::F4 => b"\x1bOS".to_vec(),
+        Key::F5 if reader.erp() => b"\x1bOT".to_vec(),
         Key::F5 => b"\x1b[15~".to_vec(),
         Key::F6 => b"\x1b[17~".to_vec(),
         Key::F7 => b"\x1b[18~".to_vec(),
@@ -455,7 +545,7 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
                 if *key == Key::Enter {
                     action.submitted = Some(action.text.clone());
                 }
-                if let Some(bytes) = key_bytes(*key, modifiers, ctx.line, ctx.app_cursor_keys) {
+                if let Some(bytes) = key_bytes(*key, modifiers, ctx.reader(), ctx.app_cursor_keys) {
                     action.bytes.extend_from_slice(&bytes);
                 }
             }
@@ -626,15 +716,20 @@ mod tests {
     #[test]
     fn enter_sends_carriage_return_not_line_feed() {
         assert_eq!(
-            key_bytes(Key::Enter, &Modifiers::NONE, None, false),
+            key_bytes(Key::Enter, &Modifiers::NONE, Reader::IrisRoutine, false),
             Some(vec![b'\r'])
         );
     }
 
     #[test]
-    fn backspace_sends_del() {
+    fn backspace_sends_del_at_a_prompt() {
         assert_eq!(
-            key_bytes(Key::Backspace, &Modifiers::NONE, None, false),
+            key_bytes(
+                Key::Backspace,
+                &Modifiers::NONE,
+                Reader::IrisPrompt(line()),
+                false
+            ),
             Some(vec![0x7f])
         );
     }
@@ -642,7 +737,7 @@ mod tests {
     #[test]
     fn arrows_send_csi_sequences() {
         assert_eq!(
-            key_bytes(Key::ArrowUp, &Modifiers::NONE, None, false),
+            key_bytes(Key::ArrowUp, &Modifiers::NONE, Reader::IrisRoutine, false),
             Some(b"\x1b[A".to_vec())
         );
     }
@@ -653,9 +748,18 @@ mod tests {
             ctrl: true,
             ..Modifiers::NONE
         };
-        assert_eq!(key_bytes(Key::C, &ctrl, None, false), Some(vec![0x03]));
-        assert_eq!(key_bytes(Key::A, &ctrl, None, false), Some(vec![0x01]));
-        assert_eq!(key_bytes(Key::Z, &ctrl, None, false), Some(vec![0x1a]));
+        assert_eq!(
+            key_bytes(Key::C, &ctrl, Reader::IrisRoutine, false),
+            Some(vec![0x03])
+        );
+        assert_eq!(
+            key_bytes(Key::A, &ctrl, Reader::IrisRoutine, false),
+            Some(vec![0x01])
+        );
+        assert_eq!(
+            key_bytes(Key::Z, &ctrl, Reader::IrisRoutine, false),
+            Some(vec![0x1a])
+        );
     }
 
     /// IRIS does not act on the Home/End sequences, so they are walked with the
@@ -663,7 +767,12 @@ mod tests {
     #[test]
     fn home_walks_left_to_the_start_of_the_typed_line() {
         assert_eq!(
-            key_bytes(Key::Home, &Modifiers::NONE, Some(line()), false),
+            key_bytes(
+                Key::Home,
+                &Modifiers::NONE,
+                Reader::IrisPrompt(line()),
+                false
+            ),
             Some(b"\x1b[D".repeat(7))
         );
     }
@@ -675,7 +784,7 @@ mod tests {
             ..line()
         };
         assert_eq!(
-            key_bytes(Key::End, &Modifiers::NONE, Some(mid), false),
+            key_bytes(Key::End, &Modifiers::NONE, Reader::IrisPrompt(mid), false),
             Some(b"\x1b[C".repeat(4))
         );
     }
@@ -688,26 +797,38 @@ mod tests {
             ..line()
         };
         assert_eq!(
-            key_bytes(Key::Home, &Modifiers::NONE, Some(start), false),
+            key_bytes(
+                Key::Home,
+                &Modifiers::NONE,
+                Reader::IrisPrompt(start),
+                false
+            ),
             Some(Vec::new())
         );
         assert_eq!(
-            key_bytes(Key::End, &Modifiers::NONE, Some(line()), false),
+            key_bytes(
+                Key::End,
+                &Modifiers::NONE,
+                Reader::IrisPrompt(line()),
+                false
+            ),
             Some(Vec::new())
         );
     }
 
-    /// Off a command line they keep the sequences a VT terminal sends, because
-    /// a full-screen routine may be the thing acting on them.
+    /// Off a command line they go out in the tilde spelling
+    /// `^%SM(301,"KeyTr")` lists, not the `ESC [ H` / `ESC [ F` a VT terminal
+    /// sends: that table has no entry for those, so they reach a routine's
+    /// `RCar` read as nothing at all.
     #[test]
-    fn home_and_end_fall_back_to_the_vt_sequences_off_a_command_line() {
+    fn home_and_end_use_the_tilde_spelling_off_a_command_line() {
         assert_eq!(
-            key_bytes(Key::Home, &Modifiers::NONE, None, false),
-            Some(b"\x1b[H".to_vec())
+            key_bytes(Key::Home, &Modifiers::NONE, Reader::IrisRoutine, false),
+            Some(b"\x1b[1~".to_vec())
         );
         assert_eq!(
-            key_bytes(Key::End, &Modifiers::NONE, None, false),
-            Some(b"\x1b[F".to_vec())
+            key_bytes(Key::End, &Modifiers::NONE, Reader::IrisRoutine, false),
+            Some(b"\x1b[4~".to_vec())
         );
     }
 
@@ -727,6 +848,109 @@ mod tests {
     #[test]
     fn an_ordinary_key_does_not_touch_the_insert_state() {
         assert!(!translate(&[press(Key::Home)], &ctx()).toggle_insert);
+    }
+
+    /// The function keys as `^%SM(301,"KeyTr")` spells them: PF keys through
+    /// F5, tilde forms from F6 on. F5 is the one a generic terminal gets
+    /// wrong, so it is the one worth pinning.
+    #[test]
+    fn the_function_keys_break_from_pf_to_tilde_form_after_f5() {
+        assert_eq!(
+            key_bytes(Key::F5, &Modifiers::NONE, Reader::IrisRoutine, false),
+            Some(b"\x1bOT".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::F6, &Modifiers::NONE, Reader::IrisRoutine, false),
+            Some(b"\x1b[17~".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::F12, &Modifiers::NONE, Reader::IrisRoutine, false),
+            Some(b"\x1b[24~".to_vec())
+        );
+    }
+
+    /// A shell has no IRIS prompt either, so before [`Reader`] existed it was
+    /// indistinguishable from a routine and got the routine's bytes. BS is
+    /// Ctrl+Backspace to a Windows shell, so every backspace rubbed out the
+    /// whole word; Home, End and F5 were the ERP's spellings, which a shell
+    /// does not recognise.
+    #[test]
+    fn a_shell_gets_the_plain_vt_spellings_a_terminal_is_expected_to_send() {
+        let shell = |key| key_bytes(key, &Modifiers::NONE, Reader::Shell, false);
+        assert_eq!(shell(Key::Backspace), Some(vec![0x7f]));
+        assert_eq!(shell(Key::Home), Some(b"[H".to_vec()));
+        assert_eq!(shell(Key::End), Some(b"[F".to_vec()));
+        assert_eq!(shell(Key::F5), Some(b"[15~".to_vec()));
+    }
+
+    /// The tilde forms the two worlds agree on stay the same either way, so a
+    /// reader that only ever saw one of them still works.
+    #[test]
+    fn the_keys_both_worlds_spell_alike_do_not_depend_on_the_reader() {
+        for key in [
+            Key::Delete,
+            Key::Insert,
+            Key::PageUp,
+            Key::PageDown,
+            Key::F6,
+            Key::F12,
+        ] {
+            assert_eq!(
+                key_bytes(key, &Modifiers::NONE, Reader::Shell, false),
+                key_bytes(key, &Modifiers::NONE, Reader::IrisRoutine, false),
+                "{key:?} should not differ between readers"
+            );
+        }
+    }
+
+    /// DECCKM is a terminal convention, so a shell keeps it: only the ERP's
+    /// keyboard table, which has no `ESC O` arrow in it, has to be spared.
+    #[test]
+    fn a_shell_still_honours_application_cursor_mode() {
+        assert_eq!(
+            key_bytes(Key::ArrowUp, &Modifiers::NONE, Reader::Shell, true),
+            Some(b"OA".to_vec())
+        );
+    }
+
+    /// The ERP's own field editor erases on BS and treats DEL as a printable
+    /// character, so a backspace off a command line has to be BS - while at a
+    /// prompt, where IRIS reads the line itself, it stays DEL.
+    #[test]
+    fn backspace_is_del_at_a_prompt_and_bs_inside_a_routine() {
+        assert_eq!(
+            key_bytes(
+                Key::Backspace,
+                &Modifiers::NONE,
+                Reader::IrisPrompt(line()),
+                false
+            ),
+            Some(vec![0x7f])
+        );
+        assert_eq!(
+            key_bytes(Key::Backspace, &Modifiers::NONE, Reader::IrisRoutine, false),
+            Some(vec![0x08])
+        );
+    }
+
+    /// DECCKM only reaches the far side where IRIS is reading the line. A
+    /// routine's `RCar` matches against a table that has no `ESC O` arrow in
+    /// it, so off a prompt the ANSI spelling goes out whatever the mode says.
+    #[test]
+    fn an_arrow_ignores_application_cursor_mode_off_a_command_line() {
+        assert_eq!(
+            key_bytes(
+                Key::ArrowUp,
+                &Modifiers::NONE,
+                Reader::IrisPrompt(line()),
+                true
+            ),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::ArrowUp, &Modifiers::NONE, Reader::IrisRoutine, true),
+            Some(b"\x1b[A".to_vec())
+        );
     }
 
     #[test]
@@ -971,7 +1195,11 @@ mod tests {
     /// can be asked to erase.
     #[test]
     fn the_erase_keys_are_unchanged_without_a_selection_on_the_command_line() {
-        let action = translate(&[press(Key::Backspace)], &ctx());
+        let at_prompt = InputContext {
+            line: Some(line()),
+            ..InputContext::default()
+        };
+        let action = translate(&[press(Key::Backspace)], &at_prompt);
         assert!(!action.erase_selection);
         assert_eq!(action.bytes, vec![0x7f]);
     }
@@ -1064,6 +1292,8 @@ mod tests {
     fn application_cursor_keys_change_the_spelling_of_an_arrow() {
         let app = InputContext {
             app_cursor_keys: true,
+            // Only at a prompt does the mode mean anything - see `key_bytes`.
+            line: Some(line()),
             ..InputContext::default()
         };
         assert_eq!(

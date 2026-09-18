@@ -5,6 +5,8 @@
 //! shortcuts.
 //!
 //! - [`autologon`] watches the screen for a login prompt and answers it.
+//! - [`doc_lookup`] watches for a safe moment to ask a session what a
+//!   global's pieces mean, for the piece tooltip.
 //! - [`history`] remembers commands across runs; Up and Down walk it.
 //! - [`logging`] writes a session transcript, muted across a password.
 //! - [`export`] saves the screen or the scrollback as text or HTML.
@@ -15,6 +17,7 @@
 
 pub mod analyze;
 pub mod autologon;
+pub mod doc_lookup;
 pub mod export;
 pub mod history;
 pub mod logging;

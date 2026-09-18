@@ -135,19 +135,39 @@ impl App {
         }
     }
 
-    /// Puts the downloaded build in place and closes, so the copy that is
-    /// starting takes over.
+    /// Asks about a live session before installing, the way Alt+F4 does -
+    /// and asks *before*, not after: installing put the new copy on disk and
+    /// starting it, so asking afterward and having the user decline left that
+    /// copy already running beside a window that then refused to close.
     pub(super) fn apply_update(&mut self, ctx: &Context) {
+        if self.updates.staged.is_none() {
+            return;
+        }
+        if self.should_confirm_close() {
+            self.confirm_close = true;
+            self.pending_update = true;
+            return;
+        }
+        self.install_and_restart(ctx);
+    }
+
+    /// Puts the downloaded build in place and closes, so the copy that is
+    /// starting takes over. Called once nothing more needs asking - either
+    /// there was no live session to ask about, or [`close_confirm_dialog`]
+    /// just got its "close anyway".
+    ///
+    /// [`close_confirm_dialog`]: super::App::close_confirm_dialog
+    pub(super) fn install_and_restart(&mut self, ctx: &Context) {
         let Some(staged) = self.updates.staged.clone() else {
             return;
         };
         match update::install(&staged) {
             Ok(()) => {
-                // The new copy is already starting; this one has to go, and it
-                // goes the way Alt+F4 does so a live session is still asked
-                // about.
                 self.updates.available = None;
                 self.updates.staged = None;
+                // Already asked, or nothing to ask about - either way this
+                // close must not stop to ask again.
+                self.close_confirmed = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Err(e) => {

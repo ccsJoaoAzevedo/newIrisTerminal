@@ -20,6 +20,10 @@ pub struct Tab {
     pub parser: vte::Parser,
     pub view: ViewState,
     pub autologon: Autologon,
+    /// Live piece-structure lookups for the tooltip - see
+    /// [`crate::features::doc_lookup`]. Not reset by [`Tab::start`]: a
+    /// reconnect does not change what a global's pieces mean.
+    pub doc_lookup: DocLookup,
     pub log: Option<SessionLog>,
     /// User-set name; falls back to the OSC title, then the profile name.
     pub custom_title: Option<String>,
@@ -93,6 +97,7 @@ impl Tab {
         let mut tab = Tab {
             uid: NEXT_TAB_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             autologon: Autologon::new(&profile),
+            doc_lookup: DocLookup::default(),
             grid: Grid::new(cols as usize, rows as usize, settings.scrollback_limit),
             profile,
             session: None,
@@ -283,6 +288,10 @@ impl Tab {
 
     /// Pulls output, parses it, answers device reports, and runs autologon.
     pub fn pump(&mut self, plugins: &mut PluginHost) {
+        // The piece tooltip's own session, which is not this tab's and so is
+        // driven whether or not this tab still has one of its own.
+        self.doc_lookup.pump(&self.profile);
+
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -543,6 +552,7 @@ mod tests {
         Tab {
             uid: NEXT_TAB_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             autologon: Autologon::new(&profile),
+            doc_lookup: DocLookup::default(),
             grid: Grid::new(80, 24, 100),
             profile,
             session: None,

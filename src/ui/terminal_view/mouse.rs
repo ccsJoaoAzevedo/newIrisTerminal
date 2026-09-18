@@ -25,6 +25,36 @@ pub(super) fn column_at(x: f32, left: f32, cell_x: f32, view_cols: usize) -> usi
     (((x - left) / cell_x).floor().max(0.0) as usize).min(view_cols.saturating_sub(1))
 }
 
+/// A screen position's line and grid column, through the display layout: a
+/// display row is not a line any more once a line can wrap over several of
+/// them. `offset` is a column of the display row - from [`column_at`] or
+/// [`boundary_at`] - and `last` is the highest column to clamp to.
+///
+/// Shared with [`super::show`]'s hover check, so a piece tooltip and a drag
+/// agree on which cell the pointer is over.
+// One argument per piece of the layout a position is resolved against - the
+// same shape `handle_mouse` itself is stuck with, and for the same reason:
+// there is no grouping of these eight that is not just a struct wrapping the
+// same eight fields for one call site.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve(
+    pos: Pos2,
+    rect: Rect,
+    cell: Vec2,
+    top: wrap::Top,
+    mode: wrap::Mode,
+    segments: &[wrap::Segment],
+    offset: usize,
+    last: usize,
+) -> (usize, usize) {
+    let row = ((pos.y - rect.top()) / cell.y).floor().max(0.0) as usize;
+    match segments.get(row.min(segments.len().saturating_sub(1))) {
+        Some(segment) => (segment.line, (segment.start + offset).min(last)),
+        // Nothing laid out at all, which means an empty grid.
+        None => (top.line, (mode.offset + offset).min(last)),
+    }
+}
+
 /// The run of like characters under `col` on `line`, as a selection.
 ///
 /// The three runs a double-click can land on are a word, a stretch of blanks
@@ -107,26 +137,26 @@ pub(super) fn handle_mouse(
     // display row is not a line any more once a line can wrap over several of
     // them, so a selection dragged over a wrapped line has to resolve to the
     // columns it actually covers. `offset` is a column of the display row,
-    // which the segment turns into a line and a grid column.
-    let resolve = |pos: Pos2, offset: usize, last: usize| -> (usize, usize) {
-        let row = ((pos.y - rect.top()) / cell.y).floor().max(0.0) as usize;
-
-        match segments.get(row.min(segments.len().saturating_sub(1))) {
-            Some(segment) => (segment.line, (segment.start + offset).min(last)),
-            // Nothing laid out at all, which means an empty grid.
-            None => (top.line, (mode.offset + offset).min(last)),
-        }
-    };
+    // which [`resolve`] turns into a line and a grid column.
     // The cell under the pointer, for dragging out a selection.
     let pos_to_cell = |pos: Pos2| -> (usize, usize) {
         let offset = column_at(pos.x, rect.left(), cell.x, mode.view_cols);
-        resolve(pos, offset, grid.cols.saturating_sub(1))
+        resolve(
+            pos,
+            rect,
+            cell,
+            top,
+            mode,
+            segments,
+            offset,
+            grid.cols.saturating_sub(1),
+        )
     };
     // The gap between cells nearest the pointer, for putting a cursor there:
     // clicking the right half of a character means after it, as anywhere else.
     let pos_to_boundary = |pos: Pos2| -> (usize, usize) {
         let offset = boundary_at(pos.x, rect.left(), cell.x, mode.view_cols);
-        resolve(pos, offset, grid.cols)
+        resolve(pos, rect, cell, top, mode, segments, offset, grid.cols)
     };
 
     // Double-click takes the word under the pointer and triple-click the whole

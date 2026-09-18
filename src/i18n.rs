@@ -530,6 +530,17 @@ const PT_BR: &[(&str, &str)] = &[
     ("A copy of {} that you can edit.", "Uma cópia de {} que você pode editar."),
     ("Show and apply {}", "Exibir e aplicar {}"),
     ("In use", "Em uso"),
+    // The piece tooltip. "Piece" is deliberately left untranslated in both
+    // languages: it is what `$PIECE` is called in ObjectScript and what the
+    // ERP's own `%CSWDOCGLOBAL` screen calls the column, so translating it
+    // would name the same thing two ways.
+    ("Looking up ^{}…", "Consultando ^{}…"),
+    ("Piece: {} - {}", "Piece: {} - {}"),
+    ("Piece: {}", "Piece: {}"),
+    ("Size: {}", "Tamanho: {}"),
+    ("Type: {}", "Tipo: {}"),
+    ("Formatted value: {}", "Valor formatado: {}"),
+    ("invalid value", "valor inválido"),
 ];
 
 #[cfg(test)]

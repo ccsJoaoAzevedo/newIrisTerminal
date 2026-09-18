@@ -257,9 +257,19 @@ impl App {
         if close_anyway {
             self.confirm_close = false;
             self.close_confirmed = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if self.pending_update {
+                // The install this was asked about, deferred from
+                // `apply_update` until now rather than done up front.
+                self.pending_update = false;
+                self.install_and_restart(ctx);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         } else if cancel || !open {
             self.confirm_close = false;
+            // Declined: leave the staged build alone so "Restart and update"
+            // is still there to press once the session is done with.
+            self.pending_update = false;
         }
     }
 

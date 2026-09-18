@@ -21,6 +21,7 @@ mod glyphs;
 mod menu;
 mod mouse;
 mod paint;
+mod pieces;
 mod scroll;
 
 // Back into one scope, which every one of those modules also sees through
@@ -32,6 +33,7 @@ pub use menu::ContextAction;
 use menu::{analyze_scopes, export_menu, macro_menu, natives_menu};
 use mouse::handle_mouse;
 use paint::{paint_row, syntax_overrides};
+pub use pieces::PieceSelection;
 use scroll::{autoscroll_lines, h_scrollbar, scroll_lines, scrollbar, SCROLLBAR_WIDTH};
 
 /// Everything about how the grid should be drawn that is not the grid itself.
@@ -366,6 +368,10 @@ pub struct RenderResult {
     /// Size of one character cell, in points. What the window has to be grown
     /// or shrunk by to gain or lose a column or a row.
     pub cell: Vec2,
+    /// The pointer is hovering a selection that is exactly one piece of a
+    /// global's value - the trigger for the documentation tooltip. Only ever
+    /// set alongside a real, non-empty selection; never speculative.
+    pub piece_hover: Option<PieceSelection>,
 }
 
 /// Draws the grid into the remaining space of `ui`.
@@ -553,6 +559,22 @@ pub fn show(
         total,
         &used,
     );
+
+    // The piece tooltip's trigger: the pointer sitting over the selection,
+    // and that selection being exactly one piece of a global's value. Read
+    // after `handle_mouse`, so a selection just finished this same frame is
+    // seen too.
+    let piece_hover = response
+        .hover_pos()
+        .and_then(|pos| {
+            let offset = mouse::column_at(pos.x, rect.left(), cell.x, mode.view_cols);
+            let last = grid.cols.saturating_sub(1);
+            let hovered = mouse::resolve(pos, rect, cell, top, mode, &segments, offset, last);
+            state
+                .selection
+                .filter(|sel| sel.contains(hovered.0, hovered.1))
+        })
+        .and_then(|selection| pieces::piece_at_selection(grid, &selection));
 
     // Where the cursor is, in grid coordinates, when it is visible and its cell
     // is one of the ones on screen.
@@ -914,6 +936,7 @@ pub fn show(
         view_cols,
         view_rows: rows,
         cell,
+        piece_hover,
     }
 }
 

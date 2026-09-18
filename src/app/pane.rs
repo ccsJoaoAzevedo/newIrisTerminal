@@ -88,16 +88,40 @@ impl App {
         // tab, and the menu is drawn from inside that - the list itself is
         // never written from there.
         let groups = std::mem::take(&mut self.macro_groups);
-        let (result, has_selection) = {
+        let (mut result, has_selection, tooltip) = {
             let Some(tab) = self.pane_mut(at) else {
                 self.macro_groups = groups;
                 return PaneMeasure::default();
             };
             let has_selection = tab.view.selection.map(|s| !s.is_empty()).unwrap_or(false);
             let result = draw_pane(ui, tab, theme, &opts, role, &groups);
-            (result, has_selection)
+            // Asked for here rather than where the hover was found: `request`
+            // needs the tab's session and namespace, which the terminal view
+            // has no reason to know about.
+            let tooltip = result.piece_hover.clone().map(|piece| {
+                let namespace = tab.namespace.clone().unwrap_or_default();
+                let lookup = tab.doc_lookup.request(&namespace, &piece.global);
+                (piece, lookup)
+            });
+            (result, has_selection, tooltip)
         };
         self.macro_groups = groups;
+        if let Some((piece, lookup)) = tooltip {
+            // A pending lookup is answered by a session of this pane's own,
+            // whose reader wakes the loop when it says something - but the
+            // steps in between (opening it, noticing it has reached a prompt)
+            // have nothing to schedule them, and an idle terminal asks for no
+            // frames at all. This is the only place that knows one is
+            // outstanding.
+            if lookup == Lookup::Pending {
+                ui.ctx().request_repaint_after(Duration::from_millis(150));
+            }
+            // Always something to say: the piece number is counted off the row
+            // itself and does not depend on IRIS having heard of the global.
+            result.response = result
+                .response
+                .on_hover_ui_at_pointer(|ui| piece_tooltip(ui, &piece, &lookup));
+        }
 
         // This pane's own session, sized to this pane: a pane is a window onto
         // one session, and telling IRIS about the whole split area would
@@ -218,6 +242,7 @@ impl App {
                 has_selection,
                 line,
                 app_cursor_keys: tab.grid.app_cursor_keys,
+                shell: tab.profile.shell.is_some(),
                 recall_mid_line: self.settings.recall_mid_line,
                 // This session's own commands, or anything an earlier run
                 // left behind. Not what another tab has typed since.
@@ -346,4 +371,77 @@ impl App {
         })
         .inner
     }
+}
+
+/// The piece tooltip's contents.
+///
+/// The piece number is always shown: it is counted off the row, and holds
+/// whether or not IRIS can say anything about the global. Everything else -
+/// the description, size, type and formatted value - needs a class that maps
+/// this global at this subscript shape, and plenty of globals have none.
+/// An undocumented global, one no map claims, and a piece a map leaves out
+/// all come out the same way, as the bare number, because from where the user
+/// is standing they are the same thing: nobody wrote this down.
+fn piece_tooltip(ui: &mut egui::Ui, piece: &terminal_view::PieceSelection, lookup: &Lookup) {
+    // A tooltip sizes itself to its contents, and a described piece's are one
+    // long line of prose per row, which egui left to itself wraps into a
+    // column a few characters wide. The minimum is the width that fits a
+    // description without shredding it and is set only where there is one -
+    // a bare `Piece: 1` in a 240px box is just an empty box. Anything longer
+    // than the maximum still wraps, which is what the maximum is for.
+    ui.set_max_width(460.0);
+
+    match lookup {
+        Lookup::Pending => {
+            ui.label(tr1("Looking up ^{}…", &piece.global));
+        }
+        Lookup::Ready(maps) => {
+            let Some(found) = describe_hover(maps, piece) else {
+                ui.label(tr1("Piece: {}", &piece.piece.to_string()));
+                return;
+            };
+            ui.set_min_width(240.0);
+            ui.label(tr2(
+                "Piece: {} - {}",
+                &found.info.label(),
+                &found.info.description,
+            ));
+            if !found.info.size.is_empty() {
+                ui.label(tr1("Size: {}", &found.info.size));
+            }
+            if !found.info.kind.is_empty() {
+                ui.label(tr1("Type: {}", &found.info.kind));
+            }
+            match doc_lookup::format_value(found.info, &found.raw) {
+                doc_lookup::Formatted::Value(formatted) => {
+                    ui.label(tr1("Formatted value: {}", &formatted));
+                }
+                doc_lookup::Formatted::Invalid => {
+                    ui.label(tr1("Formatted value: {}", tr("invalid value")));
+                }
+                doc_lookup::Formatted::Nothing => {}
+            }
+        }
+        Lookup::NotFound | Lookup::Unavailable => {
+            ui.label(tr1("Piece: {}", &piece.piece.to_string()));
+        }
+    }
+}
+
+/// The hovered piece against the map whose subscript shape this row has.
+///
+/// Split out because both the tooltip and the decision of whether to show one
+/// at all need the same answer, and asking twice for it is the only way to
+/// keep that decision out of the drawing code.
+fn describe_hover<'a>(
+    maps: &'a [doc_lookup::MapInfo],
+    piece: &terminal_view::PieceSelection,
+) -> Option<doc_lookup::Described<'a>> {
+    doc_lookup::describe(
+        maps,
+        &piece.subscripts,
+        piece.piece,
+        &piece.piece_text,
+        piece.offset,
+    )
 }

@@ -100,7 +100,11 @@ impl Live {
     /// Sends one key the way the app does, and waits for IRIS's echo of it to
     /// put the cursor where `settled` wants it.
     fn press(&mut self, key: Key, line: Option<LineEdit>, settled: usize) -> bool {
-        let bytes = input::key_bytes(key, &Modifiers::NONE, line, self.grid.app_cursor_keys)
+        let reader = match line {
+            Some(line) => input::Reader::IrisPrompt(line),
+            None => input::Reader::IrisRoutine,
+        };
+        let bytes = input::key_bytes(key, &Modifiers::NONE, reader, self.grid.app_cursor_keys)
             .unwrap_or_else(|| panic!("{key:?} sends nothing"));
         // Home and End at a command line are walks, not sequences: they only
         // ever go out as the arrow keys IRIS acts on.
