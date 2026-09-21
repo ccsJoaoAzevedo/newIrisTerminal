@@ -126,6 +126,40 @@ impl CursorStyle {
     }
 }
 
+/// When the piece and subscript tooltip appears over a `zwrite` row.
+///
+/// Three settings rather than a switch because the tooltip's cost is the
+/// pointer: following the pointer alone puts a box over the output whenever it
+/// crosses a global, which is right for reading a dump and wrong for reading
+/// around one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IntellisenseMode {
+    Off,
+    /// Hovering anything the row describes is enough.
+    Hover,
+    /// Hovering a selection, and only over the selection itself. The default,
+    /// because it is the one that never appears unasked.
+    #[default]
+    Selection,
+}
+
+impl IntellisenseMode {
+    pub const ALL: [IntellisenseMode; 3] = [
+        IntellisenseMode::Off,
+        IntellisenseMode::Hover,
+        IntellisenseMode::Selection,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            IntellisenseMode::Off => "Off",
+            IntellisenseMode::Hover => "On hover",
+            IntellisenseMode::Selection => "On selection",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -169,6 +203,12 @@ pub struct Settings {
     /// without waiting for Ctrl+C — the way the native IrisTerm and PuTTY
     /// behave.
     pub copy_on_select: bool,
+    /// When to offer what a piece or a subscript of a `zwrite`n global means.
+    ///
+    /// The answer comes from a session of the profile's own - see
+    /// [`crate::features::doc_lookup`] - so `Off` also means no second
+    /// session is ever opened and no IRIS licence slot is held for one.
+    pub intellisense: IntellisenseMode,
     /// Let Up and Down replace the line with a command from the history even
     /// when the cursor is not at the end of it, the way the native IRIS
     /// terminal does.
@@ -308,6 +348,7 @@ impl Default for Settings {
             scrollback_limit: 10_000,
             status_timeout_secs: 8,
             copy_on_select: true,
+            intellisense: IntellisenseMode::default(),
             recall_mid_line: true,
             surround_selection: true,
             save_command_history: true,

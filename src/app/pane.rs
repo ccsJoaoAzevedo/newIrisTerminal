@@ -98,15 +98,15 @@ impl App {
             // Asked for here rather than where the hover was found: `request`
             // needs the tab's session and namespace, which the terminal view
             // has no reason to know about.
-            let tooltip = result.piece_hover.clone().map(|piece| {
+            let tooltip = result.piece_hover.clone().map(|target| {
                 let namespace = tab.namespace.clone().unwrap_or_default();
-                let lookup = tab.doc_lookup.request(&namespace, &piece.global);
-                (piece, lookup)
+                let lookup = tab.doc_lookup.request(&namespace, target.global());
+                (target, lookup)
             });
             (result, has_selection, tooltip)
         };
         self.macro_groups = groups;
-        if let Some((piece, lookup)) = tooltip {
+        if let Some((target, lookup)) = tooltip {
             // A pending lookup is answered by a session of this pane's own,
             // whose reader wakes the loop when it says something - but the
             // steps in between (opening it, noticing it has reached a prompt)
@@ -116,11 +116,12 @@ impl App {
             if lookup == Lookup::Pending {
                 ui.ctx().request_repaint_after(Duration::from_millis(150));
             }
-            // Always something to say: the piece number is counted off the row
-            // itself and does not depend on IRIS having heard of the global.
+            // Always something to say: the piece number and the subscript's
+            // position are both counted off the row itself and do not depend
+            // on IRIS having heard of the global.
             result.response = result
                 .response
-                .on_hover_ui_at_pointer(|ui| piece_tooltip(ui, &piece, &lookup));
+                .on_hover_ui_at_pointer(|ui| piece_tooltip(ui, &target, &lookup));
         }
 
         // This pane's own session, sized to this pane: a pane is a window onto
@@ -373,16 +374,18 @@ impl App {
     }
 }
 
-/// The piece tooltip's contents.
+/// The tooltip's contents, for a piece of a global's value or a subscript of
+/// its key.
 ///
-/// The piece number is always shown: it is counted off the row, and holds
-/// whether or not IRIS can say anything about the global. Everything else -
-/// the description, size, type and formatted value - needs a class that maps
-/// this global at this subscript shape, and plenty of globals have none.
-/// An undocumented global, one no map claims, and a piece a map leaves out
-/// all come out the same way, as the bare number, because from where the user
-/// is standing they are the same thing: nobody wrote this down.
-fn piece_tooltip(ui: &mut egui::Ui, piece: &terminal_view::PieceSelection, lookup: &Lookup) {
+/// The number is always shown - the piece's, or the subscript's position: both
+/// are counted off the row, and hold whether or not IRIS can say anything
+/// about the global. Everything else - the description, size, type and
+/// formatted value - needs a class that maps this global at this subscript
+/// shape, and plenty of globals have none. An undocumented global, one no map
+/// claims, and a piece a map leaves out all come out the same way, as the bare
+/// number, because from where the user is standing they are the same thing:
+/// nobody wrote this down.
+fn piece_tooltip(ui: &mut egui::Ui, target: &terminal_view::GlobalTarget, lookup: &Lookup) {
     // A tooltip sizes itself to its contents, and a described piece's are one
     // long line of prose per row, which egui left to itself wraps into a
     // column a few characters wide. The minimum is the width that fits a
@@ -393,38 +396,82 @@ fn piece_tooltip(ui: &mut egui::Ui, piece: &terminal_view::PieceSelection, looku
 
     match lookup {
         Lookup::Pending => {
-            ui.label(tr1("Looking up ^{}…", &piece.global));
+            ui.label(tr1("Looking up ^{}…", target.global()));
         }
-        Lookup::Ready(maps) => {
-            let Some(found) = describe_hover(maps, piece) else {
-                ui.label(tr1("Piece: {}", &piece.piece.to_string()));
-                return;
-            };
-            ui.set_min_width(240.0);
-            ui.label(tr2(
-                "Piece: {} - {}",
-                &found.info.label(),
-                &found.info.description,
-            ));
-            if !found.info.size.is_empty() {
-                ui.label(tr1("Size: {}", &found.info.size));
+        Lookup::Ready(maps) => match target {
+            terminal_view::GlobalTarget::Piece(piece) => {
+                let Some(found) = describe_hover(maps, piece) else {
+                    ui.label(undescribed(target));
+                    return;
+                };
+                ui.set_min_width(240.0);
+                ui.label(tr2(
+                    "Piece: {} - {}",
+                    &found.info.label(),
+                    &found.info.doc.description,
+                ));
+                doc_body(ui, &found.info.doc, &found.raw);
             }
-            if !found.info.kind.is_empty() {
-                ui.label(tr1("Type: {}", &found.info.kind));
-            }
-            match doc_lookup::format_value(found.info, &found.raw) {
-                doc_lookup::Formatted::Value(formatted) => {
-                    ui.label(tr1("Formatted value: {}", &formatted));
+            terminal_view::GlobalTarget::Key(key) => {
+                let Some(found) = doc_lookup::describe_key(maps, &key.subscripts, key.position)
+                else {
+                    ui.label(undescribed(target));
+                    return;
+                };
+                ui.set_min_width(240.0);
+                match found {
+                    doc_lookup::KeyRole::Property(info) => {
+                        ui.label(tr2(
+                            "Key: {} - {}",
+                            &info.position.to_string(),
+                            &info.doc.description,
+                        ));
+                        doc_body(ui, &info.doc, &key.text);
+                    }
+                    // Nothing else to say about a constant: its value is the
+                    // subscript itself, already on screen and already read.
+                    doc_lookup::KeyRole::Fixed(value) => {
+                        ui.label(tr2(
+                            "Key: {} - constant ({})",
+                            &key.position.to_string(),
+                            value,
+                        ));
+                    }
                 }
-                doc_lookup::Formatted::Invalid => {
-                    ui.label(tr1("Formatted value: {}", tr("invalid value")));
-                }
-                doc_lookup::Formatted::Nothing => {}
             }
-        }
+        },
         Lookup::NotFound | Lookup::Unavailable => {
-            ui.label(tr1("Piece: {}", &piece.piece.to_string()));
+            ui.label(undescribed(target));
         }
+    }
+}
+
+/// All a tooltip can say about something nobody wrote down: which piece, or
+/// which subscript, it is.
+fn undescribed(target: &terminal_view::GlobalTarget) -> String {
+    match target {
+        terminal_view::GlobalTarget::Piece(piece) => tr1("Piece: {}", &piece.piece.to_string()),
+        terminal_view::GlobalTarget::Key(key) => tr1("Key: {}", &key.position.to_string()),
+    }
+}
+
+/// The lines under the heading, which are the same whether the property is
+/// mapped to a piece of the value or to a subscript.
+fn doc_body(ui: &mut egui::Ui, doc: &doc_lookup::Doc, raw: &str) {
+    if !doc.size.is_empty() {
+        ui.label(tr1("Size: {}", &doc.size));
+    }
+    if !doc.kind.is_empty() {
+        ui.label(tr1("Type: {}", &doc.kind));
+    }
+    match doc_lookup::format_value(doc, raw) {
+        doc_lookup::Formatted::Value(formatted) => {
+            ui.label(tr1("Formatted value: {}", &formatted));
+        }
+        doc_lookup::Formatted::Invalid => {
+            ui.label(tr1("Formatted value: {}", tr("invalid value")));
+        }
+        doc_lookup::Formatted::Nothing => {}
     }
 }
 

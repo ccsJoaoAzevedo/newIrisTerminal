@@ -1,4 +1,5 @@
-//! Looking up a global's piece structure, for the piece tooltip.
+//! Looking up a global's structure - its subscripts and the pieces of its
+//! value - for the tooltip that describes one of them.
 //!
 //! The question is asked down a session of its own - see [`DocLookup`] - and
 //! never down the one the user is looking at. Typing into that one was the
@@ -29,8 +30,29 @@ use crate::term::{lineedit, Grid};
 /// control the parser does not recognise is silently dropped rather than
 /// drawn, so it would never reach a row's cells to be found again.
 const MARK_MAP: &str = "##CSWMAP##";
+const MARK_KEY: &str = "##CSWKEY##";
 const MARK: &str = "##CSWTIP##";
 const MARK_END: &str = "##CSWTIPEND##";
+
+/// What a class's dictionary says about one property.
+///
+/// The same four facts whichever way the property is stored, which is why it
+/// is a type of its own rather than fields repeated on [`PieceInfo`] and
+/// [`KeyInfo`]: a subscript and a piece of the value are documented alike and
+/// are formatted by the same rules.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Doc {
+    pub description: String,
+    /// As IRIS reports it - a bare width (`"5"`) or, for a scaled numeric
+    /// type, `"total,decimals"` (`"5,2"`).
+    pub size: String,
+    /// The data type class name, e.g. `%Date`, `DataType.Valor`.
+    pub kind: String,
+    /// `(raw value, label)` pairs, from the property's display list -
+    /// `DataType.SimNao`'s hardcoded one included. Empty when the property
+    /// has none.
+    pub value_list: Vec<(String, String)>,
+}
 
 /// One piece of a global's value, as `%CSWDOCGLOBAL` documents it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,16 +66,33 @@ pub struct PieceInfo {
     /// The delimiter that subdivision uses (`;`, `,`). Carried per piece
     /// because it is declared per piece, not per map.
     pub sub_delim: Option<char>,
-    pub description: String,
-    /// As IRIS reports it - a bare width (`"5"`) or, for a scaled numeric
-    /// type, `"total,decimals"` (`"5,2"`).
-    pub size: String,
-    /// The data type class name, e.g. `%Date`, `DataType.Valor`.
-    pub kind: String,
-    /// `(raw value, label)` pairs, from the property's display list -
-    /// `DataType.SimNao`'s hardcoded one included. Empty when the property
-    /// has none.
-    pub value_list: Vec<(String, String)>,
+    pub doc: Doc,
+}
+
+/// What a map says the subscript at some position is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRole<'a> {
+    /// Bound to a property, and documented exactly as a piece is.
+    Property(&'a KeyInfo),
+    /// A constant this map requires at that position, carrying its value.
+    ///
+    /// Worth saying rather than falling silent: it is the one subscript that
+    /// holds no data, and it is what tells this map from the others the
+    /// global has. The query writes no line for one - it has no property to
+    /// describe - so this comes from [`MapInfo::fixed`].
+    Fixed(&'a str),
+}
+
+/// One subscript of a global's key, as the class's data map declares it.
+///
+/// Only the subscripts a map binds to a property are here; a constant one is
+/// part of [`MapInfo::fixed`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyInfo {
+    /// 1-based position in the subscript list, counted the way
+    /// `crate::ui::terminal_view` counts the subscripts it reads off the row.
+    pub position: usize,
+    pub doc: Doc,
 }
 
 impl PieceInfo {
@@ -82,6 +121,7 @@ pub struct MapInfo {
     /// a different class from `^FTCL(e,c,24,s)`.
     pub fixed: Vec<(usize, String)>,
     pub pieces: Vec<PieceInfo>,
+    pub key_info: Vec<KeyInfo>,
 }
 
 impl MapInfo {
@@ -142,6 +182,26 @@ pub fn describe<'a>(
     Some(Described { info, raw })
 }
 
+/// What the subscript at `position` of this row means.
+///
+/// The same choice of map as [`describe`] makes - a global is mapped by one
+/// class per subscript shape, and only the shape of the row in front of the
+/// user says which of them is describing it.
+pub fn describe_key<'a>(
+    maps: &'a [MapInfo],
+    subscripts: &[String],
+    position: usize,
+) -> Option<KeyRole<'a>> {
+    let map = maps.iter().find(|m| m.matches(subscripts))?;
+    if let Some(info) = map.key_info.iter().find(|k| k.position == position) {
+        return Some(KeyRole::Property(info));
+    }
+    map.fixed
+        .iter()
+        .find(|(at, _)| *at == position)
+        .map(|(_, value)| KeyRole::Fixed(value))
+}
+
 /// What the tooltip can say about a raw value beyond the value itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Formatted {
@@ -155,17 +215,17 @@ pub enum Formatted {
     Invalid,
 }
 
-/// How `raw` reads under `piece`'s rules.
+/// How `raw` reads under the rules of the property `doc` describes.
 ///
 /// Order matters: a value list is the most specific thing a property can
 /// carry and wins over a type-based rule, even where both happen to apply.
-pub fn format_value(piece: &PieceInfo, raw: &str) -> Formatted {
-    // An empty piece is unset, not wrong. Every rule below would refuse it,
+pub fn format_value(doc: &Doc, raw: &str) -> Formatted {
+    // An empty value is unset, not wrong. Every rule below would refuse it,
     // and calling every unset date in a row invalid would be noise.
     if raw.trim().is_empty() {
         return Formatted::Nothing;
     }
-    if let Some(label) = piece
+    if let Some(label) = doc
         .value_list
         .iter()
         .find(|(value, _)| value == raw)
@@ -176,16 +236,39 @@ pub fn format_value(piece: &PieceInfo, raw: &str) -> Formatted {
     // A value the list does not mention falls through rather than being
     // called invalid: these lists are often partial, and a property that
     // documents two of its five codes is the normal case.
-    if names_type(&piece.kind, "%Date") {
+    // `DataType.DataHora` is a `%String` of eleven characters, not a date
+    // type at all, but what it holds is the same `$H` pair `%DateTime` does -
+    // its own `LogicalToDisplay` reads it with `$ZD` and `$ZT` over the same
+    // comma. Named here because nothing about the type itself says so.
+    if is_type(&doc.kind, "%DateTime") || is_type(&doc.kind, "DataType.DataHora") {
+        return or_invalid(format_datetime(raw));
+    }
+    if is_type(&doc.kind, "%TimeStamp") {
+        return or_invalid(format_timestamp(raw));
+    }
+    if is_type(&doc.kind, "%Date") {
         return or_invalid(format_date(raw));
     }
-    if names_type(&piece.kind, "%Time") {
+    if is_type(&doc.kind, "%Time") {
         return or_invalid(format_time(raw));
     }
-    if let Some(decimals) = decimal_places(&piece.size) {
+    // A float carries its own decimal point in the global, so the decimal
+    // count in `size` is how much precision it is allowed, not a scale to
+    // divide by. Dividing anyway turned a stored `1.5` into `0,015`.
+    if stores_its_own_point(&doc.kind) {
+        return Formatted::Nothing;
+    }
+    if let Some(decimals) = decimal_places(&doc.size) {
         return or_invalid(format_decimal(raw, decimals));
     }
     Formatted::Nothing
+}
+
+/// Whether the type writes the decimal point into the stored value instead of
+/// scaling it away - which is what makes `size`'s decimal count descriptive
+/// rather than a divisor.
+fn stores_its_own_point(kind: &str) -> bool {
+    is_type(kind, "%Float") || is_type(kind, "%Double")
 }
 
 fn or_invalid(formatted: Option<String>) -> Formatted {
@@ -209,6 +292,16 @@ fn names_type(kind: &str, name: &str) -> bool {
     })
 }
 
+/// [`names_type`] in either spelling of a system type: IRIS reports the same
+/// class as `%Date` in one dictionary and `%Library.Date` in another, and a
+/// rule keyed on one of the two silently stops applying to half the globals.
+fn is_type(kind: &str, name: &str) -> bool {
+    names_type(kind, name)
+        || name
+            .strip_prefix('%')
+            .is_some_and(|short| names_type(kind, &format!("%Library.{short}")))
+}
+
 /// IRIS's logical `%Date`: whole days since 1840-12-31, the `$H` epoch.
 fn format_date(raw: &str) -> Option<String> {
     let days: i64 = raw.trim().parse().ok()?;
@@ -219,6 +312,84 @@ fn format_date(raw: &str) -> Option<String> {
     let epoch = chrono::NaiveDate::from_ymd_opt(1840, 12, 31)?;
     let date = epoch.checked_add_signed(chrono::Duration::days(days))?;
     Some(date.format("%d/%m/%Y").to_string())
+}
+
+/// IRIS's logical `%DateTime`: a whole `$H`, both halves - `67043,29376`.
+///
+/// The comma is part of the value, not a subdivision of the piece: a map that
+/// subdivides a piece says so, and no map says so about a `%DateTime`. The
+/// seconds half is optional because midnight is often stored as the date
+/// alone.
+fn format_datetime(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let (days, seconds) = match raw.split_once(',') {
+        Some((days, seconds)) => (days, Some(seconds)),
+        None => (raw, None),
+    };
+    let date = format_date(days)?;
+    match seconds {
+        Some(seconds) => Some(format!("{date} {}", format_time(seconds)?)),
+        None => Some(date),
+    }
+}
+
+/// IRIS's logical `%TimeStamp`: ODBC text, `YYYY-MM-DD HH:MM:SS`, with an
+/// optional fractional part - not a `$H` pair like every other rule here.
+///
+/// Turned round into the same `dd/mm/yyyy hh:mm:ss` the rest of the tooltip
+/// reads in, which is the whole of the work: the value is already legible,
+/// just not in the order a pt-BR reader expects. The fraction is carried
+/// through untouched rather than rounded away - it is stored precision, and
+/// dropping it would make two different timestamps look identical.
+fn format_timestamp(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    // A `T` between the halves is the ISO spelling of the same value, and
+    // IRIS accepts it on the way in.
+    let (date, time) = raw.split_once([' ', 'T'])?;
+    let (year, month, day) = {
+        let mut parts = date.split('-');
+        (parts.next()?, parts.next()?, parts.next()?)
+    };
+    if parts_are_not_digits([year, month, day]) || (year.len(), month.len(), day.len()) != (4, 2, 2)
+    {
+        return None;
+    }
+    // Validated through the calendar rather than by length: `2024-02-31`
+    // passes every shape test and is not a date.
+    chrono::NaiveDate::from_ymd_opt(year.parse().ok()?, month.parse().ok()?, day.parse().ok()?)?;
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) => (clock, Some(fraction)),
+        None => (time, None),
+    };
+    let mut hms = clock.split(':');
+    let (hour, minute, second) = (hms.next()?, hms.next()?, hms.next()?);
+    if hms.next().is_some()
+        || parts_are_not_digits([hour, minute, second])
+        || (hour.len(), minute.len(), second.len()) != (2, 2, 2)
+        || fraction.is_some_and(|f| f.is_empty() || parts_are_not_digits([f]))
+    {
+        return None;
+    }
+    // Leap seconds are not stored, so 60 is as wrong here as 61.
+    if hour.parse::<u32>().ok()? > 23
+        || minute.parse::<u32>().ok()? > 59
+        || second.parse::<u32>().ok()? > 59
+    {
+        return None;
+    }
+    Some(format!(
+        "{day}/{month}/{year} {clock}{}",
+        match fraction {
+            Some(fraction) => format!(".{fraction}"),
+            None => String::new(),
+        }
+    ))
+}
+
+fn parts_are_not_digits<const N: usize>(parts: [&str; N]) -> bool {
+    parts
+        .iter()
+        .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// IRIS's logical `%Time`: whole seconds since midnight, the second half of
@@ -647,55 +818,76 @@ fn parse_answer(lines: &[String]) -> Option<Vec<MapInfo>> {
                 MapInfo {
                     keys,
                     fixed,
-                    pieces: Vec::new(),
+                    ..MapInfo::default()
                 },
             ));
+            continue;
+        }
+        if let Some(rest) = marked(line, MARK_KEY) {
+            let mut fields = rest.split('|');
+            let (Some(class), Some(map), Some(position)) = (
+                fields.next(),
+                fields.next(),
+                fields.next().and_then(|s| s.trim().parse().ok()),
+            ) else {
+                continue;
+            };
+            let owner = format!("{class}|{map}");
+            let Some((_, map)) = maps.iter_mut().find(|(id, _)| *id == owner) else {
+                continue;
+            };
+            map.key_info.push(KeyInfo {
+                position,
+                doc: parse_doc(&mut fields),
+            });
             continue;
         }
         let Some(rest) = marked(line, MARK) else {
             continue;
         };
         let mut fields = rest.split('|');
-        let (
-            Some(class),
-            Some(map),
-            Some(seq),
-            Some(delim),
-            Some(description),
-            Some(size),
-            Some(kind),
-        ) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        )
+        let (Some(class), Some(map), Some(seq), Some(delim)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
         let Some((piece, sub)) = parse_sequence(seq) else {
             continue;
         };
+        let sub_delim = delim.chars().next();
         let owner = format!("{class}|{map}");
         let Some((_, map)) = maps.iter_mut().find(|(id, _)| *id == owner) else {
             continue;
         };
-        let values = fields.next().unwrap_or_default();
-        let labels = fields.next().unwrap_or_default();
         map.pieces.push(PieceInfo {
             piece,
             sub,
-            sub_delim: delim.chars().next(),
-            description: description.to_string(),
-            size: size.to_string(),
-            kind: kind.to_string(),
-            value_list: parse_value_list(values, labels),
+            sub_delim,
+            doc: parse_doc(&mut fields),
         });
     }
     complete.then(|| maps.into_iter().map(|(_, map)| map).collect())
+}
+
+/// The four dictionary fields both marked lines end with, in the order
+/// `EditarDadosPropriedade^%CSWDOCGLOBALRG` returns them: description, size,
+/// type, then the display list's values and its labels.
+///
+/// A line cut short by anything is read as far as it goes rather than
+/// dropped: a piece with a description and nothing else still says more than
+/// its number does.
+fn parse_doc<'a>(fields: &mut impl Iterator<Item = &'a str>) -> Doc {
+    let description = fields.next().unwrap_or_default().to_string();
+    let size = fields.next().unwrap_or_default().to_string();
+    let kind = fields.next().unwrap_or_default().to_string();
+    let values = fields.next().unwrap_or_default();
+    let labels = fields.next().unwrap_or_default();
+    Doc {
+        description,
+        size,
+        kind,
+        value_list: parse_value_list(values, labels),
+    }
 }
 
 /// A marked line's payload: what sits between the marker and the trailing
@@ -730,7 +922,8 @@ fn quoted(s: &str) -> String {
 }
 
 /// The lines typed into the sidecar: switch namespace, read the structure,
-/// print one marked line per data map, one per piece, then the end marker.
+/// print one marked line per data map, one per described subscript, one per
+/// piece, then the end marker.
 ///
 /// Not a `{` in sight, and the end marker on a line of its own, because
 /// neither shortcut survives contact with a terminal's command line:
@@ -749,7 +942,7 @@ fn quoted(s: &str) -> String {
 ///   iteration and then fails, which is what made this look like a quoting
 ///   problem the first time.
 ///
-/// Both passes name the class and map on every line they write, because they
+/// Every pass names the class and map on every line it writes, because they
 /// are separate commands and their output does not interleave.
 ///
 /// The namespace is re-checked after the `ZN` rather than assumed: a `ZN` to
@@ -760,7 +953,7 @@ fn build_query(namespace: &str, global: &str) -> String {
     let g = quoted(global);
     let ns = quoted(namespace);
     let lines = [
-        "K cswT,cc,mm,kk,pp".to_string(),
+        "K cswT,cc,mm,kk,pp,cswK,cswTp".to_string(),
         format!("ZN {ns}"),
         format!(
             "I $ZCVT($ZNSPACE,\"U\")=$ZCVT({ns},\"U\") S cswG={g},cswSc=##class(Src2.Classe).ObterInfoClassesGlobalCache(cswG,.cswT)"
@@ -774,7 +967,26 @@ fn build_query(namespace: &str, global: &str) -> String {
         format!(
             "S cc=\"\" F  S cc=$O(cswT(cc)) Q:cc=\"\"  S mm=\"\" F  S mm=$O(cswT(cc,\"maps\",\"data\",mm)) Q:mm=\"\"  S kk=\"\",nn=0,ff=\"\" F  S kk=$O(cswT(cc,\"maps\",\"data\",mm,\"chaves\",kk)) Q:kk=\"\"  S nn=nn+1 S:$D(cswT(cc,\"maps\",\"data\",mm,\"chaves\",kk,\"fixa\")) ff=ff_kk_\":\"_$P(cswT(cc,\"maps\",\"data\",mm,\"chaves\",kk,\"fixa\"),\"^\",1)_\",\" W:$O(cswT(cc,\"maps\",\"data\",mm,\"chaves\",kk))=\"\" \"{MARK_MAP}\"_cc_\"|\"_mm_\"|\"_nn_\"|\"_ff_\"##\",!"
         ),
-        // Pass two: every piece of every map, each line saying which map it
+        // Pass two: the subscripts a map binds to a property, described the
+        // same way its pieces are.
+        //
+        // A key's node says what kind of key it is by the *name* of its one
+        // child - `fixa` for a constant, and the property's own node for one
+        // bound to a property, whose value is the property's name. This is
+        // the shape `%CSWDOCGLOBALRG`'s own `GerarDadosGlobal` walks, read
+        // the same way it reads it.
+        //
+        // The property lookup is guarded rather than left to `$G`: a `fixa`
+        // key has no property, and `$G(cswT(cc,"props",""))` is not an
+        // undefined node but an illegal subscript - `<SUBSCRIPT>`, which ends
+        // the command. The pass then stopped at the first constant subscript
+        // it met and every key after it, in that class and in every class
+        // after it, went undescribed. `$S` is what makes it short-circuit;
+        // `$G` alone never sees the empty subscript coming.
+        format!(
+            "S cc=\"\" F  S cc=$O(cswT(cc)) Q:cc=\"\"  S mm=\"\" F  S mm=$O(cswT(cc,\"maps\",\"data\",mm)) Q:mm=\"\"  S cswK=\"\" F  S cswK=$O(cswT(cc,\"maps\",\"data\",mm,\"chaves\",cswK)) Q:cswK=\"\"  S cswTp=$O(cswT(cc,\"maps\",\"data\",mm,\"chaves\",cswK,\"\")),pr=$S(cswTp=\"\":\"\",cswTp=\"fixa\":\"\",1:$P($G(cswT(cc,\"maps\",\"data\",mm,\"chaves\",cswK,cswTp)),\"^\",1)),dd=$S(pr=\"\":\"\",1:$G(cswT(cc,\"props\",pr))),cswSc=$$EditarDadosPropriedade^%CSWDOCGLOBALRG(.dd) W:pr'=\"\" \"{MARK_KEY}\"_cc_\"|\"_mm_\"|\"_cswK_\"|\"_$P(dd,\"^\",1)_\"|\"_$P(dd,\"^\",5)_\"|\"_$P(dd,\"^\",3)_\"|\"_$P(dd,\"^\",6)_\"|\"_$P(dd,\"^\",7)_\"##\",!"
+        ),
+        // Pass three: every piece of every map, each line saying which map it
         // belongs to and which delimiter, if any, subdivides it further.
         format!(
             "S cc=\"\" F  S cc=$O(cswT(cc)) Q:cc=\"\"  S mm=\"\" F  S mm=$O(cswT(cc,\"maps\",\"data\",mm)) Q:mm=\"\"  S pp=\"\" F  S pp=$O(cswT(cc,\"maps\",\"data\",mm,\"pieces\",pp)) Q:pp=\"\"  S dp=cswT(cc,\"maps\",\"data\",mm,\"pieces\",pp),pr=$P(dp,\"^\",1),sq=$P(dp,\"^\",3),d2=$G(cswT(cc,\"maps\",\"data\",mm,\"pieces\",pp,2)),dd=$G(cswT(cc,\"props\",pr)),cswSc=$$EditarDadosPropriedade^%CSWDOCGLOBALRG(.dd) W:pr'=\"\" \"{MARK}\"_cc_\"|\"_mm_\"|\"_sq_\"|\"_d2_\"|\"_$P(dd,\"^\",1)_\"|\"_$P(dd,\"^\",5)_\"|\"_$P(dd,\"^\",3)_\"|\"_$P(dd,\"^\",6)_\"|\"_$P(dd,\"^\",7)_\"##\",!"
@@ -808,11 +1020,21 @@ mod tests {
 
     // --- formatting precedence -------------------------------------------
 
-    fn piece(kind: &str, size: &str, value_list: &[(&str, &str)]) -> PieceInfo {
-        PieceInfo {
-            piece: 1,
-            sub: None,
-            sub_delim: None,
+    /// The description of a subscript that a map binds to a property, which is
+    /// what most of these are asserting.
+    fn described_key<'a>(
+        maps: &'a [MapInfo],
+        subscripts: &[String],
+        position: usize,
+    ) -> Option<&'a str> {
+        match describe_key(maps, subscripts, position)? {
+            KeyRole::Property(info) => Some(&info.doc.description),
+            KeyRole::Fixed(value) => panic!("expected a property, got the constant {value}"),
+        }
+    }
+
+    fn doc(kind: &str, size: &str, value_list: &[(&str, &str)]) -> Doc {
+        Doc {
             description: "Test".into(),
             size: size.into(),
             kind: kind.into(),
@@ -826,7 +1048,7 @@ mod tests {
     /// `DataType.SimNao`'s hardcoded default: 0 is "Não", 1 is "Sim".
     #[test]
     fn a_sim_nao_value_list_formats_as_nao_or_sim() {
-        let p = piece("DataType.SimNao", "1", &[("0", "Não"), ("1", "Sim")]);
+        let p = doc("DataType.SimNao", "1", &[("0", "Não"), ("1", "Sim")]);
         assert_eq!(format_value(&p, "0"), Formatted::Value("Não".into()));
         assert_eq!(format_value(&p, "1"), Formatted::Value("Sim".into()));
     }
@@ -835,7 +1057,7 @@ mod tests {
     /// SimNao-specific in the rule itself.
     #[test]
     fn a_property_level_display_list_is_used_the_same_way() {
-        let p = piece(
+        let p = doc(
             "%Integer",
             "1",
             &[("0", "Sem Comissão"), ("1", "Com Comissão")],
@@ -850,13 +1072,13 @@ mod tests {
     /// are often partial, and there is nothing wrong with the stored value.
     #[test]
     fn a_code_outside_the_display_list_is_not_called_invalid() {
-        let p = piece("%Integer", "1", &[("0", "Não"), ("1", "Sim")]);
+        let p = doc("%Integer", "1", &[("0", "Não"), ("1", "Sim")]);
         assert_eq!(format_value(&p, "7"), Formatted::Nothing);
     }
 
     #[test]
     fn a_date_piece_converts_from_the_1840_epoch() {
-        let p = piece("%Date", "5", &[]);
+        let p = doc("%Date", "5", &[]);
         // 67043 days after 1840-12-31.
         assert_eq!(
             format_value(&p, "67043"),
@@ -867,7 +1089,7 @@ mod tests {
     /// `%Time` is whole seconds since midnight - the second half of `$H`.
     #[test]
     fn a_time_piece_converts_from_seconds_since_midnight() {
-        let p = piece("%Time", "5", &[]);
+        let p = doc("%Time", "5", &[]);
         assert_eq!(
             format_value(&p, "29376"),
             Formatted::Value("08:09:36".into())
@@ -885,15 +1107,15 @@ mod tests {
     #[test]
     fn a_value_a_rule_cannot_read_is_reported_as_invalid() {
         assert_eq!(
-            format_value(&piece("%Date", "5", &[]), "ABC"),
+            format_value(&doc("%Date", "5", &[]), "ABC"),
             Formatted::Invalid
         );
         assert_eq!(
-            format_value(&piece("%Time", "5", &[]), "ABC"),
+            format_value(&doc("%Time", "5", &[]), "ABC"),
             Formatted::Invalid
         );
         assert_eq!(
-            format_value(&piece("DataType.Valor", "5,2", &[]), "ABC"),
+            format_value(&doc("DataType.Valor", "5,2", &[]), "ABC"),
             Formatted::Invalid
         );
     }
@@ -903,11 +1125,11 @@ mod tests {
     #[test]
     fn a_value_outside_its_types_range_is_invalid() {
         assert_eq!(
-            format_value(&piece("%Date", "5", &[]), "-1"),
+            format_value(&doc("%Date", "5", &[]), "-1"),
             Formatted::Invalid
         );
         assert_eq!(
-            format_value(&piece("%Time", "5", &[]), "86400"),
+            format_value(&doc("%Time", "5", &[]), "86400"),
             Formatted::Invalid
         );
     }
@@ -917,37 +1139,137 @@ mod tests {
     #[test]
     fn an_empty_piece_is_not_called_invalid() {
         assert_eq!(
-            format_value(&piece("%Date", "5", &[]), ""),
+            format_value(&doc("%Date", "5", &[]), ""),
             Formatted::Nothing
         );
         assert_eq!(
-            format_value(&piece("%Time", "5", &[]), "   "),
+            format_value(&doc("%Time", "5", &[]), "   "),
             Formatted::Nothing
         );
         assert_eq!(
-            format_value(&piece("DataType.Valor", "5,2", &[]), ""),
+            format_value(&doc("DataType.Valor", "5,2", &[]), ""),
             Formatted::Nothing
         );
     }
 
-    /// `%DateTime` and `%TimeStamp` hold something else entirely, and reading
-    /// either through the day-count or seconds-since-midnight rule would turn
-    /// a good value into a wrong one.
+    /// Every one of these four stores something different, and each has a
+    /// rule of its own. The trap is the names: read through the rule of the
+    /// type its name starts with, a good value comes out as a wrong one
+    /// rather than as nothing.
     #[test]
     fn a_longer_type_name_is_not_mistaken_for_the_one_it_starts_with() {
+        // Seconds since midnight to `%Time`; not a timestamp at all.
         assert_eq!(
-            format_value(&piece("%DateTime", "", &[]), "67043"),
-            Formatted::Nothing
+            format_value(&doc("%TimeStamp", "", &[]), "29376"),
+            Formatted::Invalid
+        );
+        // A whole `$H` to `%DateTime`; a day count on its own to `%Date`.
+        assert_eq!(
+            format_value(&doc("%DateTime", "", &[]), "67043,29376"),
+            Formatted::Value("22/07/2024 08:09:36".into())
         );
         assert_eq!(
-            format_value(&piece("%TimeStamp", "", &[]), "29376"),
-            Formatted::Nothing
+            format_value(&doc("%Date", "", &[]), "67043,29376"),
+            Formatted::Invalid
         );
+    }
+
+    /// `%TimeStamp` is ODBC text rather than a `$H` pair - already legible,
+    /// just not in the order a pt-BR reader expects.
+    #[test]
+    fn a_timestamp_piece_is_turned_round_into_day_month_year() {
+        let p = doc("%TimeStamp", "", &[]);
+        assert_eq!(
+            format_value(&p, "2024-07-22 08:09:36"),
+            Formatted::Value("22/07/2024 08:09:36".into())
+        );
+        assert_eq!(
+            format_value(&p, "2024-07-22T08:09:36"),
+            Formatted::Value("22/07/2024 08:09:36".into()),
+            "the ISO spelling of the same value"
+        );
+        assert_eq!(
+            format_value(&p, "2024-07-22 08:09:36.123"),
+            Formatted::Value("22/07/2024 08:09:36.123".into()),
+            "stored precision is carried through, not rounded away"
+        );
+    }
+
+    /// The shapes that pass a length check and are still not a timestamp.
+    #[test]
+    fn a_timestamp_that_is_not_one_is_reported_as_invalid() {
+        let p = doc("%TimeStamp", "", &[]);
+        for raw in [
+            "2024-02-31 08:09:36",  // no such day
+            "2024-07-22 24:00:00",  // no such hour
+            "2024-07-22 08:60:00",  // no such minute
+            "22/07/2024 08:09:36",  // already turned round, so not logical
+            "2024-07-22",           // no time half
+            "2024-7-22 08:09:36",   // not zero-padded, so not ODBC
+            "2024-07-22 08:09:36.", // a point with no fraction after it
+        ] {
+            assert_eq!(format_value(&p, raw), Formatted::Invalid, "{raw:?}");
+        }
+    }
+
+    /// `DataType.DataHora` is a `%String` by inheritance, and holds a whole
+    /// `$H` - the ERP's own `LogicalToDisplay` reads it with `$ZD` and `$ZT`.
+    #[test]
+    fn the_erps_own_date_time_string_is_read_as_a_horolog() {
+        let p = doc("DataType.DataHora", "11", &[]);
+        assert_eq!(
+            format_value(&p, "67043,29376"),
+            Formatted::Value("22/07/2024 08:09:36".into())
+        );
+        assert_eq!(format_value(&p, "not a date"), Formatted::Invalid);
+    }
+
+    /// `%DateTime` is a whole `$H`, both halves of it.
+    #[test]
+    fn a_datetime_piece_converts_both_halves_of_the_horolog() {
+        let p = doc("%DateTime", "", &[]);
+        assert_eq!(
+            format_value(&p, "67043,29376"),
+            Formatted::Value("22/07/2024 08:09:36".into())
+        );
+        assert_eq!(
+            format_value(&p, "67043"),
+            Formatted::Value("22/07/2024".into()),
+            "the seconds half is often left off for midnight"
+        );
+        assert_eq!(format_value(&p, "67043,99999"), Formatted::Invalid);
+    }
+
+    /// The same rule under the name the other half of the dictionary uses.
+    #[test]
+    fn the_library_spelling_of_a_system_type_is_the_same_type() {
+        assert_eq!(
+            format_value(&doc("%Library.Date", "5", &[]), "67043"),
+            Formatted::Value("22/07/2024".into())
+        );
+        assert_eq!(
+            format_value(&doc("%Library.DateTime", "", &[]), "67043,29376"),
+            Formatted::Value("22/07/2024 08:09:36".into())
+        );
+    }
+
+    /// A float writes its own decimal point into the global, so the decimal
+    /// count in its size is precision and not a scale. Dividing anyway turned
+    /// a stored `1.5` into `0,015`.
+    #[test]
+    fn a_float_is_left_alone_however_its_size_is_written() {
+        for kind in ["%Float", "%Double", "%Library.Double"] {
+            assert_eq!(
+                format_value(&doc(kind, "10,3", &[]), "1.5"),
+                Formatted::Nothing,
+                "{kind} already carries its point"
+            );
+        }
     }
 
     #[test]
     fn a_decimal_scaled_size_groups_thousands_and_uses_a_comma() {
-        let p = piece("DataType.Valor", "5,2", &[]);
+        let p = doc("DataType.Valor", "5,2", &[]);
         assert_eq!(
             format_value(&p, "100000"),
             Formatted::Value("1.000,00".into())
@@ -957,7 +1279,7 @@ mod tests {
 
     #[test]
     fn a_bare_size_with_no_comma_is_not_treated_as_decimal() {
-        let p = piece("%Integer", "5", &[]);
+        let p = doc("%Integer", "5", &[]);
         assert_eq!(format_value(&p, "100000"), Formatted::Nothing);
     }
 
@@ -965,7 +1287,7 @@ mod tests {
     /// the most specific thing a property can carry.
     #[test]
     fn a_value_list_takes_precedence_over_a_type_rule() {
-        let p = piece("%Date", "5", &[("67043", "Feriado")]);
+        let p = doc("%Date", "5", &[("67043", "Feriado")]);
         assert_eq!(
             format_value(&p, "67043"),
             Formatted::Value("Feriado".into())
@@ -974,7 +1296,7 @@ mod tests {
 
     #[test]
     fn nothing_formats_a_value_with_no_rule_that_applies() {
-        let p = piece("%String", "40", &[]);
+        let p = doc("%String", "40", &[]);
         assert_eq!(format_value(&p, "anything"), Formatted::Nothing);
     }
 
@@ -996,11 +1318,59 @@ mod tests {
         assert!(maps[0].fixed.is_empty());
         assert_eq!(maps[0].pieces.len(), 3);
         assert_eq!(maps[0].pieces[1].piece, 6);
-        assert_eq!(maps[0].pieces[1].kind, "%Date");
+        assert_eq!(maps[0].pieces[1].doc.kind, "%Date");
         assert_eq!(maps[0].pieces[2].piece, 12);
         assert_eq!(maps[0].pieces[2].sub, Some(1));
         assert_eq!(maps[0].pieces[2].sub_delim, Some(';'));
         assert_eq!(maps[0].pieces[2].label(), "12,1");
+    }
+
+    /// The subscripts are described the same way the pieces are, and picked
+    /// out of the same map.
+    #[test]
+    fn a_complete_answer_parses_the_subscripts_of_a_map() {
+        let maps = parse_answer(&answer(&[
+            "##CSWMAP##Cre.DuplicataAberta|CCDUMap|2|##",
+            "##CSWKEY##Cre.DuplicataAberta|CCDUMap|1|Código da empresa|4|%Integer||##",
+            "##CSWKEY##Cre.DuplicataAberta|CCDUMap|2|Código do cliente|5|%Integer||##",
+        ]))
+        .expect("a complete answer");
+        let subs = vec!["1".to_string(), "1".to_string()];
+        assert_eq!(described_key(&maps, &subs, 2), Some("Código do cliente"));
+        assert_eq!(
+            describe_key(&maps, &subs, 3),
+            None,
+            "a row of this shape has no third subscript"
+        );
+    }
+
+    /// A constant subscript has no property, so the query writes no line for
+    /// one and its value comes from the map header instead. Saying what it is
+    /// beats a bare number: it is the one subscript holding no data.
+    ///
+    /// The subscript *after* it is the regression: reaching a constant used to
+    /// end the whole pass with a `<SUBSCRIPT>`, so every key after the first
+    /// constant - in that class and in every class after it - arrived
+    /// undescribed.
+    #[test]
+    fn a_constant_subscript_is_named_and_does_not_stop_the_ones_after_it() {
+        let maps = parse_answer(&answer(&[
+            "##CSWMAP##Fat.CliInscEst|FTCLMap|4|3:19,##",
+            "##CSWKEY##Fat.CliInscEst|FTCLMap|1|Empresa|4|%Integer||##",
+            "##CSWKEY##Fat.CliInscEst|FTCLMap|4|Sequência|3|%Integer||##",
+        ]))
+        .expect("a complete answer");
+        let subs: Vec<String> = ["1", "1", "19", "7"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(described_key(&maps, &subs, 1), Some("Empresa"));
+        assert_eq!(
+            describe_key(&maps, &subs, 3),
+            Some(KeyRole::Fixed("19")),
+            "the constant that picks this map out of the global's others"
+        );
+        assert_eq!(described_key(&maps, &subs, 4), Some("Sequência"));
     }
 
     /// The bug this whole shape exists for: one global, several classes, told
@@ -1022,7 +1392,7 @@ mod tests {
         let subs = |s: &str| -> Vec<String> { s.split(',').map(str::to_string).collect() };
         let named = |subs: Vec<String>| {
             describe(&maps, &subs, 1, "99", 0)
-                .map(|d| d.info.description.clone())
+                .map(|d| d.info.doc.description.clone())
                 .unwrap_or_default()
         };
         assert_eq!(named(subs("1,1")), "Nome do cliente");
@@ -1047,7 +1417,7 @@ mod tests {
         .expect("a complete answer");
         let at = |k: &str| {
             let subs: Vec<String> = k.split(',').map(str::to_string).collect();
-            describe(&maps, &subs, 1, "x", 0).map(|d| d.info.description.clone())
+            describe(&maps, &subs, 1, "x", 0).map(|d| d.info.doc.description.clone())
         };
         assert_eq!(at("1,1,19,7").as_deref(), Some("Endereco"));
         assert_eq!(at("1,1,24,7").as_deref(), Some("Histórico"));
@@ -1067,11 +1437,11 @@ mod tests {
         let subs = vec!["1".to_string(), "1".to_string()];
 
         let first = describe(&maps, &subs, 12, "1234;7", 0).expect("the first run");
-        assert_eq!(first.info.description, "Primeira Nota Fiscal");
+        assert_eq!(first.info.doc.description, "Primeira Nota Fiscal");
         assert_eq!(first.raw, "1234");
 
         let second = describe(&maps, &subs, 12, "1234;7", 5).expect("the second run");
-        assert_eq!(second.info.description, "Quantidade de Notas");
+        assert_eq!(second.info.doc.description, "Quantidade de Notas");
         assert_eq!(
             second.raw, "7",
             "the value shown is the sub-piece, not all of it"

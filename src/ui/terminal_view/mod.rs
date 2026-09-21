@@ -6,7 +6,7 @@
 
 use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 
-use crate::config::{CursorStyle, Theme};
+use crate::config::{CursorStyle, IntellisenseMode, Theme};
 use crate::features::analyze;
 use crate::features::export;
 use crate::features::macros::{Macro, MacroGroup};
@@ -33,7 +33,7 @@ pub use menu::ContextAction;
 use menu::{analyze_scopes, export_menu, macro_menu, natives_menu};
 use mouse::handle_mouse;
 use paint::{paint_row, syntax_overrides};
-pub use pieces::PieceSelection;
+pub use pieces::{GlobalTarget, KeySelection, PieceSelection};
 use scroll::{autoscroll_lines, h_scrollbar, scroll_lines, scrollbar, SCROLLBAR_WIDTH};
 
 /// Everything about how the grid should be drawn that is not the grid itself.
@@ -58,6 +58,9 @@ pub struct RenderOpts {
     pub wrap: bool,
     /// Put a selection on the clipboard the moment the mouse is released.
     pub copy_on_select: bool,
+    /// When to work out what the pointer is over on a `zwrite` row, for the
+    /// piece and subscript tooltip.
+    pub intellisense: IntellisenseMode,
     /// Tell the session the grid is [`TERMINAL_COLS`] wide rather than as wide
     /// as the window.
     ///
@@ -81,6 +84,7 @@ impl Default for RenderOpts {
             syntax: true,
             wrap: true,
             copy_on_select: false,
+            intellisense: IntellisenseMode::default(),
             wide_grid: true,
         }
     }
@@ -368,10 +372,11 @@ pub struct RenderResult {
     /// Size of one character cell, in points. What the window has to be grown
     /// or shrunk by to gain or lose a column or a row.
     pub cell: Vec2,
-    /// The pointer is hovering a selection that is exactly one piece of a
-    /// global's value - the trigger for the documentation tooltip. Only ever
-    /// set alongside a real, non-empty selection; never speculative.
-    pub piece_hover: Option<PieceSelection>,
+    /// What the pointer is over on a `zwrite` row - one piece of a global's
+    /// value, or one subscript of its key. The trigger for the documentation
+    /// tooltip, and `None` whenever the pointer is over anything else or the
+    /// tooltip is switched off.
+    pub piece_hover: Option<GlobalTarget>,
 }
 
 /// Draws the grid into the remaining space of `ui`.
@@ -560,21 +565,28 @@ pub fn show(
         &used,
     );
 
-    // The piece tooltip's trigger: the pointer sitting over the selection,
-    // and that selection being exactly one piece of a global's value. Read
-    // after `handle_mouse`, so a selection just finished this same frame is
-    // seen too.
-    let piece_hover = response
-        .hover_pos()
-        .and_then(|pos| {
-            let offset = mouse::column_at(pos.x, rect.left(), cell.x, mode.view_cols);
-            let last = grid.cols.saturating_sub(1);
-            let hovered = mouse::resolve(pos, rect, cell, top, mode, &segments, offset, last);
-            state
+    // The tooltip's trigger: what the pointer is over, read after
+    // `handle_mouse` so a selection just finished this same frame is seen too.
+    //
+    // `Selection` asks about the selection under the pointer - so the tooltip
+    // only ever appears over text the user picked out. `Hover` asks about the
+    // cell itself, which needs no selection at all and is the mode for reading
+    // a dump rather than one row of it.
+    let piece_hover = response.hover_pos().and_then(|pos| {
+        if opts.intellisense == IntellisenseMode::Off {
+            return None;
+        }
+        let offset = mouse::column_at(pos.x, rect.left(), cell.x, mode.view_cols);
+        let last = grid.cols.saturating_sub(1);
+        let (line, col) = mouse::resolve(pos, rect, cell, top, mode, &segments, offset, last);
+        match opts.intellisense {
+            IntellisenseMode::Hover => pieces::target_at_point(grid, line, col),
+            _ => state
                 .selection
-                .filter(|sel| sel.contains(hovered.0, hovered.1))
-        })
-        .and_then(|selection| pieces::piece_at_selection(grid, &selection));
+                .filter(|sel| sel.contains(line, col))
+                .and_then(|selection| pieces::target_at_selection(grid, &selection)),
+        }
+    });
 
     // Where the cursor is, in grid coordinates, when it is visible and its cell
     // is one of the ones on screen.

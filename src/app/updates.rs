@@ -135,28 +135,24 @@ impl App {
         }
     }
 
-    /// Asks about a live session before installing, the way Alt+F4 does -
-    /// and asks *before*, not after: installing put the new copy on disk and
-    /// starting it, so asking afterward and having the user decline left that
-    /// copy already running beside a window that then refused to close.
+    /// Installs and restarts outright, without the live-session question a
+    /// plain close asks.
+    ///
+    /// "Restart and update" is already an answer to that question: it names
+    /// the close it is asking for. Putting the confirmation in front of it
+    /// meant the one button whose whole point is "close and come back" stopped
+    /// to ask whether to close, which read as the update having failed.
+    /// `confirm_close_with_live_session` guards the closes the user did not
+    /// spell out - the window's X, Alt+F4 - and this is not one of them.
     pub(super) fn apply_update(&mut self, ctx: &Context) {
         if self.updates.staged.is_none() {
-            return;
-        }
-        if self.should_confirm_close() {
-            self.confirm_close = true;
-            self.pending_update = true;
             return;
         }
         self.install_and_restart(ctx);
     }
 
     /// Puts the downloaded build in place and closes, so the copy that is
-    /// starting takes over. Called once nothing more needs asking - either
-    /// there was no live session to ask about, or [`close_confirm_dialog`]
-    /// just got its "close anyway".
-    ///
-    /// [`close_confirm_dialog`]: super::App::close_confirm_dialog
+    /// starting takes over.
     pub(super) fn install_and_restart(&mut self, ctx: &Context) {
         let Some(staged) = self.updates.staged.clone() else {
             return;
@@ -165,9 +161,14 @@ impl App {
             Ok(()) => {
                 self.updates.available = None;
                 self.updates.staged = None;
-                // Already asked, or nothing to ask about - either way this
-                // close must not stop to ask again.
+                // The new build is on disk and this process is the old one:
+                // the close that follows is the update, not a close to be
+                // reconsidered, so it must not stop to ask.
                 self.close_confirmed = true;
+                // And a confirmation already on screen - raised by an X the
+                // user clicked and then thought better of - is not left
+                // hanging over a window that is going away.
+                self.confirm_close = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Err(e) => {

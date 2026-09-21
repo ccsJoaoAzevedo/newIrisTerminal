@@ -125,8 +125,8 @@ const PT_BR: &[(&str, &str)] = &[
     ("Could not save the proxy password: {}",
      "Não foi possível salvar a senha do proxy: {}"),
     ("Restart and update", "Reiniciar e atualizar"),
-    ("Puts the new version in place and starts it. A session still connected is asked about first.",
-     "Coloca a nova versão no lugar e a inicia. Uma sessão ainda conectada é perguntada antes."),
+    ("Puts the new version in place and starts it. Closes straight away, without asking about connected sessions - this is the close you just asked for. Each of them is sent HALT on the way out.",
+     "Coloca a nova versão no lugar e a inicia. Fecha na hora, sem perguntar sobre sessões conectadas - este é o fechamento que você acabou de pedir. Cada uma delas recebe HALT na saída."),
     ("Later", "Depois"),
     ("Check for a new version at startup", "Procurar uma nova versão ao iniciar"),
     ("One request to GitHub through the machine's own proxy. Nothing is downloaded or replaced without being asked.",
@@ -537,10 +537,22 @@ const PT_BR: &[(&str, &str)] = &[
     ("Looking up ^{}…", "Consultando ^{}…"),
     ("Piece: {} - {}", "Piece: {} - {}"),
     ("Piece: {}", "Piece: {}"),
+    // A subscript, in the vocabulary the ERP's own documentation screen uses
+    // for one: "chave".
+    ("Key: {} - {}", "Chave: {} - {}"),
+    ("Key: {}", "Chave: {}"),
+    ("Key: {} - constant ({})", "Chave: {} - fixa ({})"),
     ("Size: {}", "Tamanho: {}"),
     ("Type: {}", "Tipo: {}"),
     ("Formatted value: {}", "Valor formatado: {}"),
     ("invalid value", "valor inválido"),
+    ("Global tooltip", "Dica do global"),
+    ("On hover", "Ao passar o mouse"),
+    ("On selection", "Ao selecionar"),
+    (
+        "What a piece or a subscript of a zwrite'n global means, read out of the class that maps it. On selection: only over text you have selected, which is what a double-click on a piece already gives. On hover: over whatever the pointer is on, with nothing selected. Off: never asked, and no second session is opened to ask with.",
+        "O que significa um piece ou uma chave de um global exibido com zwrite, lido da classe que o mapeia. Ao selecionar: somente sobre o texto selecionado, que é o que um duplo clique num piece já dá. Ao passar o mouse: sobre o que estiver sob o ponteiro, sem precisar selecionar. Desligado: nunca consulta, e nenhuma segunda sessão é aberta para consultar.",
+    ),
 ];
 
 #[cfg(test)]

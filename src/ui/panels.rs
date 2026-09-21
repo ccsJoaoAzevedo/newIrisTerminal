@@ -18,7 +18,7 @@ use egui::{Context, Ui};
 
 use crate::config::profile::Remote;
 use crate::config::servers::{Server, ServerList, Target};
-use crate::config::{profile::LogMode, CursorStyle, Profile, Settings, Theme};
+use crate::config::{profile::LogMode, CursorStyle, IntellisenseMode, Profile, Settings, Theme};
 use crate::features::macros::Macro;
 use crate::features::natives::Native;
 use crate::i18n::{tr, tr1, tr2};
@@ -509,7 +509,7 @@ pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool
                     if ui
                         .button(tr("Restart and update"))
                         .on_hover_text(tr(
-                            "Puts the new version in place and starts it. A session still connected is asked about first.",
+                            "Puts the new version in place and starts it. Closes straight away, without asking about connected sessions - this is the close you just asked for. Each of them is sent HALT on the way out.",
                         ))
                         .clicked()
                     {
@@ -777,6 +777,23 @@ pub fn settings_dialog(
                 {
                     changed = true;
                 }
+                ui.horizontal(|ui| {
+                    ui.label(tr("Global tooltip"));
+                    for mode in IntellisenseMode::ALL {
+                        if ui
+                            .selectable_label(settings.intellisense == mode, tr(mode.label()))
+                            .clicked()
+                        {
+                            settings.intellisense = mode;
+                            changed = true;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(tr(
+                    "What a piece or a subscript of a zwrite'n global means, read out of the class that maps it. On selection: only over text you have selected, which is what a double-click on a piece already gives. On hover: over whatever the pointer is on, with nothing selected. Off: never asked, and no second session is opened to ask with.",
+                ));
+
                 if ui
                     .checkbox(
                         &mut settings.surround_selection,

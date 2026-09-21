@@ -165,11 +165,6 @@ pub struct App {
     /// Set once the user has said to close anyway, so the confirmation cannot
     /// cancel the very close it just approved.
     close_confirmed: bool,
-    /// A restart-and-update is waiting on the same live-session question a
-    /// plain close asks. Set by [`App::apply_update`] instead of installing
-    /// outright, so a decline leaves the old build running with nothing
-    /// changed rather than a new copy already started beside it.
-    pending_update: bool,
     /// The opening size still to be applied, while there is one.
     fit: Option<WindowFit>,
     /// Window geometry as last seen by [`App::track_window_geometry`], which is
@@ -327,7 +322,6 @@ impl App {
             settings_placement,
             confirm_close: false,
             close_confirmed: false,
-            pending_update: false,
             fit,
             window_size: None,
             window_position: None,
