@@ -50,6 +50,15 @@ pub fn command_history_path() -> PathBuf {
     config_dir().join("history.txt")
 }
 
+/// The best score anyone has managed at the easter egg, as a bare number.
+///
+/// A file of its own rather than a field in the settings: it is written by the
+/// game as it ends, and settings.toml is rewritten from the settings window -
+/// the two would overwrite each other.
+pub fn snake_score_path() -> PathBuf {
+    config_dir().join("snake.txt")
+}
+
 /// Shows `path` in the platform's file manager, creating it first if it is not
 /// there yet.
 ///

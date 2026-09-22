@@ -54,6 +54,12 @@ pub struct Tab {
     /// Which pane has the keyboard. Meaningless until the tab is split, and
     /// what the strip entry's `1:` or `2:` reports.
     pub focus: Pane,
+    /// The easter egg, in the tab `/snake` opened. A tab holding one holds no
+    /// session and never will: it is drawn by
+    /// [`crate::ui::snake_view`] instead of by the terminal, and every path
+    /// that would pump, resize or type into a session asks this first. See
+    /// `App::take_easter_egg`.
+    pub game: Option<Box<Snake>>,
 }
 
 /// Source of [`Tab::uid`]. Never reused, so a closed tab's id cannot collide
@@ -113,9 +119,55 @@ impl Tab {
             error: None,
             split: None,
             focus: Pane::First,
+            game: None,
         };
         tab.start();
         tab
+    }
+
+    /// A tab holding the easter egg instead of a session.
+    ///
+    /// Nothing is started, nothing is logged and nothing is connected: this
+    /// tab has no far side at all, which is what every `session.is_none()`
+    /// path through the shell already copes with. The grid it carries is never
+    /// drawn - [`crate::ui::snake_view`] draws the board instead - so it is
+    /// made at the smallest size the rest of the code will accept rather than
+    /// at the terminal's own.
+    pub fn snake(game: Snake) -> Self {
+        Tab {
+            uid: NEXT_TAB_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            autologon: Autologon::new(&Profile::default()),
+            doc_lookup: DocLookup::default(),
+            grid: Grid::new(2, 2, 0),
+            profile: Profile {
+                name: crate::i18n::tr("Snake").to_string(),
+                ..Profile::default()
+            },
+            session: None,
+            parser: vte::Parser::new(),
+            view: ViewState::default(),
+            log: None,
+            // Left for the user to set, the way any other tab's is: the name
+            // on the strip comes from the profile below, through the ordinary
+            // path.
+            custom_title: None,
+            namespace: None,
+            commands: Vec::new(),
+            recall_step: None,
+            clear_asked: None,
+            ended: false,
+            error: None,
+            split: None,
+            focus: Pane::First,
+            game: Some(Box::new(game)),
+        }
+    }
+
+    /// Whether this tab is the easter egg rather than a session. Asked by
+    /// everything that would otherwise treat a tab as a terminal - drawing it,
+    /// sizing it, splitting it.
+    pub fn is_game(&self) -> bool {
+        self.game.is_some()
     }
 
     pub fn start(&mut self) {
@@ -433,6 +485,12 @@ impl Tab {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        // The easter egg has no grid worth the name and no far side to tell
+        // about one. Its board is square and sizes itself to the pane it is
+        // drawn in.
+        if self.is_game() {
+            return;
+        }
         if cols == self.grid.cols && rows == self.grid.rows {
             return;
         }
@@ -568,6 +626,7 @@ mod tests {
             error: None,
             split: None,
             focus: Pane::First,
+            game: None,
         }
     }
 

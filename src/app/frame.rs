@@ -120,6 +120,15 @@ impl eframe::App for App {
                     pane: Pane::Second,
                 };
 
+                // The easter egg is not a session, and none of what follows is
+                // about it: there is no character grid to fit the window to,
+                // no far side to tell a width to, and nothing to drain. Its
+                // board squares itself off against the pane it is given.
+                if self.tabs[active].is_game() {
+                    self.game_pane(ui, ctx, &theme, first);
+                    return;
+                }
+
                 // `geometry` is the first pane's, which is what the window is
                 // fitted from and what a new session opens at; `shown` is the
                 // focused pane's, which is the size worth reporting because it

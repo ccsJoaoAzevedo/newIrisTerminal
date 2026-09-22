@@ -36,6 +36,21 @@ impl App {
         self.active = self.tabs.len() - 1;
     }
 
+    /// Opens the easter egg, or goes back to the board that is already open.
+    ///
+    /// One at a time: typing `/snake` again is somebody coming back to the
+    /// game rather than asking for a second one, and the score they were
+    /// playing for is on the board they left.
+    pub(super) fn open_snake_tab(&mut self) {
+        if let Some(index) = self.tabs.iter().position(Tab::is_game) {
+            self.active = index;
+            return;
+        }
+        let game = Snake::new(Some(config::snake_score_path()));
+        self.tabs.push(Tab::snake(game));
+        self.active = self.tabs.len() - 1;
+    }
+
     /// Closes a tab and everything in it - both sessions, when it is split.
     pub fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
@@ -197,6 +212,12 @@ impl App {
             });
         }
 
+        // Where each tab was drawn this frame, and which one is being dragged:
+        // what a drag is measured against once every tab has been laid out.
+        let mut spans: Vec<(f32, f32)> = Vec::with_capacity(self.tabs.len());
+        let mut dragging = None;
+        let mut to_move = None;
+
         egui::ScrollArea::horizontal()
             .auto_shrink([true, false])
             .scroll_bar_visibility(visibility)
@@ -205,15 +226,25 @@ impl App {
                 for index in 0..self.tabs.len() {
                     let selected = index == self.active;
                     let split = self.tabs[index].split.is_some();
+                    let game = self.tabs[index].is_game();
                     let mut label = self.tabs[index].strip_label(with_namespace);
                     if self.tabs[index].focused().ended {
                         label.push_str(" (ended)");
                     }
-                    let response = ui
-                        .selectable_label(selected, label)
-                        .on_hover_text(tr("Double-click to rename."));
+                    let response = tab_label(ui, self.tabs[index].uid, selected, label)
+                        .on_hover_text(tr("Double-click to rename, drag to reorder."));
                     if response.clicked() {
                         to_activate = Some(index);
+                    }
+                    // The tab being moved is the one shown, the way it is
+                    // everywhere else tabs are dragged: what is under the strip
+                    // should be the session the user has hold of.
+                    if response.drag_started() {
+                        to_activate = Some(index);
+                    }
+                    if response.dragged() {
+                        dragging = Some(index);
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                     }
                     if response.double_clicked() {
                         to_rename = Some(index);
@@ -245,7 +276,7 @@ impl App {
                                 to_unsplit = Some(index);
                                 ui.close_menu();
                             }
-                        } else {
+                        } else if !game {
                             if ui
                                 .button(tr("Split to right"))
                                 .on_hover_text(tr(
@@ -275,17 +306,47 @@ impl App {
                             ui.close_menu();
                         }
                     });
-                    if icon_button(ui, icons::Glyph::SmallCross, None)
-                        .on_hover_text(tr("Close this tab."))
-                        .clicked()
-                    {
+                    let close = icon_button(ui, icons::Glyph::SmallCross, None)
+                        .on_hover_text(tr("Close this tab."));
+                    if close.clicked() {
                         to_close = Some(index);
                     }
+                    spans.push((response.rect.left(), close.rect.right()));
                     ui.separator();
+                }
+
+                let pointer = ui.ctx().pointer_interact_pos();
+                if let (Some(from), Some(pointer)) = (dragging, pointer) {
+                    to_move = drop_slot(&spans, from, pointer.x).map(|to| (from, to));
+                    // Held against either edge of the strip, the drag scrolls
+                    // it: the tabs beyond the edge are where the user is
+                    // trying to put this one, and they cannot be reached by
+                    // a pointer that has nowhere further to go.
+                    let visible = ui.clip_rect();
+                    let edge = 24.0;
+                    let push = if pointer.x < visible.left() + edge {
+                        1.0
+                    } else if pointer.x > visible.right() - edge {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    if push != 0.0 {
+                        ui.scroll_with_delta(egui::vec2(push * 8.0, 0.0));
+                        // The pointer holding still is still asking for the
+                        // strip to move, and an idle loop asks for no frames.
+                        ui.ctx().request_repaint();
+                    }
                 }
             });
         });
 
+        if let Some((from, to)) = to_move {
+            self.move_tab(from, to);
+            // The tab ends where the pointer is, and it was active already
+            // from the moment it was taken hold of.
+            to_activate = Some(to);
+        }
         if let Some(index) = to_activate {
             self.activate_tab(index);
         }
@@ -314,6 +375,23 @@ impl App {
         }
     }
 
+    /// Moves the tab at `from` to `to`, shifting the ones between along.
+    ///
+    /// Everything that remembers a tab by its index has to move with it: the
+    /// active tab, and a rename in progress, which would otherwise commit the
+    /// new name to whichever tab slid into the old place.
+    pub(super) fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = moved_index(self.active, from, to);
+        if let Some(renaming) = self.renaming.as_mut() {
+            renaming.tab = moved_index(renaming.tab, from, to);
+        }
+    }
+
     /// Makes a tab the active one, which is the tab drawn and the one every
     /// other feature works on. Which of its panes is current is the tab's own
     /// business - see [`Tab::focus`].
@@ -330,7 +408,13 @@ impl App {
     /// that is already split is left alone: it has two names to show and no
     /// room for a third.
     pub(super) fn split_tab(&mut self, index: usize, dir: SplitDir) {
-        if self.tabs.get(index).is_none_or(|tab| tab.split.is_some()) {
+        // A tab holding the easter egg holds no session and cannot hold one:
+        // splitting it would put a live IRIS session in a pane nothing draws.
+        if self
+            .tabs
+            .get(index)
+            .is_none_or(|tab| tab.split.is_some() || tab.is_game())
+        {
             return;
         }
         let (cols, rows) = self.initial_size(&self.new_tab_profile.clone());
@@ -449,6 +533,168 @@ impl App {
         } else if !(cancel || !open) {
             // Still open, so the draft survives to the next frame.
             self.renaming = Some(renaming);
+        }
+    }
+}
+
+/// One tab's name in the strip: a selectable label, drawn exactly as egui's
+/// own, that can also be dragged.
+///
+/// Not `ui.selectable_label`, because that takes its id from egui's counter,
+/// which numbers widgets by where they are drawn - and `push_id` around it
+/// does not help, since a child `Ui` seeds its counter from its parent's
+/// rather than from the id it was given. A drag is tracked by id, and the tab
+/// being dragged changes place every time it passes another one: with an id
+/// that belongs to the place, the drag stayed behind and was taken up by
+/// whichever tab moved into it, which then moved in turn, and the tabs went
+/// round in a circle under a pointer that was holding still. The id here is
+/// the tab's own, so it goes wherever the tab goes.
+///
+/// Click and drag both: egui only calls it a drag once the pointer has moved
+/// past the click threshold, so a click still selects and a double-click still
+/// renames.
+fn tab_label(ui: &mut egui::Ui, uid: u64, selected: bool, text: String) -> egui::Response {
+    let padding = ui.spacing().button_padding;
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        None,
+        ui.available_width() - 2.0 * padding.x,
+        egui::TextStyle::Button,
+    );
+    let mut size = galley.size() + 2.0 * padding;
+    size.y = size.y.max(ui.spacing().interact_size.y);
+    let (rect, _) = ui.allocate_at_least(size, egui::Sense::hover());
+    let response = ui.interact(
+        rect,
+        egui::Id::new(("nit-tab", uid)),
+        egui::Sense::click_and_drag(),
+    );
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        if selected || response.hovered() || response.highlighted() || response.has_focus() {
+            ui.painter().rect(
+                rect.expand(visuals.expansion),
+                visuals.rounding,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+            );
+        }
+        let at = ui
+            .layout()
+            .align_size_within_rect(galley.size(), rect.shrink2(padding))
+            .min;
+        ui.painter().galley(at, galley, visuals.text_color());
+    }
+    response
+}
+
+/// Where the tab being dragged belongs, given the left and right edge of every
+/// tab as drawn and where the pointer is - or `None` while it is still over its
+/// own place.
+///
+/// A tab moves once the pointer passes the *middle* of a neighbour, not its
+/// edge. Tabs differ in width, and swapping at the edge would put a wide
+/// neighbour straight back under the pointer, which would swap them back on
+/// the next frame and flicker for as long as the pointer stayed there. Past
+/// the middle, the neighbour ends up on the far side of the pointer either way.
+///
+/// A pointer that has passed several middles in one frame - a fast flick -
+/// moves the tab all the way, not one place per frame.
+fn drop_slot(spans: &[(f32, f32)], from: usize, x: f32) -> Option<usize> {
+    let middle = |i: usize| (spans[i].0 + spans[i].1) / 2.0;
+    if from >= spans.len() {
+        return None;
+    }
+    (from + 1..spans.len())
+        .rev()
+        .find(|&i| x > middle(i))
+        .or_else(|| (0..from).find(|&i| x < middle(i)))
+}
+
+/// Where the tab at `index` is after the one at `from` has moved to `to`.
+fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && (from + 1..=to).contains(&index) {
+        index - 1
+    } else if to < from && (to..from).contains(&index) {
+        index + 1
+    } else {
+        index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Three tabs of different widths, side by side: 0..50, 50..250, 250..300.
+    const SPANS: [(f32, f32); 3] = [(0.0, 50.0), (50.0, 250.0), (250.0, 300.0)];
+
+    #[test]
+    fn a_tab_stays_put_until_the_pointer_passes_a_neighbours_middle() {
+        assert_eq!(drop_slot(&SPANS, 0, 140.0), None, "short of 150");
+        assert_eq!(drop_slot(&SPANS, 0, 160.0), Some(1));
+        assert_eq!(
+            drop_slot(&SPANS, 2, 160.0),
+            None,
+            "short of 150, from the right"
+        );
+        assert_eq!(drop_slot(&SPANS, 2, 140.0), Some(1));
+    }
+
+    /// Swapped past the middle, the wide neighbour lands on the far side of
+    /// the pointer - so the next frame, with the pointer where it was, leaves
+    /// the tabs alone rather than swapping them back.
+    #[test]
+    fn a_swap_with_a_wider_neighbour_does_not_swap_straight_back() {
+        let x = 160.0;
+        assert_eq!(drop_slot(&SPANS, 0, x), Some(1));
+        // After the swap: the wide tab first, the dragged one after it.
+        let swapped = [(0.0, 200.0), (200.0, 250.0), (250.0, 300.0)];
+        assert_eq!(drop_slot(&swapped, 1, x), None);
+    }
+
+    #[test]
+    fn a_fast_drag_moves_the_tab_past_every_middle_it_crossed() {
+        assert_eq!(drop_slot(&SPANS, 0, 290.0), Some(2));
+        assert_eq!(drop_slot(&SPANS, 2, 10.0), Some(0));
+    }
+
+    #[test]
+    fn the_pointer_over_the_dragged_tab_itself_moves_nothing() {
+        assert_eq!(drop_slot(&SPANS, 1, 60.0), None);
+        assert_eq!(drop_slot(&SPANS, 1, 240.0), None);
+    }
+
+    /// Every index is carried along: the moved tab goes to its new place, the
+    /// ones it passed shift by one towards where it came from, and the rest
+    /// stay where they were.
+    #[test]
+    fn moving_a_tab_shifts_only_the_tabs_it_passed() {
+        // 0 1 2 3 4, with 1 moved to 3: 0 2 3 1 4.
+        let after: Vec<usize> = (0..5).map(|i| moved_index(i, 1, 3)).collect();
+        assert_eq!(after, vec![0, 3, 1, 2, 4]);
+        // And back the other way, 3 to 1: 0 3 1 2 4.
+        let after: Vec<usize> = (0..5).map(|i| moved_index(i, 3, 1)).collect();
+        assert_eq!(after, vec![0, 2, 3, 1, 4]);
+    }
+
+    /// The same remapping, checked against what `Vec::remove` and `insert`
+    /// actually do to the tabs, for every pair of places.
+    #[test]
+    fn the_remapping_agrees_with_moving_the_tabs_themselves() {
+        for from in 0..5 {
+            for to in 0..5 {
+                let mut tabs: Vec<usize> = (0..5).collect();
+                let tab = tabs.remove(from);
+                tabs.insert(to, tab);
+                for original in 0..5 {
+                    let now = moved_index(original, from, to);
+                    assert_eq!(tabs[now], original, "{original}, moving {from} to {to}");
+                }
+            }
         }
     }
 }

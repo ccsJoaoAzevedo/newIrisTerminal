@@ -1,12 +1,22 @@
 //! Recognising the part of a global a pointer or a selection is asking about.
 //!
-//! A `zwrite`-shaped row reads `^NAME(subscripts)="p1^p2^p3"`. This is a
-//! character-level reader of that one shape, not a general parser: it only
-//! has to answer "is this one `^`-delimited piece of the value, or one
+//! A global reaches the screen in three shapes, and this reads all three:
+//!
+//! * A `zwrite` row: `^NAME(subscripts)="p1^p2^p3"`, key and value on one row.
+//! * A `write` of one node: the command line names the key -
+//!   `USER>w ^NAME(subscripts)` - and the row under it is the bare value,
+//!   unquoted, with nothing on it to say whose value it is.
+//! * A `^%G` listing, which prints a key in full only when it has to: a row
+//!   whose leading subscripts are the same as the row above's leaves them out
+//!   and indents to where the first different one starts, `          3)="..."`.
+//!   The missing part is recovered from the rows above.
+//!
+//! This is a character-level reader of those shapes, not a general parser: it
+//! only has to answer "is this one `^`-delimited piece of the value, or one
 //! subscript of the key, and if so which and of what global".
 
 use super::Selection;
-use crate::term::Grid;
+use crate::term::{syntax, Grid, Row};
 
 /// A single piece of a global's value, selected whole.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,8 +94,8 @@ impl GlobalTarget {
 ///
 /// `None` for a selection spanning more than one line (nothing here is
 /// per-line), one that reaches outside both the key and the value, one that
-/// crosses a `^` or a subscript boundary, or a row that is not shaped like
-/// `^NAME(...)=...` at all.
+/// crosses a `^` or a subscript boundary, or a row that is none of the shapes
+/// the module reads.
 pub fn target_at_selection(grid: &Grid, selection: &Selection) -> Option<GlobalTarget> {
     let (line, sel_start, sel_end) = single_line_span(selection)?;
     if sel_start >= sel_end {
@@ -99,23 +109,13 @@ pub fn target_at_selection(grid: &Grid, selection: &Selection) -> Option<GlobalT
 ///
 /// It answers exactly what a selection of that column would, empty pieces
 /// included: pointing at either delimiter of a `^^` names the piece between
-/// them. See [`widened`], which is what makes one column enough.
+/// them. See `widened`, which is what makes one column enough.
 pub fn target_at_point(grid: &Grid, line: usize, col: usize) -> Option<GlobalTarget> {
     target_in(grid, line, col, col + 1)
 }
 
 fn target_in(grid: &Grid, line: usize, from: usize, to: usize) -> Option<GlobalTarget> {
-    let row = grid.line(line)?;
-    // Before the row is copied out, not after: on hover this runs every frame
-    // the pointer is anywhere in the pane, and a row is as wide as
-    // `TERMINAL_COLS` lets it be. A row that does not start with `^` is not a
-    // `zwrite` line and is most of them.
-    if row.cells.first().map(|c| c.ch) != Some('^') {
-        return None;
-    }
-    let width = row.used_width();
-    let text: Vec<char> = row.cells[..width].iter().map(|c| c.ch).collect();
-    let shape = row_shape(&text)?;
+    let (text, shape) = shape_at(grid, line)?;
 
     // The value first: a subscript span and the value never overlap, so the
     // order is only about which of two `None`s is reached first.
@@ -125,22 +125,77 @@ fn target_in(grid: &Grid, line: usize, from: usize, to: usize) -> Option<GlobalT
     key_in(&shape, from, to).map(GlobalTarget::Key)
 }
 
+/// The row at `line` taken apart, with its text, whichever of the three shapes
+/// in the module's description it is.
+///
+/// Every test that decides a row is none of them is made on the cells before
+/// the row is copied out, not after: on hover this runs every frame the
+/// pointer is anywhere in the pane, a row is as wide as `TERMINAL_COLS` lets
+/// it be, and most rows are plain output that fails on its first character.
+fn shape_at(grid: &Grid, line: usize) -> Option<(Vec<char>, RowShape)> {
+    let row = grid.line(line)?;
+    let first = row.cells.first()?.ch;
+    let under_write = line
+        .checked_sub(1)
+        .and_then(|above| grid.line(above))
+        .and_then(written_reference);
+    let has_prompt = syntax::prompt_end_of(&row.cells).is_some();
+    if first != '^' && first != ' ' && under_write.is_none() && !has_prompt {
+        return None;
+    }
+
+    let text = text_of(row);
+    let shape = if first == '^' { row_shape(&text) } else { None };
+    // A written value can start with `^` itself - an empty first piece - so
+    // it is tried whenever the row is not a `zwrite` one, not only when it
+    // does not start with `^`. And before an indented row, being the more
+    // certain of the two: a command line right above it names exactly this,
+    // where an indented row is only a guess until the rows above it agree.
+    let shape = shape
+        .or_else(|| under_write.and_then(|reference| written_value(reference, &text, has_prompt)))
+        .or_else(|| match first {
+            ' ' => continued_row(grid, line, &text),
+            _ => None,
+        })
+        .or_else(|| {
+            written_reference(row).map(|reference| RowShape {
+                global: reference.global,
+                subscripts: reference.subscripts,
+                key_spans: reference.key_spans,
+                value: None,
+            })
+        })?;
+    Some((text, shape))
+}
+
 /// The piece of the value the span `from..to` asks about.
+///
+/// Worked in columns relative to the value, signed, because the column just
+/// before the value is one of its bounds and a written value starts at column
+/// zero: there `-1` is a column that does not exist and still has to bound the
+/// first piece.
 fn piece_in(text: &[char], shape: &RowShape, from: usize, to: usize) -> Option<PieceSelection> {
-    let (val_from, val_to) = (shape.val_from, shape.val_to);
-    let (from, to) = widened(text, val_from, val_to, from, to);
+    let (val_from, val_to) = shape.value?;
+    // Past the row's last character there is nothing to point at. Checked
+    // here because a value that runs to the end of the row - a written one,
+    // an unquoted one - has that empty column as its own closing bound.
+    if from >= text.len() {
+        return None;
+    }
+    let value = &text[val_from..val_to];
+    let relative = |col: usize| col as isize - val_from as isize;
+    let (from, to) = widened(value, relative(from), relative(to));
     // What is being asked about, as a half-open range of the value.
-    let (asked_from, asked_to) = match between_delimiters(text, val_from, val_to, from, to) {
+    let (asked_from, asked_to) = match between_delimiters(value, from, to) {
         Some(between) => between,
         None => {
-            if from < val_from || to > val_to {
+            if from < 0 || to > value.len() as isize {
                 return None;
             }
-            (from - val_from, to - val_from)
+            (from as usize, to as usize)
         }
     };
 
-    let value = &text[val_from..val_to];
     if value.get(asked_from..asked_to)?.contains(&'^') {
         return None;
     }
@@ -199,70 +254,63 @@ fn key_in(shape: &RowShape, from: usize, to: usize) -> Option<KeySelection> {
 /// left alone, but one with another delimiter beside it has an empty piece
 /// between them and nothing else it could mean. The side after is tried
 /// first, so the two delimiters of one `^^` both name the piece between them.
-fn widened(
-    text: &[char],
-    val_from: usize,
-    val_to: usize,
-    from: usize,
-    to: usize,
-) -> (usize, usize) {
-    if to != from + 1 || !is_delimiter(text, val_from, val_to, from) {
+///
+/// In columns relative to the value, like everything `piece_in` hands on.
+fn widened(value: &[char], from: isize, to: isize) -> (isize, isize) {
+    if to != from + 1 || !is_delimiter(value, from) {
         return (from, to);
     }
-    if is_delimiter(text, val_from, val_to, to) {
+    if is_delimiter(value, to) {
         return (from, to + 1);
     }
-    match from.checked_sub(1) {
-        Some(before) if is_delimiter(text, val_from, val_to, before) => (before, to),
-        _ => (from, to),
+    if is_delimiter(value, from - 1) {
+        return (from - 1, to);
     }
+    (from, to)
 }
 
 /// What lies between the two delimiters a selection is made of, as a
 /// half-open range of the value - or `None` when the selection is not that
 /// shape and is an ordinary selection inside a piece.
 ///
-/// The first and last selected columns both have to be delimiters. The value's
-/// own quotes count as delimiters, because the first and last pieces have
-/// nothing else bounding them.
-fn between_delimiters(
-    text: &[char],
-    val_from: usize,
-    val_to: usize,
-    sel_start: usize,
-    sel_end: usize,
-) -> Option<(usize, usize)> {
-    let last = sel_end.checked_sub(1)?;
+/// The first and last selected columns both have to be delimiters. The
+/// value's own bounds count as delimiters, because the first and last pieces
+/// have nothing else bounding them.
+fn between_delimiters(value: &[char], sel_start: isize, sel_end: isize) -> Option<(usize, usize)> {
+    let last = sel_end - 1;
     // Two distinct characters: a lone `^` does not say which of the two pieces
     // it separates is the one being asked about.
     if last <= sel_start {
         return None;
     }
-    if !is_delimiter(text, val_from, val_to, sel_start)
-        || !is_delimiter(text, val_from, val_to, last)
-    {
+    if !is_delimiter(value, sel_start) || !is_delimiter(value, last) {
         return None;
     }
-    let from = (sel_start + 1).checked_sub(val_from)?;
-    let to = last.checked_sub(val_from)?;
-    (from <= to).then_some((from, to))
+    // Both in range: a delimiter is never left of `-1` or right of the
+    // value's length, and `last` is right of `sel_start`.
+    Some(((sel_start + 1) as usize, last as usize))
 }
 
-/// Whether column `at` holds something that bounds a piece: a `^`, one of the
-/// characters a map can subdivide a piece with, or one of the value's own
-/// quotes.
+/// Whether column `at` of the value bounds a piece: a `^`, one of the
+/// characters a map can subdivide a piece with, or one of the value's own two
+/// bounds - the columns just before and just after it.
+///
+/// The bounds are the quotes of a quoted value. An unquoted one has nothing
+/// there, or an `=` there, and they bound it all the same: this is what lets
+/// the empty first piece of a written value, which starts at column zero, be
+/// pointed at through the `^` that closes it.
 ///
 /// The sub-delimiters are named here rather than taken from the map, which
 /// this layer cannot see. Listing the two the ERP actually uses is enough:
 /// picking the wrong one only ever widens what is offered as the piece's
 /// text, and `crate::features::doc_lookup::describe` splits it by the
 /// delimiter the map really declares.
-fn is_delimiter(text: &[char], val_from: usize, val_to: usize, at: usize) -> bool {
-    match text.get(at) {
-        Some('"') => at + 1 == val_from || at == val_to,
-        Some(&c) if at >= val_from && at < val_to => matches!(c, '^' | ';' | ','),
-        _ => false,
+fn is_delimiter(value: &[char], at: isize) -> bool {
+    let len = value.len() as isize;
+    if at == -1 || at == len {
+        return true;
     }
+    (0..len).contains(&at) && matches!(value[at as usize], '^' | ';' | ',')
 }
 
 /// The selection's line and column span, when it sits on exactly one line and
@@ -272,27 +320,41 @@ fn single_line_span(selection: &Selection) -> Option<(usize, usize, usize)> {
     (start.0 == end.0).then_some((start.0, start.1, end.1))
 }
 
-/// A `zwrite` row taken apart: which global, what its key holds and where
-/// each subscript of it sits on the row, and where its value starts and ends.
+/// A row taken apart: which global, what its key holds and where each
+/// subscript of it sits on the row, and where its value starts and ends.
 struct RowShape {
     global: String,
     subscripts: Vec<String>,
     /// Each subscript's own columns on the row, as a half-open range and in
     /// the same order as `subscripts`. Quotes included, because what is being
     /// pointed at is the text on screen and a quote is part of it.
+    ///
+    /// Empty for a subscript that is part of the key but not on this row - a
+    /// written value's, which are on the command line, or the ones `^%G` left
+    /// out - so that nothing can point into it.
     key_spans: Vec<(usize, usize)>,
-    val_from: usize,
-    val_to: usize,
+    /// The value's columns, quotes stripped, or `None` for the command line of
+    /// a `write`, which holds a key and no value.
+    value: Option<(usize, usize)>,
 }
 
-/// The row taken apart, or `None` when it does not open with `^NAME`
-/// followed, past an optional subscript list, by `=`.
-fn row_shape(text: &[char]) -> Option<RowShape> {
-    let mut i = 0;
-    if text.first() != Some(&'^') {
+/// A global reference as written, `^NAME(subscripts)`: the global, its
+/// subscripts, and where each of them and the reference itself end.
+struct Reference {
+    global: String,
+    subscripts: Vec<String>,
+    key_spans: Vec<(usize, usize)>,
+    /// The column just past the reference - past its `)`, or past the name
+    /// when it has no subscripts.
+    end: usize,
+}
+
+/// The reference starting at column `at`, or `None` when there is not one.
+fn reference_at(text: &[char], at: usize) -> Option<Reference> {
+    if text.get(at) != Some(&'^') {
         return None;
     }
-    i += 1;
+    let mut i = at + 1;
     let name_from = i;
     if text.get(i) == Some(&'%') {
         i += 1;
@@ -315,17 +377,197 @@ fn row_shape(text: &[char]) -> Option<RowShape> {
         }
         i = close;
     }
-    if text.get(i) != Some(&'=') {
-        return None;
-    }
-    let (val_from, val_to) = unquoted_span(text, i + 1);
-    Some(RowShape {
+    Some(Reference {
         global,
         subscripts,
         key_spans,
-        val_from,
-        val_to,
+        end: i,
     })
+}
+
+/// A `zwrite` row taken apart, or `None` when it does not open with `^NAME`
+/// followed, past an optional subscript list, by `=`.
+fn row_shape(text: &[char]) -> Option<RowShape> {
+    let reference = reference_at(text, 0)?;
+    if text.get(reference.end) != Some(&'=') {
+        return None;
+    }
+    Some(RowShape {
+        global: reference.global,
+        subscripts: reference.subscripts,
+        key_spans: reference.key_spans,
+        value: Some(unquoted_span(text, reference.end + 1)),
+    })
+}
+
+/// The node a command line writes, when it writes exactly one: `w ^NAME(...)`
+/// or `write ^NAME(...)`, in either case, with nothing after it but the `,!`
+/// that ends the line.
+///
+/// Anything more - two references, an expression, a function around the
+/// reference - and the row under it is no longer that node's value alone, so
+/// it is refused rather than half-read.
+fn written_reference(row: &Row) -> Option<Reference> {
+    let start = syntax::prompt_end_of(&row.cells)?;
+    let text = text_of(row);
+    let blanks = |from: usize| {
+        text.get(from..)
+            .map_or(0, |rest| rest.iter().take_while(|&&c| c == ' ').count())
+    };
+
+    let word_from = start + blanks(start);
+    let word_len = text
+        .get(word_from..)?
+        .iter()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .count();
+    let word: String = text[word_from..word_from + word_len].iter().collect();
+    if !word.eq_ignore_ascii_case("w") && !word.eq_ignore_ascii_case("write") {
+        return None;
+    }
+    let after_word = word_from + word_len;
+    // A command and its argument are separated by exactly the blank IRIS
+    // requires; two would make it an argumentless `write`, which lists every
+    // variable instead.
+    if text.get(after_word) != Some(&' ') {
+        return None;
+    }
+    let reference = reference_at(&text, after_word + 1)?;
+
+    let mut i = reference.end;
+    while text.get(i..i + 2) == Some(&[',', '!'][..]) {
+        i += 2;
+    }
+    // The row is trimmed of trailing blanks, so the reference ends it.
+    (i == text.len()).then_some(reference)
+}
+
+/// The value a `write` of `reference` printed, which is the whole row.
+///
+/// `None` when the row is the prompt that follows a write of an empty value
+/// rather than a value, or the error IRIS printed instead of one.
+fn written_value(reference: Reference, text: &[char], has_prompt: bool) -> Option<RowShape> {
+    if has_prompt || is_error(text) {
+        return None;
+    }
+    Some(RowShape {
+        key_spans: vec![(0, 0); reference.subscripts.len()],
+        global: reference.global,
+        subscripts: reference.subscripts,
+        value: Some((0, text.len())),
+    })
+}
+
+/// Whether the row opens with an IRIS error, `<UNDEFINED>` and its kind.
+fn is_error(text: &[char]) -> bool {
+    let Some(rest) = text.strip_prefix(&['<']) else {
+        return false;
+    };
+    let name = rest.iter().take_while(|c| c.is_ascii_uppercase()).count();
+    name > 0 && rest.get(name) == Some(&'>')
+}
+
+/// Deep enough for any `^%G` listing a person reads by scrolling, and a bound
+/// on what one hovered frame can cost: a row far down a long run of siblings
+/// walks past every one of them to reach the row that names its global.
+const MAX_ROWS_ABOVE: usize = 5000;
+
+/// An indented `^%G` row, with the subscripts it leaves out recovered from the
+/// rows above it.
+///
+/// `^%G` indents a row to the column its first new subscript would have had,
+/// and every row above it is laid out on the same columns - so what is left of
+/// that column on the nearest row that has something there is exactly what
+/// this one leaves out. That row may be indented too, and then what *it*
+/// leaves out comes from further up: the walk narrows the column it still
+/// needs as it goes, and ends at the first row that is written in full.
+///
+/// `None` unless every step of that agrees. A row that is neither kind, or a
+/// blank one, is the end of the listing, and a row reached through it would
+/// belong to another global - so nothing is guessed across it.
+fn continued_row(grid: &Grid, line: usize, text: &[char]) -> Option<RowShape> {
+    let own = indented_row(text)?;
+    // Collected nearest first, so the chunks come out in reverse order.
+    let mut left_out: Vec<Vec<String>> = Vec::new();
+    let mut need = own.indent;
+    for above in (line.saturating_sub(MAX_ROWS_ABOVE)..line).rev() {
+        let row = grid.line(above)?;
+        let first = row.cells.iter().position(|c| !c.is_blank())?;
+        if first >= need && first > 0 {
+            // A sibling, or a row deeper than the one being read: it has
+            // nothing left of `need` that is its own.
+            continue;
+        }
+        let row_text = text_of(row);
+        if first == 0 {
+            let full = row_shape(&row_text)?;
+            left_out.push(
+                full.subscripts
+                    .into_iter()
+                    .zip(&full.key_spans)
+                    .filter(|&(_, &(from, _))| from < need)
+                    .map(|(key, _)| key)
+                    .collect(),
+            );
+            let mut subscripts: Vec<String> = left_out.into_iter().rev().flatten().collect();
+            let mut key_spans = vec![(0, 0); subscripts.len()];
+            for (key, from, to) in own.keys {
+                subscripts.push(key);
+                key_spans.push((from, to));
+            }
+            return Some(RowShape {
+                global: full.global,
+                subscripts,
+                key_spans,
+                value: Some(own.value),
+            });
+        }
+        let parent = indented_row(&row_text)?;
+        left_out.push(
+            parent
+                .keys
+                .into_iter()
+                .filter(|&(_, from, _)| from < need)
+                .map(|(key, ..)| key)
+                .collect(),
+        );
+        need = parent.indent;
+    }
+    None
+}
+
+/// A row as `^%G` prints one whose key starts like the row above's: blanks,
+/// then the rest of the subscript list and its `)`, then `=` and the value.
+struct Indented {
+    /// The column the row's first subscript starts at.
+    indent: usize,
+    /// The subscripts that are on the row, with their columns.
+    keys: Vec<(String, usize, usize)>,
+    value: (usize, usize),
+}
+
+fn indented_row(text: &[char]) -> Option<Indented> {
+    let indent = text.iter().position(|&c| c != ' ')?;
+    if indent == 0 {
+        return None;
+    }
+    // The list's `(` is on a row above; the column before the indent stands
+    // in for it, which is all `skip_balanced_parens` looks at it for.
+    let close = skip_balanced_parens(text, indent - 1)?;
+    let list_end = close - 1;
+    if list_end <= indent || text.get(close) != Some(&'=') {
+        return None;
+    }
+    Some(Indented {
+        indent,
+        keys: split_subscripts(text, indent, list_end),
+        value: unquoted_span(text, close + 1),
+    })
+}
+
+/// The row's characters, up to its last non-blank one.
+fn text_of(row: &Row) -> Vec<char> {
+    row.cells[..row.used_width()].iter().map(|c| c.ch).collect()
 }
 
 /// The subscript list in `text[from..to]`, split on the commas that separate
@@ -795,5 +1037,213 @@ mod tests {
     fn a_pointer_past_the_end_of_the_row_resolves_to_nothing() {
         let grid = grid_with(&[r#"^CCDU(1,4711)="1^350""#]);
         assert_eq!(target_at_point(&grid, 0, 60), None);
+    }
+
+    /// The piece under a bare pointer, for the tests below that are only
+    /// about which piece of which node a row is read as.
+    fn piece_at(grid: &Grid, line: usize, col: usize) -> PieceSelection {
+        match target_at_point(grid, line, col) {
+            Some(GlobalTarget::Piece(piece)) => piece,
+            other => panic!("expected a piece at {line}:{col}, got {other:?}"),
+        }
+    }
+
+    fn strings(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    // --- the value of a `write` -------------------------------------------
+
+    /// The row under `w ^NODE` is that node's value, bare: no key, no quotes.
+    /// Which node is read off the command line above it.
+    #[test]
+    fn the_row_under_a_write_of_one_node_is_that_nodes_value() {
+        let grid = grid_with(&[
+            "RDB81-TR>w ^FTCL(1,1)",
+            "350^DESCRICAO CLIENTE 1^RUA PINHEIRO MACHADO",
+            "RDB81-TR>",
+        ]);
+        // `DESCRICAO CLIENTE 1` runs 4..23.
+        let piece = piece_at(&grid, 1, 8);
+        assert_eq!(piece.global, "FTCL");
+        assert_eq!(piece.subscripts, strings(&["1", "1"]));
+        assert_eq!(piece.piece, 2);
+        assert_eq!(piece.piece_text, "DESCRICAO CLIENTE 1");
+        assert_eq!(piece_at(&grid, 1, 0).piece_text, "350");
+    }
+
+    /// `write` spelled out, in capitals, and with the `,!` that ends the line
+    /// is the same command.
+    #[test]
+    fn every_spelling_of_the_write_is_read() {
+        for command in [
+            "USER>write ^CCDU(1,1)",
+            "USER>W ^CCDU(1,1)",
+            "USER>w ^CCDU(1,1),!",
+            "USER> w ^CCDU(1,1)",
+        ] {
+            let grid = grid_with(&[command, "1^350^2"]);
+            let piece = piece_at(&grid, 1, 3);
+            assert_eq!(
+                (piece.piece, piece.piece_text.as_str()),
+                (2, "350"),
+                "{command}"
+            );
+        }
+    }
+
+    /// A written value has no quotes to bound its first and last pieces, and
+    /// they can still be empty: the `^` that closes one is enough to point at.
+    #[test]
+    fn the_empty_pieces_at_either_end_of_a_written_value_can_be_pointed_at() {
+        let grid = grid_with(&["USER>w ^CCDU(1,1)", "^350^"]);
+        let first = piece_at(&grid, 1, 0);
+        assert_eq!((first.piece, first.piece_text.as_str()), (1, ""));
+        let last = piece_at(&grid, 1, 4);
+        assert_eq!((last.piece, last.piece_text.as_str()), (3, ""));
+        assert_eq!(piece_at(&grid, 1, 2).piece_text, "350");
+        assert_eq!(
+            target_at_point(&grid, 1, 5),
+            None,
+            "past the end of the row"
+        );
+    }
+
+    /// The command line itself holds the key, and its subscripts answer like
+    /// a `zwrite` row's do.
+    #[test]
+    fn the_subscripts_on_the_write_command_line_are_its_key() {
+        let grid = grid_with(&["USER>w ^CCDU(1,4711)", "1^350"]);
+        // `4711` runs 15..19.
+        match target_at_point(&grid, 0, 16) {
+            Some(GlobalTarget::Key(key)) => {
+                assert_eq!(key.global, "CCDU");
+                assert_eq!((key.position, key.text.as_str()), (2, "4711"));
+            }
+            other => panic!("expected a key, got {other:?}"),
+        }
+        assert_eq!(
+            target_at_point(&grid, 0, 2),
+            None,
+            "the prompt is not the key"
+        );
+    }
+
+    /// Anything but one node alone, and the row under it is not that node's
+    /// value - so it names nothing rather than being read as one.
+    #[test]
+    fn a_write_of_anything_but_one_node_names_nothing() {
+        for command in [
+            "USER>w ^CCDU(1,1),^CCDU(1,2)",
+            "USER>w ^CCDU(1,1)_\"x\"",
+            "USER>w $g(^CCDU(1,1))",
+            "USER>w x",
+            "USER>s x=^CCDU(1,1)",
+            "USER>zw ^CCDU(1,1)",
+        ] {
+            let grid = grid_with(&[command, "1^350^2"]);
+            assert_eq!(target_at_point(&grid, 1, 3), None, "{command}");
+        }
+    }
+
+    /// What follows a write is not always a value: an empty one prints
+    /// nothing and the next prompt is right there, and an undefined one
+    /// prints an error instead.
+    #[test]
+    fn the_prompt_or_error_after_a_write_is_not_its_value() {
+        let grid = grid_with(&["USER>w ^CCDU(1,1)", "USER>"]);
+        assert_eq!(target_at_point(&grid, 1, 1), None);
+        let grid = grid_with(&["USER>w ^CCDU(9,9)", "<UNDEFINED> *^CCDU(9,9)"]);
+        assert_eq!(target_at_point(&grid, 1, 3), None);
+    }
+
+    // --- a `^%G` listing --------------------------------------------------
+
+    /// The listing from the screenshot this was written against, one row of
+    /// each shape it produces.
+    fn percent_g_listing() -> Grid {
+        grid_with(&[
+            r#"^FTCL(1,1,2)="4799^teste""#,
+            r#"          3)="7899^27852""#,
+            r#"^FTCL(1,1,3,1,67774,29330)="99^ccs.evandro.ochner^100000""#,
+            r#"                    29356)="99^ccs.evandro.ochner^200000""#,
+            r#"                    29376)="99^ccs.evandro.ochner^600000""#,
+            r#"^FTCL(1,1,24,1)="67109^53099""#,
+            r#"             2)="67108^54906""#,
+            r#"             3)="67130^55796""#,
+        ])
+    }
+
+    /// A row that leaves out the subscripts it shares with the row above is
+    /// read with them put back.
+    #[test]
+    fn an_indented_percent_g_row_gets_back_the_subscripts_it_left_out() {
+        let grid = percent_g_listing();
+        // `3)="7899^27852"`: the value starts at column 14.
+        let piece = piece_at(&grid, 1, 20);
+        assert_eq!(piece.global, "FTCL");
+        assert_eq!(piece.subscripts, strings(&["1", "1", "3"]));
+        assert_eq!((piece.piece, piece.piece_text.as_str()), (2, "27852"));
+    }
+
+    /// The row above may be indented too, and then the full row is further up
+    /// still, past every sibling in between.
+    #[test]
+    fn a_run_of_siblings_all_take_their_key_from_the_row_that_opened_it() {
+        let grid = percent_g_listing();
+        let piece = piece_at(&grid, 4, 28);
+        assert_eq!(
+            piece.subscripts,
+            strings(&["1", "1", "3", "1", "67774", "29376"])
+        );
+        assert_eq!(piece.piece_text, "99");
+        let piece = piece_at(&grid, 7, 18);
+        assert_eq!(piece.subscripts, strings(&["1", "1", "24", "3"]));
+        assert_eq!(piece.piece_text, "67130");
+    }
+
+    /// A row whose first new subscript is further left than the row above's
+    /// starts takes less from it, and the rest from further up.
+    #[test]
+    fn an_indent_left_of_the_row_above_takes_its_key_from_further_up() {
+        let grid = grid_with(&[
+            r#"^X(1,2,3)="a""#,
+            r#"       4)="b""#,
+            r#"     5,1)="c""#,
+            r#"       2)="d""#,
+        ]);
+        let subscripts_at = |line: usize| piece_at(&grid, line, 11).subscripts;
+        assert_eq!(subscripts_at(1), strings(&["1", "2", "4"]));
+        assert_eq!(subscripts_at(2), strings(&["1", "5", "1"]));
+        assert_eq!(subscripts_at(3), strings(&["1", "5", "2"]));
+    }
+
+    /// The subscripts that are on the row answer with their place in the
+    /// whole key; the ones left out are not on screen to point at.
+    #[test]
+    fn a_visible_subscript_of_an_indented_row_answers_with_its_whole_key_position() {
+        let grid = percent_g_listing();
+        match target_at_point(&grid, 4, 22) {
+            Some(GlobalTarget::Key(key)) => {
+                assert_eq!((key.position, key.text.as_str()), (6, "29376"));
+                assert_eq!(key.subscripts.len(), 6);
+            }
+            other => panic!("expected a key, got {other:?}"),
+        }
+        assert_eq!(target_at_point(&grid, 4, 5), None, "the indent is blank");
+    }
+
+    /// An indented row with no listing above it, or with a blank row between
+    /// it and one, is not recovered from anything.
+    #[test]
+    fn an_indented_row_outside_a_listing_names_nothing() {
+        let grid = grid_with(&["USER>d ^%G", r#"          3)="7899^27852""#]);
+        assert_eq!(target_at_point(&grid, 1, 20), None);
+        let grid = grid_with(&[
+            r#"^FTCL(1,1,2)="4799^teste""#,
+            "",
+            r#"          3)="7899^27852""#,
+        ]);
+        assert_eq!(target_at_point(&grid, 2, 20), None);
     }
 }

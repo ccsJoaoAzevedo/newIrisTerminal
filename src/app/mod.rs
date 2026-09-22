@@ -14,6 +14,7 @@ use crate::features::export::{self, Range};
 use crate::features::history::{self, History};
 use crate::features::logging::{self, SessionLog};
 use crate::features::macros::{self, MacroGroup};
+use crate::features::snake::Snake;
 use crate::features::update;
 use crate::i18n::{tr, tr1, tr2};
 use crate::plugins::PluginHost;
@@ -25,7 +26,7 @@ use crate::ui::macro_manager;
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
 use crate::ui::terminal_view::{self, RenderOpts, Selection, ViewState};
 use crate::ui::theme_manager::{self, ThemeAction};
-use crate::ui::{fonts, icons, input, shortcut};
+use crate::ui::{fonts, icons, input, shortcut, snake_view};
 
 // The shell is split by what each part is responsible for, and every one of
 // these holds part of `impl App`. Behaviour lives beside the state it acts on;

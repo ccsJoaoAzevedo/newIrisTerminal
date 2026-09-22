@@ -142,7 +142,7 @@ const PT_BR: &[(&str, &str)] = &[
     ("Open a session (Ctrl+T)", "Abrir uma sessão (Ctrl+T)"),
     ("IRIS servers", "Servidores IRIS"),
     ("No servers, profiles or instances found.", "Nenhum servidor, perfil ou instância encontrado."),
-    ("Double-click to rename.", "Clique duplo para renomear."),
+    ("Double-click to rename, drag to reorder.", "Clique duplo para renomear, arraste para reordenar."),
     ("Session ended.", "Sessão encerrada."),
     ("Reconnect", "Reconectar"),
     ("Close", "Fechar"),
@@ -553,6 +553,19 @@ const PT_BR: &[(&str, &str)] = &[
         "What a piece or a subscript of a zwrite'n global means, read out of the class that maps it. On selection: only over text you have selected, which is what a double-click on a piece already gives. On hover: over whatever the pointer is on, with nothing selected. Off: never asked, and no second session is opened to ask with.",
         "O que significa um piece ou uma chave de um global exibido com zwrite, lido da classe que o mapeia. Ao selecionar: somente sobre o texto selecionado, que é o que um duplo clique num piece já dá. Ao passar o mouse: sobre o que estiver sob o ponteiro, sem precisar selecionar. Desligado: nunca consulta, e nenhuma segunda sessão é aberta para consultar.",
     ),
+
+    // The easter egg. See `crate::features::snake`.
+    ("Snake", "Snake"),
+    ("Score: {}", "Pontos: {}"),
+    ("Best: {}", "Recorde: {}"),
+    ("Ready", "Pronto"),
+    ("Game over", "Fim de jogo"),
+    ("You filled the board!", "Você preencheu o tabuleiro inteiro!"),
+    ("Click the board to play.", "Clique no tabuleiro para jogar."),
+    ("Arrows or WASD to steer. Space to start.",
+     "Setas ou WASD para virar. Espaço para começar."),
+    ("Arrows or WASD to steer.", "Setas ou WASD para virar."),
+    ("Space to play again.", "Espaço para jogar de novo."),
 ];
 
 #[cfg(test)]

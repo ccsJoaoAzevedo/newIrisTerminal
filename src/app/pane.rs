@@ -300,14 +300,24 @@ impl App {
         }
 
         // Recorded before the Enter reaches IRIS, while the line is still on
-        // screen to be read.
-        if let Some(unechoed) = action.submitted.as_deref() {
-            // Submitting ends the selection with the line it was on, rather
-            // than leaving it highlighted in the scrollback.
-            if let Some(tab) = self.pane_mut(at) {
-                tab.view.clear_selection();
+        // screen to be read. Taken rather than borrowed: the easter egg
+        // rewrites what is left of the action.
+        if let Some(unechoed) = action.submitted.take() {
+            if self.take_easter_egg(at, &unechoed) {
+                // The line has been rubbed out and the game is open, so
+                // neither the Enter nor the character typed alongside it has
+                // anywhere left to go: sending the Enter would print a fresh
+                // prompt over a line the user never ran.
+                action.bytes.clear();
+                action.text.clear();
+            } else {
+                // Submitting ends the selection with the line it was on, rather
+                // than leaving it highlighted in the scrollback.
+                if let Some(tab) = self.pane_mut(at) {
+                    tab.view.clear_selection();
+                }
+                self.record_command(at, &unechoed);
             }
-            self.record_command(at, unechoed);
         }
         if let Some(direction) = action.recall {
             self.recall(at, direction);
@@ -353,6 +363,38 @@ impl App {
         }
 
         measure
+    }
+
+    /// Draws the easter egg's board in place of a terminal pane.
+    ///
+    /// A tab holding a game holds no session, so almost nothing
+    /// [`App::terminal_pane`] does applies: there is nothing to drain, nothing
+    /// to size and no keystroke with anywhere else to go. What is kept is the
+    /// handling of the keyboard, because a pane that does not claim focus is a
+    /// pane the arrows never reach.
+    pub(super) fn game_pane(&mut self, ui: &mut egui::Ui, ctx: &Context, theme: &Theme, at: At) {
+        let Some(uid) = self.pane(at).map(|tab| tab.uid) else {
+            return;
+        };
+        // The same two guards the terminal has: a key meant for a shortcut
+        // being recorded, or for whatever surface the shell has put in front
+        // of the window, must not reach the game either.
+        let window_active = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let capturing = self.panels.macros.capture_shortcut || self.panels.capture_manager_shortcut;
+        let role = snake_view::Role {
+            focused: true,
+            take_focus: self.focused_tab != Some(uid),
+            keys: window_active && !capturing,
+        };
+        self.focused_tab = Some(uid);
+
+        let Some(game) = self.pane_mut(at).and_then(|tab| tab.game.as_deref_mut()) else {
+            return;
+        };
+        let rect = snake_view::show(ui, game, theme, uid, role).rect;
+        // So the window's resize grips keep off the board, exactly as they
+        // keep off a terminal.
+        self.pane_rects.push(rect);
     }
 
     /// [`App::terminal_pane`] in a box of a given size, for one half of a

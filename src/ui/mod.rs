@@ -15,6 +15,8 @@
 //! - [`fonts`], [`icons`], [`shading`], [`monitors`], [`shortcut`] are small
 //!   helpers named for what they do.
 //! - [`detach`] opens a pane in a window of its own.
+//! - [`snake_view`] draws the easter egg's board, in a tab that holds no
+//!   session at all.
 
 pub mod chrome;
 pub mod detach;
@@ -27,6 +29,7 @@ pub mod panels;
 pub mod search;
 pub mod shading;
 pub mod shortcut;
+pub mod snake_view;
 pub mod terminal_view;
 pub mod theme_manager;
 pub mod wrap;

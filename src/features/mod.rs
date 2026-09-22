@@ -13,6 +13,7 @@
 //! - [`macros`] runs saved command sequences, with parameters.
 //! - [`natives`] is the built-in set of those.
 //! - [`analyze`] hands a transcript to Claude Code.
+//! - [`snake`] is the easter egg `/snake` opens, and is a game, not a terminal.
 //! - [`update`] checks for a newer release and installs it.
 
 pub mod analyze;
@@ -23,4 +24,5 @@ pub mod history;
 pub mod logging;
 pub mod macros;
 pub mod natives;
+pub mod snake;
 pub mod update;

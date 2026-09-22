@@ -92,6 +92,56 @@ impl App {
         true
     }
 
+    /// The easter egg: `/snake` submitted at a local IRIS prompt opens the
+    /// game instead of reaching IRIS, which would only answer `<SYNTAX>`.
+    ///
+    /// Local sessions only. A remote server is somebody else's machine and a
+    /// shell has a filesystem where `/snake` could mean something; the local
+    /// instance is the one place the line is unambiguously a joke rather than
+    /// a command. Nothing is recorded either - the line never ran, so it has
+    /// no business in the recall or in `history.txt`.
+    ///
+    /// The line is rubbed out on the way, because the Enter that asked for it
+    /// is never sent: IRIS is still reading the line it echoed, and leaving
+    /// `/snake` sitting on the prompt would have the next thing typed run as
+    /// part of it. Answers whether the line was the egg.
+    pub(super) fn take_easter_egg(&mut self, at: At, unechoed: &str) -> bool {
+        let Some(tab) = self.pane(at) else {
+            return false;
+        };
+        if tab.profile.shell.is_some() || tab.profile.remote.is_some() {
+            return false;
+        }
+        let Some(line) = lineedit::current(&tab.grid) else {
+            return false;
+        };
+        let Some(typed) = lineedit::typed_text(&tab.grid) else {
+            return false;
+        };
+        if !is_easter_egg(&format!("{typed}{unechoed}")) {
+            return false;
+        }
+
+        // To the end of the line, then rub out every character of it - the
+        // same gesture as a recall, which is the only way to change a buffer
+        // the far side owns. The characters typed in this same frame are in
+        // that buffer too but not yet on screen, so they are counted
+        // separately: rubbing out only what the screen shows would leave the
+        // last letter of `/snake` on the prompt.
+        let app_cursor = tab.grid.app_cursor_keys;
+        let rubouts = line.len() + unechoed.chars().count();
+        let mut wire = cursor_bytes(line.end as i64 - line.cursor as i64, app_cursor);
+        wire.extend(std::iter::repeat_n(0x7f, rubouts));
+        let wire = self.plugins.on_input(&wire);
+        if let Some(tab) = self.pane_mut(at) {
+            tab.view.clear_selection();
+            tab.recall_step = None;
+            tab.send(&wire);
+        }
+        self.open_snake_tab();
+        true
+    }
+
     /// Remembers the commands a multi-line paste is about to submit.
     ///
     /// A paste carrying line breaks presses Enter for the user, once per break,
@@ -534,5 +584,33 @@ impl App {
             "Claude is opening with this output in context ({}). Ask it whatever you like.",
             &path.display().to_string(),
         ));
+    }
+}
+
+/// What opens the easter egg.
+///
+/// Spelled like a slash command because that is what it is pretending to be,
+/// and matched with the surrounding blanks trimmed off: a prompt line is read
+/// back off the screen, and a trailing space is indistinguishable from the
+/// blank the cursor is sitting on.
+const SNAKE_COMMAND: &str = "/snake";
+
+fn is_easter_egg(typed: &str) -> bool {
+    typed.trim().eq_ignore_ascii_case(SNAKE_COMMAND)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_egg_is_the_whole_line_and_nothing_else() {
+        assert!(is_easter_egg("/snake"));
+        assert!(is_easter_egg("  /snake "), "read back off a padded row");
+        assert!(is_easter_egg("/SNAKE"));
+        assert!(!is_easter_egg("w /snake"));
+        assert!(!is_easter_egg("/snakes"));
+        assert!(!is_easter_egg("snake"));
+        assert!(!is_easter_egg(""));
     }
 }
