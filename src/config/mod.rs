@@ -2,6 +2,7 @@
 
 pub mod profile;
 pub mod servers;
+pub mod session;
 pub mod theme;
 
 use std::path::PathBuf;
@@ -57,6 +58,15 @@ pub fn command_history_path() -> PathBuf {
 /// the two would overwrite each other.
 pub fn snake_score_path() -> PathBuf {
     config_dir().join("snake.txt")
+}
+
+/// The tabs open when the app last closed - see [`session::SavedSession`].
+///
+/// Not in settings.toml for the reason the snake's score is not: that file is
+/// rewritten whole from the settings window, which would put back whatever
+/// tabs were open when the window was opened.
+pub fn session_path() -> PathBuf {
+    config_dir().join("session.toml")
 }
 
 /// Shows `path` in the platform's file manager, creating it first if it is not
@@ -303,6 +313,10 @@ pub struct Settings {
     pub default_rows: u16,
     /// Reopen where the window was last closed. Off centres it on the monitor.
     pub save_window_position: bool,
+    /// Reopen the tabs, splits and tab names that were open when the app last
+    /// closed, instead of the default profile. The list is kept in
+    /// [`session_path`], and only while this is on.
+    pub remember_open_tabs: bool,
     /// Inner size of the window in egui points, as last closed. Recorded only
     /// while `save_terminal_size` is on, and ignored when it is off, so
     /// switching the setting back on restores what was there before rather
@@ -380,6 +394,7 @@ impl Default for Settings {
             default_cols: DEFAULT_TERMINAL_COLS,
             default_rows: DEFAULT_TERMINAL_ROWS,
             save_window_position: false,
+            remember_open_tabs: false,
             window_size: None,
             window_position: None,
             window_maximized: false,
@@ -693,6 +708,7 @@ mod tests {
         assert!(settings.copy_on_select);
         assert!(settings.save_command_history);
         assert!(settings.show_window_buttons);
+        assert!(!settings.remember_open_tabs);
         assert_eq!(settings.status_timeout_secs, 8);
         assert_eq!(
             settings.default_geometry(),

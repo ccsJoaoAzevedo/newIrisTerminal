@@ -191,6 +191,10 @@ pub fn key_bytes(
     let bytes: Vec<u8> = match key {
         // IRIS expects CR for "line entered"; sending LF leaves it waiting.
         Key::Enter => vec![b'\r'],
+        // Back-tab, which a shell's line editor and anything running in it -
+        // Claude Code's mode switch among them - reads as `CSI Z`. Plain Tab to
+        // IRIS, whose keyboard table has no entry for it.
+        Key::Tab if modifiers.shift && !reader.erp() => b"\x1b[Z".to_vec(),
         Key::Tab => vec![b'\t'],
         Key::Escape => vec![0x1b],
         // DEL everywhere a line editor is reading, BS inside an IRIS routine.
@@ -252,6 +256,18 @@ pub fn key_bytes(
             let c = control_char(k)?;
             vec![c]
         }
+        // Alt+letter is the letter behind an Escape: meta, the way every
+        // terminal sends it. A shell only - the ERP's keyboard table would read
+        // the Escape as "leave the field".
+        k if modifiers.alt && !reader.erp() => {
+            let letter = alt_letter(k)?;
+            let letter = if modifiers.shift {
+                letter.to_ascii_uppercase()
+            } else {
+                letter
+            };
+            vec![0x1b, letter as u8]
+        }
         _ => return None,
     };
 
@@ -272,6 +288,13 @@ pub fn cursor_key(app_cursor: bool, final_byte: u8) -> Vec<u8> {
 
 /// Maps a key to its ASCII control code, covering the letters plus the handful
 /// of punctuation codes (Ctrl+[, Ctrl+\, Ctrl+], Ctrl+_) that terminals use.
+/// The letter an Alt chord is built on, lowercase, or `None` for any other key.
+fn alt_letter(key: Key) -> Option<char> {
+    let mut chars = key.name().chars();
+    let first = chars.next()?.to_ascii_lowercase();
+    (chars.next().is_none() && first.is_ascii_lowercase()).then_some(first)
+}
+
 fn control_char(key: Key) -> Option<u8> {
     let name = key.name();
     let mut chars = name.chars();
@@ -450,9 +473,19 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
             .line
             .is_some_and(|line| ctx.recall_mid_line || line.at_end());
 
+    // The letter an Alt chord was just sent as, in case the platform also
+    // reports it as typed text - which would put it on the line twice.
+    let mut sent_as_meta: Option<char> = None;
+
     for event in events {
         match event {
             Event::Text(text) => {
+                if sent_as_meta
+                    .take()
+                    .is_some_and(|letter| text.eq_ignore_ascii_case(&letter.to_string()))
+                {
+                    continue;
+                }
                 // egui already filters out text produced while a command
                 // modifier is held, so this is genuine typed input.
                 action.text.push_str(text);
@@ -546,6 +579,9 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
                     action.submitted = Some(action.text.clone());
                 }
                 if let Some(bytes) = key_bytes(*key, modifiers, ctx.reader(), ctx.app_cursor_keys) {
+                    if modifiers.alt && bytes.len() == 2 && bytes[0] == 0x1b {
+                        sent_as_meta = alt_letter(*key);
+                    }
                     action.bytes.extend_from_slice(&bytes);
                 }
             }
@@ -1376,6 +1412,35 @@ mod tests {
             ..InputContext::default()
         };
         assert!(translate(&[Event::Cut], &selected).copy);
+    }
+
+    fn shell() -> InputContext {
+        InputContext {
+            shell: true,
+            ..InputContext::default()
+        }
+    }
+
+    #[test]
+    fn shift_tab_reaches_a_shell_as_back_tab_and_iris_as_tab() {
+        let back = translate(&[press_with(Key::Tab, Modifiers::SHIFT)], &shell());
+        assert_eq!(back.bytes, b"\x1b[Z");
+        let iris = translate(&[press_with(Key::Tab, Modifiers::SHIFT)], &ctx());
+        assert_eq!(iris.bytes, b"\t");
+    }
+
+    #[test]
+    fn alt_and_a_letter_reach_a_shell_as_meta_and_only_once() {
+        let events = [press_with(Key::T, Modifiers::ALT), Event::Text("t".into())];
+        let action = translate(&events, &shell());
+        assert_eq!(action.bytes, b"\x1bt");
+        assert!(action.text.is_empty(), "the letter was typed as well");
+    }
+
+    #[test]
+    fn alt_and_a_letter_are_not_meta_to_iris() {
+        let action = translate(&[press_with(Key::T, Modifiers::ALT)], &ctx());
+        assert!(action.bytes.is_empty());
     }
 
     /// Arrows, Tab and Escape are what egui would otherwise steal for focus

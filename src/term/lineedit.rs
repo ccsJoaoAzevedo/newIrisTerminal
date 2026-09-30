@@ -231,9 +231,107 @@ pub fn typed_text(grid: &Grid) -> Option<String> {
     Some(text)
 }
 
+/// The folder a shell's prompt says it is in, read off the row the cursor is
+/// on - or, for a prompt that puts the path on a line of its own, the row
+/// above it.
+///
+/// The prompt is the only place a shell says where it is: nothing on Windows
+/// hands this side another process's working directory. Three spellings are
+/// read, the defaults of the shells a tab is likely to hold:
+///
+/// - `cmd`: `C:\Users\me>`
+/// - PowerShell: `PS C:\Users\me>`
+/// - Git Bash: `me@HOST MINGW64 /c/Users/me (main)`, above a `$`
+///
+/// `None` for anything else, which leaves the tab reopening where it opened.
+pub fn shell_cwd(grid: &Grid) -> Option<String> {
+    let row = grid.screen.get(grid.cursor.row)?.to_text();
+    let row = row.trim_start();
+    let windows = row.strip_prefix("PS ").unwrap_or(row);
+    if let Some((path, _)) = windows.split_once('>') {
+        if is_drive_path(path) {
+            return Some(path.to_string());
+        }
+    }
+    // Git Bash writes the path on the line before the `$`.
+    if !row.starts_with('$') {
+        return None;
+    }
+    let above = grid.screen.get(grid.cursor.row.checked_sub(1)?)?.to_text();
+    let (_, path) = [" MINGW64 ", " MINGW32 ", " UCRT64 ", " MSYS "]
+        .iter()
+        .find_map(|system| above.split_once(system))?;
+    // What follows the path is the branch, in parentheses.
+    let path = path.split(" (").next().unwrap_or(path).trim();
+    msys_to_windows(path)
+}
+
+/// Whether `text` starts like an absolute Windows path, `X:\`.
+fn is_drive_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+/// `/c/Users/me` as `C:\Users\me`. Other MSYS paths - `/usr`, `~` - name
+/// something only that shell can resolve, and are not guessed at.
+fn msys_to_windows(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/')?;
+    let (drive, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut chars = drive.chars();
+    let letter = chars.next().filter(char::is_ascii_alphabetic)?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(format!(
+        "{}:\\{}",
+        letter.to_ascii_uppercase(),
+        tail.replace('/', "\\")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shell_grid(rows: &[&str]) -> Grid {
+        let mut grid = Grid::new(60, rows.len(), 10);
+        for (row, text) in grid.screen.iter_mut().zip(rows) {
+            row.set_text(text);
+        }
+        grid.cursor.row = rows.len() - 1;
+        grid
+    }
+
+    #[test]
+    fn the_folder_is_read_off_a_cmd_and_a_powershell_prompt() {
+        let cmd = shell_grid(&["C:\\github\\newIrisTerminal>dir"]);
+        assert_eq!(
+            shell_cwd(&cmd).as_deref(),
+            Some("C:\\github\\newIrisTerminal")
+        );
+        let ps = shell_grid(&["PS D:\\work> "]);
+        assert_eq!(shell_cwd(&ps).as_deref(), Some("D:\\work"));
+    }
+
+    #[test]
+    fn the_folder_is_read_off_the_line_above_a_git_bash_prompt() {
+        let bash = shell_grid(&["me@HOST MINGW64 /c/github/newIrisTerminal (main)", "$ ls"]);
+        assert_eq!(
+            shell_cwd(&bash).as_deref(),
+            Some("C:\\github\\newIrisTerminal")
+        );
+    }
+
+    #[test]
+    fn output_that_is_not_a_prompt_names_no_folder() {
+        for rows in [
+            &["COMP80>"][..],
+            &["Volume in drive C has no label."][..],
+            &["me@HOST MINGW64 ~", "$ "][..],
+        ] {
+            assert_eq!(shell_cwd(&shell_grid(rows)), None, "{rows:?}");
+        }
+    }
 
     /// Builds a one-row grid holding `text`, with the cursor at `col`.
     fn grid_with(text: &str, col: usize) -> Grid {

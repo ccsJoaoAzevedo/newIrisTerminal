@@ -6,6 +6,7 @@ use egui::{Context, Key, Modifiers};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::config::session::{SavedDir, SavedSession, SavedSplit, SavedTab};
 use crate::config::{self, ensure_config_tree, load_themes, LogMode, Profile, Settings, Theme};
 use crate::features::analyze;
 use crate::features::autologon::{Autologon, State as AutoState};
@@ -344,8 +345,18 @@ impl App {
         app.apply_font(&cc.egui_ctx);
 
         // Straight into the instance. Anyone with something to change has
-        // Settings; everyone else was only ever going to press Connect.
-        if app.settings.open_on_start {
+        // Settings; everyone else was only ever going to press Connect. Unless
+        // there is a session to come back to, which is what they asked for
+        // instead when they turned that on.
+        let saved = app
+            .settings
+            .remember_open_tabs
+            .then(|| SavedSession::load(&config::session_path()))
+            .flatten()
+            .filter(|saved| !saved.tabs.is_empty());
+        if let Some(saved) = saved {
+            app.restore_session(saved);
+        } else if app.settings.open_on_start {
             app.open_new_tab();
         }
         app

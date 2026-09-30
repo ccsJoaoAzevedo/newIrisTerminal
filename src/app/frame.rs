@@ -371,6 +371,17 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Before the sessions are closed down, while every tab is still here.
+        // An empty list is saved as such: closing every tab and then the
+        // window is asking for nothing to come back.
+        let path = config::session_path();
+        if self.settings.remember_open_tabs {
+            if let Err(e) = self.session_snapshot().save(&path) {
+                log::warn!("could not save the open tabs: {e:#}");
+            }
+        } else {
+            SavedSession::clear(&path);
+        }
         for tab in &mut self.tabs {
             close_down(tab);
             if let Some(split) = tab.split.as_mut() {

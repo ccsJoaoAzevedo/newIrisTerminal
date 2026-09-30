@@ -262,6 +262,10 @@ const PT_BR: &[(&str, &str)] = &[
     ("Puts the session's process id next to the instance name and the window size in the menu bar. A local session only: a remote one runs its process on the far side.",
      "Coloca o ID do processo da sessão ao lado do nome da instância e do tamanho da janela, na barra de menu. Somente sessão local: uma remota executa seu processo do outro lado."),
     ("Open the default profile at startup", "Abrir o perfil padrão ao iniciar"),
+    ("Remember open tabs and namespaces", "Lembrar abas e namespaces abertos"),
+    ("output from before the terminal was closed", "saída de antes de o terminal ser fechado"),
+    ("Reopens the tabs and splits that were open when the terminal was closed, instead of the default profile, and takes each IRIS session back to the namespace it was left in. The sessions themselves are new: what was on screen is shown above them, but variables, locks and routines in progress are not. Closing every tab before closing the window leaves nothing to reopen.",
+     "Reabre as abas e divisões que estavam abertas quando o terminal foi fechado, no lugar do perfil padrão, e leva cada sessão IRIS de volta ao namespace em que ficou. As sessões em si são novas: o que estava na tela aparece acima delas, mas variáveis, locks e rotinas em andamento não. Fechar todas as abas antes de fechar a janela não deixa nada para reabrir."),
     ("Ask before closing with a session still connected", "Perguntar antes de fechar com uma sessão ainda conectada"),
 
     // Settings: window.

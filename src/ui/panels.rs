@@ -864,6 +864,16 @@ pub fn settings_dialog(
                 }
                 if ui
                     .checkbox(
+                        &mut settings.remember_open_tabs,
+                        tr("Remember open tabs and namespaces"),
+                    )
+                    .on_hover_text(tr("Reopens the tabs and splits that were open when the terminal was closed, instead of the default profile, and takes each IRIS session back to the namespace it was left in. The sessions themselves are new: what was on screen is shown above them, but variables, locks and routines in progress are not. Closing every tab before closing the window leaves nothing to reopen."))
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(
                         &mut settings.confirm_close_with_live_session,
                         tr("Ask before closing with a session still connected"),
                     )

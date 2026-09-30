@@ -6,6 +6,29 @@
 
 use super::*;
 
+/// How long the echo of a resuming `ZN` is waited for - see `Tab::zn_sent`.
+const ZN_ECHO_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Takes the `ZN` a reopened pane was sent off the screen, now that the prompt
+/// it led to is on the row below it.
+///
+/// The app typed it, not the user, and leaving it would be the first thing on
+/// the screen of every pane that comes back. Only the screen changes: IRIS
+/// tracks the column it is at, not the rows above, and the column is kept.
+fn hide_zn_echo(grid: &mut Grid, wanted: &str) {
+    let Some(above) = grid.cursor.row.checked_sub(1) else {
+        return;
+    };
+    let echo = grid.screen[above].to_text();
+    if !echo.trim_end().ends_with(&format!("ZN \"{wanted}\"")) {
+        return;
+    }
+    let col = grid.cursor.col;
+    grid.move_up(1);
+    grid.delete_lines(1);
+    grid.cursor.col = col;
+}
+
 /// Rotate a transcript once it passes this size.
 const LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -60,6 +83,20 @@ pub struct Tab {
     /// that would pump, resize or type into a session asks this first. See
     /// `App::take_easter_egg`.
     pub game: Option<Box<Snake>>,
+    /// The namespace a reopened pane was left in, until its first prompt.
+    ///
+    /// Sent as a `ZN` from that prompt rather than handed to the launcher:
+    /// an instance's own startup can move every new session to a namespace of
+    /// its choosing, which undoes whatever it was started in.
+    pub resume_namespace: Option<String>,
+    /// The `ZN` just sent for `resume_namespace`, and when, so its echo can be
+    /// taken off the screen once the prompt it leads to appears. Given up on
+    /// after [`ZN_ECHO_WAIT`]: a `ZN` that failed never reaches that prompt,
+    /// and one the user types later must not be the line that goes.
+    zn_sent: Option<(String, std::time::Instant)>,
+    /// The folder a shell's prompt last said it was in, so a remembered tab
+    /// can reopen there. See [`lineedit::shell_cwd`].
+    pub cwd: Option<String>,
 }
 
 /// Source of [`Tab::uid`]. Never reused, so a closed tab's id cannot collide
@@ -120,6 +157,9 @@ impl Tab {
             split: None,
             focus: Pane::First,
             game: None,
+            resume_namespace: None,
+            cwd: None,
+            zn_sent: None,
         };
         tab.start();
         tab
@@ -160,6 +200,9 @@ impl Tab {
             split: None,
             focus: Pane::First,
             game: Some(Box::new(game)),
+            resume_namespace: None,
+            cwd: None,
+            zn_sent: None,
         }
     }
 
@@ -168,6 +211,29 @@ impl Tab {
     /// sizing it, splitting it.
     pub fn is_game(&self) -> bool {
         self.game.is_some()
+    }
+
+    /// Puts back what this pane showed in the last run, dimmed, above a line
+    /// saying so, before the new session has written anything.
+    ///
+    /// Straight into the grid and never to the session or the log: it is
+    /// history to read, not input, and the transcript already has it. It ends
+    /// on blank rows so neither autologon nor the namespace reader, which look
+    /// at the rows the cursor is on, can take an old prompt for a new one.
+    pub fn replay(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut bytes = String::from("\x1b[2m");
+        for line in text.lines() {
+            bytes.push_str(line);
+            bytes.push_str("\r\n");
+        }
+        bytes.push_str(&format!(
+            "\r\n--- {} ---\x1b[0m\r\n\r\n",
+            tr("output from before the terminal was closed")
+        ));
+        let _ = crate::term::parser::advance(&mut self.parser, &mut self.grid, bytes.as_bytes());
     }
 
     pub fn start(&mut self) {
@@ -384,7 +450,32 @@ impl Tab {
             // is the only place a session says which namespace it is in, and it
             // says so again after every `ZN`. Kept when the screen moves off a
             // prompt, so the tab does not lose its name mid-routine.
+            if self.profile.is_shell() {
+                if let Some(cwd) = lineedit::shell_cwd(&self.grid) {
+                    self.cwd = Some(cwd);
+                }
+            }
             if let Some(namespace) = lineedit::namespace(&self.grid) {
+                // Once autologon is done with the prompt: before that, the
+                // prompt is still its to answer.
+                if !self.autologon.is_running() {
+                    if let Some(wanted) = self.resume_namespace.take() {
+                        if !namespace.eq_ignore_ascii_case(&wanted) {
+                            let zn = format!("ZN \"{wanted}\"\r");
+                            let _ = session.write(&self.profile.wire_encoding().encode(&zn));
+                            self.zn_sent = Some((wanted, std::time::Instant::now()));
+                        }
+                    }
+                }
+                if let Some((wanted, at)) = self.zn_sent.take() {
+                    if !namespace.eq_ignore_ascii_case(&wanted) {
+                        if at.elapsed() < ZN_ECHO_WAIT {
+                            self.zn_sent = Some((wanted, at));
+                        }
+                    } else {
+                        hide_zn_echo(&mut self.grid, &wanted);
+                    }
+                }
                 self.namespace = Some(namespace);
             }
 
@@ -577,6 +668,36 @@ pub(super) fn close_down(tab: &mut Tab) {
 mod tests {
     use super::*;
 
+    fn grid_of(rows: &[&str], cursor: (usize, usize)) -> Grid {
+        let mut grid = Grid::new(40, 4, 10);
+        for (row, text) in grid.screen.iter_mut().zip(rows) {
+            row.set_text(text);
+        }
+        grid.cursor.row = cursor.0;
+        grid.cursor.col = cursor.1;
+        grid
+    }
+
+    #[test]
+    fn the_resuming_zn_is_taken_off_the_screen_and_the_prompt_keeps_its_column() {
+        let mut grid = grid_of(
+            &["old output", "COMP80>ZN \"DESENV80\"", "DESENV80>"],
+            (2, 9),
+        );
+        hide_zn_echo(&mut grid, "DESENV80");
+        assert_eq!(grid.screen[0].to_text().trim_end(), "old output");
+        assert_eq!(grid.screen[1].to_text().trim_end(), "DESENV80>");
+        assert_eq!((grid.cursor.row, grid.cursor.col), (1, 9));
+    }
+
+    #[test]
+    fn a_line_that_is_not_the_zn_echo_stays() {
+        let mut grid = grid_of(&["COMP80>w 1", "DESENV80>"], (1, 9));
+        hide_zn_echo(&mut grid, "DESENV80");
+        assert_eq!(grid.screen[0].to_text().trim_end(), "COMP80>w 1");
+        assert_eq!(grid.cursor.row, 1);
+    }
+
     /// Ctrl+Delete asks the far side to clear itself, and what a shell answers
     /// to is the shell's business: Ctrl+L wherever a line editor binds it, and
     /// the command for `cmd.exe`, whose does not - with the Escape that empties
@@ -627,6 +748,9 @@ mod tests {
             split: None,
             focus: Pane::First,
             game: None,
+            resume_namespace: None,
+            cwd: None,
+            zn_sent: None,
         }
     }
 

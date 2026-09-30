@@ -417,17 +417,96 @@ impl App {
         {
             return;
         }
-        let (cols, rows) = self.initial_size(&self.new_tab_profile.clone());
-        let opened = Tab::new(self.new_tab_profile.clone(), &self.settings, cols, rows);
+        // Down the middle to start with. The divider between them is what moves
+        // it from there.
+        self.open_split(index, dir, self.new_tab_profile.clone(), 0.5);
+        self.tabs[index].focus = Pane::Second;
+        self.active = index;
+    }
+
+    /// Opens `profile` in a second pane of the tab at `index`, which the
+    /// caller has made sure is not split already.
+    fn open_split(&mut self, index: usize, dir: SplitDir, profile: Profile, ratio: f32) {
+        let (cols, rows) = self.initial_size(&profile);
+        let opened = Tab::new(profile, &self.settings, cols, rows);
         self.tabs[index].split = Some(Split {
             dir,
             tab: Box::new(opened),
-            // Down the middle to start with. The divider between them is what
-            // moves it from there.
-            ratio: 0.5,
+            ratio,
         });
-        self.tabs[index].focus = Pane::Second;
-        self.active = index;
+    }
+
+    /// What [`App::restore_session`] needs to open these tabs again.
+    ///
+    /// The easter egg is left out: it has no far side to reconnect to, and
+    /// `/snake` is how anybody who wants it back gets it.
+    pub(super) fn session_snapshot(&self) -> SavedSession {
+        let kept: Vec<bool> = self.tabs.iter().map(|tab| !tab.is_game()).collect();
+        let tabs = self
+            .tabs
+            .iter()
+            .filter(|tab| !tab.is_game())
+            .map(|tab| SavedTab {
+                profile: saved_profile(tab),
+                namespace: saved_namespace(tab),
+                title: tab.custom_title.clone(),
+                screen: saved_screen(tab),
+                split: tab.split.as_ref().map(|split| SavedSplit {
+                    dir: match split.dir {
+                        SplitDir::Right => SavedDir::Right,
+                        SplitDir::Bottom => SavedDir::Bottom,
+                    },
+                    ratio: split.ratio,
+                    profile: saved_profile(&split.tab),
+                    namespace: saved_namespace(&split.tab),
+                    title: split.tab.custom_title.clone(),
+                    screen: saved_screen(&split.tab),
+                }),
+                second_focused: tab.split.is_some() && tab.focus == Pane::Second,
+            })
+            .collect();
+        SavedSession {
+            active: kept_index(self.active, &kept),
+            tabs,
+        }
+    }
+
+    /// Opens again the tabs [`App::session_snapshot`] wrote down, in the same
+    /// order, with the same names and splits, and the same one in front.
+    ///
+    /// Each one connects the way a newly opened tab would, autologon included:
+    /// the profile is all it keeps, and the password was never in it.
+    pub(super) fn restore_session(&mut self, saved: SavedSession) {
+        for entry in saved.tabs {
+            self.open_tab(entry.profile);
+            let index = self.tabs.len() - 1;
+            self.tabs[index].custom_title = entry.title;
+            self.tabs[index].replay(&entry.screen);
+            self.tabs[index].resume_namespace = entry.namespace;
+            if let Some(split) = entry.split {
+                let dir = match split.dir {
+                    SavedDir::Right => SplitDir::Right,
+                    SavedDir::Bottom => SplitDir::Bottom,
+                };
+                // The file can be edited by hand, and a NaN would survive
+                // every clamp the layout applies to it.
+                let ratio = if split.ratio.is_finite() {
+                    split.ratio.clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                self.open_split(index, dir, split.profile, ratio);
+                if let Some(opened) = self.tabs[index].split.as_mut() {
+                    opened.tab.custom_title = split.title;
+                    opened.tab.replay(&split.screen);
+                    opened.tab.resume_namespace = split.namespace;
+                }
+                if entry.second_focused {
+                    self.tabs[index].focus = Pane::Second;
+                }
+            }
+        }
+        self.active = saved.active.min(self.tabs.len().saturating_sub(1));
     }
 
     /// Takes a split tab back to one session, and gives the other one a tab of
@@ -625,9 +704,68 @@ fn moved_index(index: usize, from: usize, to: usize) -> usize {
     }
 }
 
+/// How many lines of a pane's output are kept for the next run. Enough to see
+/// what was being done in it; the transcript log is where the whole of it is.
+const SAVED_SCREEN_LINES: usize = 2_000;
+
+/// A pane's profile, with a shell pointed at the folder it was last in.
+///
+/// Only a folder that is still there: a shell asked to start somewhere that
+/// has gone does not start at all, and where it opened is a better answer.
+fn saved_profile(tab: &Tab) -> Profile {
+    let mut profile = tab.profile.clone();
+    if let (Some(shell), Some(cwd)) = (profile.shell.as_mut(), tab.cwd.as_ref()) {
+        let cwd = std::path::PathBuf::from(cwd);
+        if cwd.is_dir() {
+            shell.cwd = Some(cwd);
+        }
+    }
+    profile
+}
+
+/// The namespace to take a pane back to. Only an IRIS one has any, and a pane
+/// that never reached a prompt has nothing worth going back to.
+fn saved_namespace(tab: &Tab) -> Option<String> {
+    tab.namespace.clone().filter(|_| !tab.profile.is_shell())
+}
+
+/// The last [`SAVED_SCREEN_LINES`] lines a pane showed, as plain text.
+fn saved_screen(tab: &Tab) -> String {
+    let text = analyze::transcript(&tab.grid, analyze::Scope::All);
+    let lines: Vec<&str> = text.lines().collect();
+    let from = lines.len().saturating_sub(SAVED_SCREEN_LINES);
+    lines[from..].join("\n")
+}
+
+/// Where the tab at `index` ends up once only the tabs marked in `kept` are
+/// left: the nearest kept tab before it when it was not kept, or the first
+/// one when there is none before it.
+fn kept_index(index: usize, kept: &[bool]) -> usize {
+    let before = kept.iter().take(index).filter(|&&k| k).count();
+    let survives = kept.get(index).copied().unwrap_or(false);
+    if survives {
+        before
+    } else {
+        before.saturating_sub(1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_active_tab_keeps_its_place_when_a_game_before_it_is_left_out() {
+        assert_eq!(kept_index(2, &[true, false, true]), 1);
+        assert_eq!(kept_index(0, &[true, false, true]), 0);
+    }
+
+    #[test]
+    fn an_active_game_that_is_left_out_hands_the_front_to_the_tab_before_it() {
+        assert_eq!(kept_index(1, &[true, false, true]), 0);
+        assert_eq!(kept_index(0, &[false, true]), 0);
+        assert_eq!(kept_index(0, &[false]), 0);
+    }
 
     /// Three tabs of different widths, side by side: 0..50, 50..250, 250..300.
     const SPANS: [(f32, f32); 3] = [(0.0, 50.0), (50.0, 250.0), (250.0, 300.0)];

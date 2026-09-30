@@ -218,18 +218,45 @@ impl Performer<'_> {
 
     /// SGR — select graphic rendition. Walks the parameter list because
     /// 38/48 consume following parameters for extended colour.
+    ///
+    /// Colon sub-parameters (`4:3`, `38:2::R:G:B`) are read as one group and
+    /// never flattened into the list: flattened, the trailing component of a
+    /// colon colour was run as an SGR code of its own, so a blue of 4 left
+    /// everything after it underlined with nothing to turn it off.
     fn sgr(&mut self, params: &Params) {
-        let flat: Vec<u16> = params.iter().flat_map(|p| p.iter().copied()).collect();
-        if flat.is_empty() {
+        let groups: Vec<&[u16]> = params.iter().collect();
+        if groups.is_empty() {
             self.grid.pen.reset();
             self.grid.touch();
             return;
         }
 
         let mut i = 0;
-        while i < flat.len() {
+        while i < groups.len() {
+            let group = groups[i];
             let pen = &mut self.grid.pen;
-            match flat[i] {
+            if group.len() > 1 {
+                match group[0] {
+                    4 if group[1] == 0 => pen.attrs.remove(Attrs::UNDERLINE),
+                    4 => pen.attrs.insert(Attrs::UNDERLINE),
+                    38 => {
+                        if let Some(color) = parse_colon_color(group) {
+                            pen.fg = color;
+                        }
+                    }
+                    48 => {
+                        if let Some(color) = parse_colon_color(group) {
+                            pen.bg = color;
+                        }
+                    }
+                    // 58 (underline colour) and anything else: not drawn.
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+
+            match group[0] {
                 0 => pen.reset(),
                 1 => pen.attrs.insert(Attrs::BOLD),
                 2 => pen.attrs.insert(Attrs::DIM),
@@ -250,22 +277,22 @@ impl Performer<'_> {
                 28 => pen.attrs.remove(Attrs::HIDDEN),
                 29 => pen.attrs.remove(Attrs::STRIKE),
                 n @ 30..=37 => pen.fg = Color::Indexed((n - 30) as u8),
-                38 => {
-                    if let Some((color, consumed)) = parse_extended_color(&flat[i..]) {
-                        pen.fg = color;
+                n @ (38 | 48 | 58) => {
+                    // 58 is the underline colour, which is not drawn, but its
+                    // arguments must still be consumed or they run as codes.
+                    let rest: Vec<u16> = groups[i..].iter().map(|g| g[0]).collect();
+                    if let Some((color, consumed)) = parse_extended_color(&rest) {
+                        match n {
+                            38 => pen.fg = color,
+                            48 => pen.bg = color,
+                            _ => {}
+                        }
                         i += consumed;
                         continue;
                     }
                 }
                 39 => pen.fg = Color::Default,
                 n @ 40..=47 => pen.bg = Color::Indexed((n - 40) as u8),
-                48 => {
-                    if let Some((color, consumed)) = parse_extended_color(&flat[i..]) {
-                        pen.bg = color;
-                        i += consumed;
-                        continue;
-                    }
-                }
                 49 => pen.bg = Color::Default,
                 // Bright variants, as emitted by 16-colour terminfo.
                 n @ 90..=97 => pen.fg = Color::Indexed((n - 90 + 8) as u8),
@@ -289,6 +316,17 @@ fn parse_extended_color(rest: &[u16]) -> Option<(Color, usize)> {
             let b = *rest.get(4)? as u8;
             Some((Color::Rgb(r, g, b), 5))
         }
+        _ => None,
+    }
+}
+
+/// The colon spelling of an extended colour, as one group: `38:5:N`,
+/// `38:2:R:G:B`, or ITU's `38:2:CS:R:G:B` with a colour-space slot first.
+fn parse_colon_color(group: &[u16]) -> Option<Color> {
+    match (group.get(1)?, group.len()) {
+        (5, _) => Some(Color::Indexed(*group.get(2)? as u8)),
+        (2, 5) => Some(Color::Rgb(group[2] as u8, group[3] as u8, group[4] as u8)),
+        (2, n) if n >= 6 => Some(Color::Rgb(group[3] as u8, group[4] as u8, group[5] as u8)),
         _ => None,
     }
 }
@@ -649,6 +687,29 @@ mod tests {
         let grid = run(10, 2, b"\x1b[38;2;10;20;30;1mX");
         assert_eq!(grid.screen[0].cells[0].fg, Color::Rgb(10, 20, 30));
         assert!(grid.screen[0].cells[0].attrs.contains(Attrs::BOLD));
+    }
+
+    #[test]
+    fn a_colon_truecolour_never_leaks_its_blue_component_as_an_attribute() {
+        let grid = run(10, 2, b"[38:2::10:20:4mX");
+        assert_eq!(grid.screen[0].cells[0].fg, Color::Rgb(10, 20, 4));
+        assert!(grid.screen[0].cells[0].attrs.is_empty());
+    }
+
+    #[test]
+    fn a_curly_underline_is_an_underline_and_not_italic() {
+        let grid = run(10, 2, b"[4:3mA[4:0mB");
+        assert_eq!(grid.screen[0].cells[0].attrs, Attrs::UNDERLINE);
+        assert!(grid.screen[0].cells[1].attrs.is_empty());
+    }
+
+    #[test]
+    fn an_underline_colour_is_ignored_without_touching_the_pen() {
+        let grid = run(10, 2, b"[58:2::1:4:7mA[58;5;4mB[58;2;1;4;7mC");
+        for cell in &grid.screen[0].cells[..3] {
+            assert!(cell.attrs.is_empty());
+            assert_eq!(cell.fg, Color::Default);
+        }
     }
 
     #[test]
