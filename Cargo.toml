@@ -36,6 +36,9 @@ image = "0.24"
 # async runtime - which matters for a check that runs once at startup.
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
+# The main window's HWND, for pinning it to the desktop. Already in the tree
+# through eframe, which does not re-export it.
+raw-window-handle = "0.6"
 
 [features]
 default = []
@@ -49,9 +52,29 @@ optional = true
 # Already in the dependency tree via portable-pty, so this adds no download.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.10"
+# Pinning to the desktop: a WinEvent hook and a few window-placement calls.
+# Already in the dependency tree, so this adds no download.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 winres = "0.1"
+
+# Debug builds are linked once per test binary, and full debug info is most of
+# what each ld.exe holds in memory. Line tables keep file:line in our own
+# backtraces; the dependencies, which nobody steps through, carry none.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 opt-level = 2
@@ -65,3 +88,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "new-iris-terminal"
 path = "src/main.rs"
+# The binary is one call to `lib::run` and has no tests: building a harness
+# for it was a link that tested nothing.
+test = false

@@ -81,6 +81,87 @@ fn colour_row(ui: &mut Ui, label: &'static str, value: &mut Color32, editable: b
 /// reset button beside it is what gives one back to the style. There used to be
 /// a checkbox here meaning "is this set", which read as if it turned the button
 /// off and did nothing of the sort.
+/// Which title-bar buttons a theme shows, and in what order. Reports a change.
+///
+/// One list for both, so a button is switched off where it is moved: hiding
+/// it keeps its place, and switching it back on returns it there.
+fn button_order(
+    ui: &mut Ui,
+    buttons: &mut crate::config::theme::WindowButtons,
+    editable: bool,
+) -> bool {
+    use crate::config::theme::TitleButton;
+    let mut changed = false;
+    let mut swap = None;
+    let last = buttons.order.len() - 1;
+    ui.add_enabled_ui(editable, |ui| {
+        Grid::new("theme-button-order")
+            .num_columns(3)
+            .show(ui, |ui| {
+                for (at, button) in buttons.order.into_iter().enumerate() {
+                    let label = match button {
+                        TitleButton::Close => tr("Close"),
+                        TitleButton::Minimize => tr("Minimize"),
+                        TitleButton::Maximize => tr("Maximize"),
+                        TitleButton::OnTop => tr("Always on top"),
+                        TitleButton::Settings => tr("Settings gear"),
+                        TitleButton::NewTab => tr("New tab +"),
+                        TitleButton::Tabs => tr("Tabs"),
+                    };
+                    let shown = match button {
+                        TitleButton::Close => Some(&mut buttons.show_close),
+                        TitleButton::Minimize => Some(&mut buttons.show_minimize),
+                        TitleButton::Maximize => Some(&mut buttons.show_maximize),
+                        TitleButton::OnTop => Some(&mut buttons.show_on_top),
+                        // Placed, never hidden: the gear is the only way into
+                        // Settings, the + the only way to the server menu, and
+                        // the tabs are the middle of the bar, where it drags.
+                        TitleButton::Settings | TitleButton::NewTab | TitleButton::Tabs => None,
+                    };
+                    match shown {
+                        Some(shown) => {
+                            if ui.checkbox(shown, label).changed() {
+                                changed = true;
+                            }
+                        }
+                        None => {
+                            ui.add_enabled(false, egui::Checkbox::new(&mut true, label))
+                                .on_disabled_hover_text(tr(
+                                    "Always shown. Whatever is left of the tabs sits at the left-hand end of the title bar, whatever is right of them at the right-hand end.",
+                                ));
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(at > 0, egui::Button::new("⬅").small())
+                            .on_hover_text(tr("Move left"))
+                            .clicked()
+                        {
+                            swap = Some((at - 1, at));
+                        }
+                        if ui
+                            .add_enabled(at < last, egui::Button::new("➡").small())
+                            .on_hover_text(tr("Move right"))
+                            .clicked()
+                        {
+                            swap = Some((at, at + 1));
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        if ui.small_button(tr("Usual order")).clicked() {
+            buttons.order = crate::config::theme::default_order(false);
+            changed = true;
+        }
+    });
+    if let Some((a, b)) = swap {
+        buttons.order.swap(a, b);
+        changed = true;
+    }
+    changed
+}
+
 fn optional_colour_row(
     ui: &mut Ui,
     label: &'static str,
@@ -534,15 +615,9 @@ fn editor(
                             changed = true;
                         }
                     }
-                    if ui
-                        .checkbox(&mut theme.window_buttons.left, tr("On the left"))
-                        .changed()
-                    {
-                        changed = true;
-                    }
                 });
             });
-            ui.small(tr("Settings -> Window turns the buttons off altogether."));
+            ui.small(tr("Settings -> Window management turns the window controls off altogether."));
             // What each colour falls back to when the theme does not set it,
             // which is what the swatch has to show rather than a black hole.
             let style = theme.window_buttons.style;
@@ -564,7 +639,7 @@ fn editor(
                     &mut buttons.close,
                     fallback(Slot::Close),
                     editable,
-                    Some(&mut buttons.show_close),
+                    None,
                 ) {
                     changed = true;
                 }
@@ -574,7 +649,7 @@ fn editor(
                     &mut buttons.minimize,
                     fallback(Slot::Minimize),
                     editable,
-                    Some(&mut buttons.show_minimize),
+                    None,
                 ) {
                     changed = true;
                 }
@@ -584,7 +659,7 @@ fn editor(
                     &mut buttons.maximize,
                     fallback(Slot::Maximize),
                     editable,
-                    Some(&mut buttons.show_maximize),
+                    None,
                 ) {
                     changed = true;
                 }
@@ -632,6 +707,12 @@ fn editor(
                     changed = true;
                 }
             });
+
+            ui.add_space(6.0);
+            ui.label(tr("Title bar buttons, left to right"));
+            if button_order(ui, &mut theme.window_buttons, editable) {
+                changed = true;
+            }
 
             ui.add_space(8.0);
             ui.strong(tr("ANSI"));
@@ -732,18 +813,21 @@ fn preview(ui: &mut Ui, theme: &Theme) {
         .inner_margin(egui::Margin::symmetric(6.0, 4.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if theme.window_buttons.left {
-                    crate::ui::chrome::sample_buttons(ui, &theme.window_buttons);
-                    ui.add_space(4.0);
-                }
+                crate::ui::chrome::sample_buttons(
+                    ui,
+                    &theme.window_buttons,
+                    crate::ui::chrome::Side::Leading,
+                );
                 ui.label(
                     egui::RichText::new("USER  100x30")
                         .color(theme.ui_foreground)
                         .size(SIZE),
                 );
-                if !theme.window_buttons.left {
-                    crate::ui::chrome::sample_buttons(ui, &theme.window_buttons);
-                }
+                crate::ui::chrome::sample_buttons(
+                    ui,
+                    &theme.window_buttons,
+                    crate::ui::chrome::Side::Trailing,
+                );
             });
         });
 

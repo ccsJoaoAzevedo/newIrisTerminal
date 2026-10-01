@@ -1,7 +1,7 @@
 //! Where the time goes when opening a session.
 //!
 //! ```text
-//! cargo test --test live_timing -- --ignored --nocapture --test-threads=1
+//! cargo test --test integration live_timing:: -- --ignored --nocapture --test-threads=1
 //! ```
 
 use std::time::{Duration, Instant};

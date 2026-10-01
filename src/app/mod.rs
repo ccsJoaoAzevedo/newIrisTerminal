@@ -27,7 +27,7 @@ use crate::ui::macro_manager;
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
 use crate::ui::terminal_view::{self, RenderOpts, Selection, ViewState};
 use crate::ui::theme_manager::{self, ThemeAction};
-use crate::ui::{fonts, icons, input, shortcut, snake_view};
+use crate::ui::{fonts, input, shortcut, snake_view};
 
 // The shell is split by what each part is responsible for, and every one of
 // these holds part of `impl App`. Behaviour lives beside the state it acts on;
@@ -140,6 +140,11 @@ pub struct App {
     /// `+` button and Ctrl+T connect straight away, and this is what they
     /// connect to. Right-clicking `+` picks a different one.
     new_tab_profile: Profile,
+    /// The tabs closed this run, most recent last, for Ctrl+Alt+T. Kept as
+    /// what a saved session keeps, for the same reason: a closed tab's
+    /// session is gone, and its profile, namespace and screen are what is left
+    /// to open it again with.
+    closed_tabs: Vec<SavedTab>,
     status: Option<String>,
     /// When the message in the footer went up, so it can be taken down again
     /// once `status_timeout_secs` has passed.
@@ -167,6 +172,9 @@ pub struct App {
     /// Set once the user has said to close anyway, so the confirmation cannot
     /// cancel the very close it just approved.
     close_confirmed: bool,
+    /// The always-on-top state last handed to the window, so it is only sent
+    /// when it changes. `None` until the first frame has sent it.
+    on_top_applied: Option<bool>,
     /// The opening size still to be applied, while there is one.
     fit: Option<WindowFit>,
     /// Window geometry as last seen by [`App::track_window_geometry`], which is
@@ -233,6 +241,9 @@ impl App {
         // Before anything is drawn: every label the first frame asks for goes
         // through `tr`, which reads this.
         crate::i18n::set_language(settings.language);
+        crate::ui::desktop::install(cc);
+        crate::ui::tray::install(cc);
+        crate::ui::desktop::set_pinned(settings.pin_to_desktop);
         let themes = load_themes();
 
         // Housekeeping that would otherwise never happen.
@@ -296,6 +307,7 @@ impl App {
 
         let mut app = App {
             new_tab_profile: default_profile,
+            closed_tabs: Vec::new(),
             macro_groups: load_macros(&settings).groups,
             pane_rects: Vec::new(),
             history: History::load(
@@ -324,6 +336,7 @@ impl App {
             settings_placement,
             confirm_close: false,
             close_confirmed: false,
+            on_top_applied: None,
             fit,
             window_size: None,
             window_position: None,
@@ -361,38 +374,6 @@ impl App {
         }
         app
     }
-}
-
-/// A square button carrying one of the app's own marks.
-///
-/// The alternative was a letter: the new-tab button was a `+` and the tab's
-/// close button a lowercase `x`, which at this size is a small letter next to a
-/// slightly larger one. A painted mark can be designed against its neighbours -
-/// see [`icons`] - and it cannot come out as a tofu box in a font that has no
-/// glyph for it.
-/// `tint` is the theme's colour for this mark, when it names one. It wins over
-/// the widget colours whether or not the pointer is on the button: a theme
-/// picking out the `+` means it picked it out, not "unless you hover it".
-fn icon_button(
-    ui: &mut egui::Ui,
-    glyph: icons::Glyph,
-    tint: Option<egui::Color32>,
-) -> egui::Response {
-    let side = ui.spacing().interact_size.y;
-    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
-    let visuals = ui.style().interact(&response);
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, egui::Rounding::same(3.0), visuals.bg_fill);
-    }
-    icons::draw(
-        ui.painter(),
-        rect,
-        glyph,
-        tint.unwrap_or(visuals.fg_stroke.color),
-        visuals.bg_fill,
-    );
-    response
 }
 
 /// Loads the organisation file (if configured) and the personal one, and

@@ -1,0 +1,6 @@
+# At most four compilers and linkers at once. Cargo's default is one per CPU
+# thread, and a dozen linkers at ~250 MB each left the machine unusable during
+# a build. Override for one run with `cargo build -j N`, or for a machine with
+# `CARGO_BUILD_JOBS`.
+[build]
+jobs = 4

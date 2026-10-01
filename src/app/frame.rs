@@ -39,6 +39,7 @@ impl eframe::App for App {
             }
         }
 
+        self.apply_always_on_top(ctx);
         self.poll_updates();
         self.expire_status(ctx);
         self.handle_shortcuts(ctx);
@@ -46,9 +47,13 @@ impl eframe::App for App {
         // A close asked for by the window manager - Alt+F4, or the taskbar -
         // arrives as a flag rather than an event, and has to be caught before
         // anything else gets a chance to draw over the question.
-        if ctx.input(|i| i.viewport().close_requested()) && self.should_confirm_close() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_close = true;
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.should_close_to_tray() && crate::ui::tray::hide("newIrisTerminal") {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else if self.should_confirm_close() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_close = true;
+            }
         }
 
         let mut window_action = None;
@@ -65,9 +70,19 @@ impl eframe::App for App {
         if let Some(action) = window_action {
             // Close is the one action that may be refused; the rest are
             // immediate.
-            if action == WindowAction::Close && self.should_confirm_close() {
+            let hidden = action == WindowAction::Close
+                && self.should_close_to_tray()
+                && crate::ui::tray::hide("newIrisTerminal");
+            if hidden {
+                // The sessions stay; the tray icon brings the window back.
+            } else if action == WindowAction::Close && self.should_confirm_close() {
                 self.confirm_close = true;
+            } else if action == WindowAction::ToggleOnTop {
+                self.handle_request(ctx, UiRequest::ToggleAlwaysOnTop);
             } else {
+                if action == WindowAction::Minimize {
+                    crate::ui::desktop::minimizing_on_purpose();
+                }
                 chrome::apply(ctx, action);
             }
         }

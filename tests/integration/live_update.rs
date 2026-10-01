@@ -4,7 +4,7 @@
 //! twelve megabytes over it. Run with:
 //!
 //! ```text
-//! cargo test --test live_update -- --ignored --nocapture
+//! cargo test --test integration live_update:: -- --ignored --nocapture
 //! ```
 //!
 //! Read-only against the repository: one API call and one asset download into

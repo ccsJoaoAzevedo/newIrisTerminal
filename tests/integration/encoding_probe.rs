@@ -3,7 +3,7 @@
 //! from how a console happened to render a test log.
 //!
 //! ```text
-//! cargo test --test encoding_probe -- --ignored --nocapture
+//! cargo test --test integration encoding_probe:: -- --ignored --nocapture
 //! ```
 
 use std::time::{Duration, Instant};

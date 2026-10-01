@@ -4,7 +4,7 @@
 //! not break `cargo test` on a machine (or CI runner) without one. Run with:
 //!
 //! ```text
-//! cargo test --test live_session -- --ignored --nocapture
+//! cargo test --test integration live_session:: -- --ignored --nocapture
 //! ```
 //!
 //! Set `IRIS_TEST_INSTANCE` to choose the instance; otherwise the first one

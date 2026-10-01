@@ -263,13 +263,10 @@ fn title_bar(
 ) -> Option<WindowAction> {
     let mut action = None;
     ui.horizontal(|ui| {
-        if buttons.left {
-            // No gear: a dialog does not open the settings window - it may
-            // well *be* the settings window.
-            if let Some(asked) = chrome::leading_window_buttons(ui, buttons, None) {
-                action = Some(asked);
-            }
-            ui.add_space(6.0);
+        // No gear and no `+`: a dialog does not open the settings window - it
+        // may well *be* the settings window - and opens no sessions.
+        if let Some(asked) = chrome::leading_window_buttons(ui, buttons, true, None, None, None) {
+            action = Some(asked);
         }
         // Visual only, and a handle for the window: see `chrome::drag_text`.
         if let Some(asked) = chrome::drag_text(
@@ -283,7 +280,8 @@ fn title_bar(
         }
         // Claims the rest of the row for dragging either way; without it the
         // window could not be moved at all.
-        if let Some(asked) = chrome::title_bar_controls(ui, buttons, !buttons.left, window, None) {
+        if let Some(asked) = chrome::title_bar_controls(ui, buttons, true, window, None, None, None)
+        {
             action = Some(asked);
         }
     });

@@ -1,7 +1,7 @@
 //! Resizing the window against a real IRIS.
 //!
 //! ```text
-//! cargo test --test live_resize -- --ignored --nocapture
+//! cargo test --test integration live_resize:: -- --ignored --nocapture
 //! ```
 //!
 //! A Windows pseudoconsole answers every resize by repainting the whole screen,

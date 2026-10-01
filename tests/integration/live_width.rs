@@ -1,7 +1,7 @@
 //! How long a line the terminal can carry, end to end against a real IRIS.
 //!
 //! ```text
-//! cargo test --test live_width -- --ignored --nocapture --test-threads=1
+//! cargo test --test integration live_width:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! IRIS truncates a `Write` at the device right margin, so the width the app

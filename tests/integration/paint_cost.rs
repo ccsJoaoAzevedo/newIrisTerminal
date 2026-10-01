@@ -4,7 +4,7 @@
 //! frame that the app pays for on every redraw - building the shapes, and
 //! turning them into triangles. Ignored by default because a timing number is
 //! not a thing to fail a build on; run it with
-//! `cargo test --release --test paint_cost -- --ignored --nocapture`.
+//! `cargo test --release --test integration paint_cost:: -- --ignored --nocapture`.
 
 use eframe::egui;
 use new_iris_terminal::config::theme::Theme;

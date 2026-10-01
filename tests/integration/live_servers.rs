@@ -5,7 +5,7 @@
 //! (or CI runner) without either. Run with:
 //!
 //! ```text
-//! cargo test --test live_servers -- --ignored --nocapture
+//! cargo test --test integration live_servers:: -- --ignored --nocapture
 //! ```
 //!
 //! These tests only read configuration and the login banner. They never log in

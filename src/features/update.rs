@@ -20,7 +20,7 @@
 //! ships can do NTLM, so a proxy that insists on it is one the app cannot get
 //! past, and the dialog offers the browser instead.
 //!
-//! `tests/live_update.rs` is where all of this is checked against the real
+//! `tests/integration/live_update.rs` is where all of this is checked against the real
 //! repository, and it is the only way any of it can be.
 
 use std::path::{Path, PathBuf};
@@ -440,7 +440,7 @@ fn download(release: &Release, progress: &AtomicU64) -> Result<PathBuf> {
 
 /// Downloads the release's asset to `into`, reporting progress as it goes.
 ///
-/// Public so `tests/live_update.rs` can do exactly what the app does without
+/// Public so `tests/integration/live_update.rs` can do exactly what the app does without
 /// touching the running executable: the download is the half of the updater
 /// that goes wrong, and it is the half that cannot be checked without the
 /// network.

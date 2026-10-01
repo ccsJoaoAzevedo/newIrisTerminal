@@ -32,8 +32,8 @@ Everything CI runs, and what you must run before claiming a change works:
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features plugins -- -D warnings
-cargo test --all-targets
-cargo test --features plugins --all-targets
+cargo test --lib --tests
+cargo test --features plugins --lib --tests
 ```
 
 `plugins` is behind a feature flag and would otherwise rot, so it is tested
@@ -44,14 +44,23 @@ Docs are part of the build's cleanliness. `cargo doc --no-deps` must emit **no
 warnings** — a link to a private item does not resolve for a reader, so write
 the name in backticks instead of `[brackets]` when the target is private.
 
+### Keeping a build from eating the machine
+
+Every test binary is a separate link, and a debug link holds ~250 MB. So the
+integration tests are **one binary**, `tests/integration/main.rs`, with each
+file a module: add a new one as `mod name;` there, never as a new file directly
+under `tests/` (that would be one more link). `.cargo/config.toml` caps Cargo at
+four jobs, and `Cargo.toml` keeps debug info to line tables for this crate and
+none for dependencies. Override the cap for one run with `-j N`.
+
 ### Tests that need a live IRIS
 
-`tests/live_*.rs` are `#[ignore]`d by default: they need an installed, running
+`tests/integration/live_*.rs` are `#[ignore]`d by default: they need an installed, running
 instance and must never break `cargo test` on a machine without one. Run one
 with:
 
 ```bash
-cargo test --test live_session -- --ignored --nocapture
+cargo test --test integration live_session:: -- --ignored --nocapture
 ```
 
 **These tests must never log in and never write data.** Every `RDB*` database is
@@ -59,12 +68,12 @@ shared with the whole team.
 
 ### The paint benchmark
 
-`tests/paint_cost.rs` is a stopwatch, not an assertion, and is `#[ignore]`d for
+`tests/integration/paint_cost.rs` is a stopwatch, not an assertion, and is `#[ignore]`d for
 that reason. It measures what one frame of the terminal grid costs on the CPU,
 split into building the shapes and tessellating them:
 
 ```bash
-cargo test --release --test paint_cost -- --ignored --nocapture
+cargo test --release --test integration paint_cost:: -- --ignored --nocapture
 ```
 
 Run it before and after anything that touches drawing. The machine is noisy, so

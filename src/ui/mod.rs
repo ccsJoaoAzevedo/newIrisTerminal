@@ -19,6 +19,7 @@
 //!   session at all.
 
 pub mod chrome;
+pub mod desktop;
 pub mod detach;
 pub mod fonts;
 pub mod icons;
@@ -32,4 +33,5 @@ pub mod shortcut;
 pub mod snake_view;
 pub mod terminal_view;
 pub mod theme_manager;
+pub mod tray;
 pub mod wrap;

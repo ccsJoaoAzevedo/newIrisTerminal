@@ -3,7 +3,7 @@
 //! Ignored by default — it needs an installed, running instance. Run with:
 //!
 //! ```text
-//! cargo test --test live_clear -- --ignored --nocapture
+//! cargo test --test integration live_clear:: -- --ignored --nocapture
 //! ```
 //!
 //! Read-only: it writes `W #` to the device and nothing else. No login, no

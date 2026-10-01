@@ -1,7 +1,7 @@
 //! Reproduces the "long lines get cut off" report and shows where the loss is.
 //!
 //! ```text
-//! cargo test --test live_wrap -- --ignored --nocapture --test-threads=1
+//! cargo test --test integration live_wrap:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! The question this answers: when IRIS writes a line wider than the terminal,

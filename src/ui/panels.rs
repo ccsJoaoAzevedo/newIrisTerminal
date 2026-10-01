@@ -44,6 +44,8 @@ pub enum UiRequest {
     ExportHtml(crate::features::export::Range),
     CopyRange(crate::features::export::Range),
     SettingsChanged,
+    /// Keep the main window above all others, or stop.
+    ToggleAlwaysOnTop,
     /// Write the personal macro file back to disk.
     SavePersonalMacros,
     /// Show a folder in the platform's file manager.
@@ -872,17 +874,7 @@ pub fn settings_dialog(
                 {
                     changed = true;
                 }
-                if ui
-                    .checkbox(
-                        &mut settings.confirm_close_with_live_session,
-                        tr("Ask before closing with a session still connected"),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-
-                section(ui, tr("Window"));
+                section(ui, tr("Window management"));
                 if ui
                     .checkbox(
                         &mut settings.show_window_buttons,
@@ -976,6 +968,32 @@ pub fn settings_dialog(
                 ui.small(tr(
                     "Takes effect the next time the app starts, and covers this window as well as the main one.",
                 ));
+                if ui
+                    .checkbox(&mut settings.pin_to_desktop, tr("Pin to desktop"))
+                    .on_hover_text(tr(
+                        "Keeps the window on screen when the desktop is shown (Win+D). Otherwise it is an ordinary window: others cover it, and clicking it brings it to the front.",
+                    ))
+                    .changed()
+                {
+                    changed = true;
+                }
+
+                if ui
+                    .checkbox(
+                        &mut settings.confirm_close_with_live_session,
+                        tr("Ask before closing with a session still connected"),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(&mut settings.close_to_tray, tr("Close to the tray"))
+                    .on_hover_text(tr("Closing the window hides it behind an icon in the notification area, and the sessions stay connected. Click the icon to bring it back; its menu's Exit quits."))
+                    .changed()
+                {
+                    changed = true;
+                }
 
                 section(ui, tr("Updates"));
                 if ui

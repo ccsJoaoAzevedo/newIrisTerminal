@@ -40,6 +40,11 @@ pub enum Glyph {
     Plus,
     /// Close tab: a smaller cross, for a button that sits inside a tab.
     SmallCross,
+    /// Pin to desktop, while it is off: a pushpin drawn in outline.
+    Pin,
+    /// Pin to desktop, while it is on: the same pushpin with its head filled,
+    /// so the state reads without hovering for the tooltip.
+    Pinned,
 }
 
 impl Glyph {
@@ -66,6 +71,7 @@ impl Glyph {
             // tab, beside a label, and growing it would make closing a tab
             // look like the thing the tab is for.
             Glyph::SmallCross => 0.40,
+            Glyph::Pin | Glyph::Pinned => 0.50,
         }
     }
 
@@ -82,7 +88,7 @@ impl Glyph {
             Glyph::Cross => 1.7,
             Glyph::SmallCross => 1.3,
             Glyph::Gear => 1.5,
-            Glyph::Window | Glyph::WindowStack => 1.3,
+            Glyph::Window | Glyph::WindowStack | Glyph::Pin | Glyph::Pinned => 1.3,
         }
     }
 }
@@ -105,6 +111,8 @@ pub fn draw(painter: &Painter, rect: Rect, glyph: Glyph, colour: Color32, behind
         Glyph::Cross | Glyph::SmallCross => cross(painter, box_, stroke),
         Glyph::Gear => gear(painter, box_, stroke),
         Glyph::Plus => plus(painter, box_, stroke),
+        Glyph::Pin => pin(painter, box_, stroke, false),
+        Glyph::Pinned => pin(painter, box_, stroke, true),
     }
 }
 
@@ -206,6 +214,29 @@ fn gear(painter: &Painter, box_: Rect, stroke: Stroke) {
     }
 }
 
+/// Pin to desktop: a round head in the upper right and a needle running from it
+/// to the lower left, the way a pushpin sits in a board.
+///
+/// Leaning rather than upright: an upright pin at this size is a circle on a
+/// stick, which reads as a key or a lollipop before it reads as a pin.
+fn pin(painter: &Painter, box_: Rect, stroke: Stroke, pinned: bool) {
+    let side = box_.width();
+    let head = box_.right_top() + Vec2::new(-side * 0.32, side * 0.32);
+    let radius = side * 0.26;
+    let dir = Vec2::new(-1.0, 1.0).normalized();
+    painter.line_segment([head + dir * radius, box_.left_bottom()], stroke);
+    // The collar under the head, across the needle, which is what makes the
+    // round thing a pin's head rather than a balloon on a string.
+    let across = Vec2::new(1.0, 1.0).normalized() * radius * 0.9;
+    let collar = head + dir * (radius + stroke.width);
+    painter.line_segment([collar - across, collar + across], stroke);
+    if pinned {
+        painter.circle_filled(head, radius, stroke.color);
+    } else {
+        painter.circle_stroke(head, radius, stroke);
+    }
+}
+
 /// A rectangle on whole pixels, so a one-point outline comes out crisp rather
 /// than as two grey rows.
 fn align(rect: Rect) -> Rect {
@@ -231,6 +262,8 @@ mod tests {
             Glyph::Gear,
             Glyph::Plus,
             Glyph::SmallCross,
+            Glyph::Pin,
+            Glyph::Pinned,
         ] {
             assert!(
                 glyph.scale() > 0.0 && glyph.scale() <= 0.62,

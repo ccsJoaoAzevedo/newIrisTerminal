@@ -2,7 +2,7 @@
 //! break is still a command line.
 //!
 //! ```text
-//! cargo test --test live_break_prompt -- --ignored --nocapture --test-threads=1
+//! cargo test --test integration live_break_prompt:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! A break leaves the program stack level on the prompt — `COMP80 2x0>`,

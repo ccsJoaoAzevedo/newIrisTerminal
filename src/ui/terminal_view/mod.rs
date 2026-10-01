@@ -115,7 +115,7 @@ impl Default for RenderOpts {
 /// The ceiling above it is the console's, not ours. A pseudoconsole resized to
 /// exactly 32767 columns - `SHRT_MAX` - stops answering altogether: the session
 /// comes up as a black screen that ignores every key, which is what
-/// `tests/live_width.rs` measures and pins. 32000 leaves most of a thousand
+/// `tests/integration/live_width.rs` measures and pins. 32000 leaves most of a thousand
 /// columns of clearance under that cliff and is demonstrably fast at every
 /// window height. IRIS's own limit is 32767, so there is nothing meaningful
 /// left above it either.

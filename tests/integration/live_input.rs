@@ -1,7 +1,7 @@
 //! End-to-end input tests against a real IRIS instance.
 //!
 //! ```text
-//! cargo test --test live_input -- --ignored --nocapture --test-threads=1
+//! cargo test --test integration live_input:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! These drive the same code paths the GUI uses, but bypass egui: they push

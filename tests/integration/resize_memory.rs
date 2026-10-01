@@ -7,7 +7,7 @@
 //! give pages back.
 //!
 //! ```text
-//! cargo test --release --test resize_memory -- --ignored --nocapture
+//! cargo test --release --test integration resize_memory:: -- --ignored --nocapture
 //! ```
 
 use std::alloc::{GlobalAlloc, Layout, System};

@@ -11,7 +11,7 @@ use egui::{
     ViewportCommand,
 };
 
-use crate::config::theme::{WindowButtonStyle, WindowButtons};
+use crate::config::theme::{TitleButton, WindowButtonStyle, WindowButtons};
 use crate::i18n::tr;
 use crate::ui::icons::{self, Glyph};
 use crate::ui::shading::{darken, gloss, gradient, lighten, radial, white};
@@ -45,6 +45,14 @@ enum Icon {
     /// whatever style the theme gives the others, or it would read as
     /// something from a different program bolted onto the title bar.
     Settings,
+    /// Keeps the window above every other window, or stops.
+    Pin {
+        pinned: bool,
+    },
+    /// The `+` that opens a session.
+    NewTab,
+    /// The cross inside each tab.
+    CloseTab,
 }
 
 impl Icon {
@@ -59,7 +67,16 @@ impl Icon {
             // painted in it would claim to be one. It has a slot of its own
             // instead, and falls back to the glyph colour when the theme is
             // silent about it - which is where it was before the slot existed.
-            Icon::Settings => style.settings,
+            Icon::Settings | Icon::Pin { .. } => style.settings,
+            Icon::NewTab => style.new_tab,
+            // The stroked style draws it in the tab's own ink, as it always
+            // has; a red cross in every tab would shout. The other two have no
+            // un-coloured button to offer, and a close light is what they are
+            // already drawing at the corner of the window.
+            Icon::CloseTab => match style.style {
+                WindowButtonStyle::Stroke => None,
+                WindowButtonStyle::Aqua | WindowButtonStyle::Luna => style.close,
+            },
         }
     }
 
@@ -69,9 +86,12 @@ impl Icon {
             Icon::Close => style.show_close,
             Icon::Minimize => style.show_minimize,
             Icon::Maximize | Icon::Restore => style.show_maximize,
+            Icon::Pin { .. } => style.show_on_top,
             // The way into Settings cannot be something a theme can take
             // away: there would then be no way in at all.
-            Icon::Settings => true,
+            // None of these is a window control, so none answers to the
+            // switches that hide those.
+            Icon::Settings | Icon::NewTab | Icon::CloseTab => true,
         }
     }
 
@@ -83,7 +103,20 @@ impl Icon {
             Icon::Restore => Glyph::WindowStack,
             Icon::Close => Glyph::Cross,
             Icon::Settings => Glyph::Gear,
+            Icon::Pin { pinned: false } => Glyph::Pin,
+            Icon::Pin { pinned: true } => Glyph::Pinned,
+            Icon::NewTab => Glyph::Plus,
+            Icon::CloseTab => Glyph::SmallCross,
         }
+    }
+
+    /// Whether this is one of the app's own controls rather than a window
+    /// control. Aqua had no mark for these, so they are the app's glyph on an
+    /// Aqua bubble - and, unlike the traffic lights, with the glyph always
+    /// showing: a grey bubble that only says it opens a tab once the pointer
+    /// is on it is not a button anyone can find.
+    fn is_own(self) -> bool {
+        matches!(self, Icon::Pin { .. } | Icon::NewTab | Icon::CloseTab)
     }
 }
 
@@ -105,13 +138,16 @@ const AQUA_INACTIVE: Color32 = Color32::from_rgb(203, 203, 203);
 fn window_button(ui: &mut Ui, icon: Icon, hint: &str, style: &WindowButtons) -> Response {
     let side = ui.spacing().interact_size.y;
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
-    let hovered = response.hovered();
+    paint(ui, rect, icon, response.hovered(), style);
+    response.on_hover_text(hint)
+}
+
+fn paint(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButtons) {
     match style.style {
         WindowButtonStyle::Stroke => paint_stroked(ui, rect, icon, hovered, style),
         WindowButtonStyle::Aqua => paint_aqua(ui, rect, icon, hovered, style),
         WindowButtonStyle::Luna => paint_luna(ui, rect, icon, hovered, style),
     }
-    response.on_hover_text(hint)
 }
 
 /// The app's own look: a glyph on a transparent square, filled on hover.
@@ -209,6 +245,16 @@ fn paint_aqua(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
         215,
     );
 
+    if icon.is_own() {
+        icons::draw(
+            painter,
+            Rect::from_center_size(center, Vec2::splat(radius * 2.0)),
+            icon.glyph(),
+            darken(base, 0.30),
+            base,
+        );
+        return;
+    }
     // Tiger showed the marks only under the pointer - x to close, - to
     // minimize, + to zoom - and hid them the rest of the time.
     if !hovered {
@@ -263,6 +309,8 @@ fn paint_aqua(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
                 stroke,
             );
         }
+        // Drawn above, before the hover test.
+        Icon::Pin { .. } | Icon::NewTab | Icon::CloseTab => {}
     }
 }
 
@@ -339,7 +387,9 @@ fn paint_luna(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
     let glyph = Rect::from_center_size(tile.center(), Vec2::splat((side_of(rect) * 0.26).max(5.0)));
     match icon {
         // Luna never had one either, and its glyphs are always on.
-        Icon::Settings => icons::draw(painter, tile, Glyph::Gear, colour, darken(base, 0.80)),
+        Icon::Settings | Icon::Pin { .. } | Icon::NewTab | Icon::CloseTab => {
+            icons::draw(painter, tile, icon.glyph(), colour, darken(base, 0.80))
+        }
         Icon::Minimize => {
             // Luna's minimize sat on the baseline rather than in the middle.
             let y = glyph.bottom();
@@ -382,18 +432,38 @@ pub enum WindowAction {
     Minimize,
     ToggleMaximize,
     Close,
+    /// Keep the window above all others, or stop. Carried out by the app
+    /// rather than by [`apply`], because it is a setting and has to be saved.
+    ToggleOnTop,
 }
 
-/// Draws the three controls with nothing behind them, for a theme preview.
+/// Draws one end of the title bar with nothing behind it, for a theme preview.
 ///
 /// The clicks are dropped: this is a picture of the buttons, not the buttons.
 /// Under the stroked style the glyph colour still comes from the surrounding
 /// widget colours - that is what the style means - so what a preview shows of
 /// it is whatever the *active* theme says, not the one being edited.
-pub fn sample_buttons(ui: &mut Ui, style: &WindowButtons) {
-    let _ = optional_button(ui, Icon::Close, tr("Close"), style);
-    let _ = optional_button(ui, Icon::Minimize, tr("Minimize"), style);
-    let _ = optional_button(ui, Icon::Maximize, tr("Maximize"), style);
+pub fn sample_buttons(ui: &mut Ui, style: &WindowButtons, side: Side) {
+    let mut open = false;
+    let mut plus = |ui: &mut Ui| {
+        let _ = new_tab_button(ui, style);
+    };
+    let _ = controls(
+        ui,
+        style,
+        true,
+        Some(&mut open),
+        Some(false),
+        side,
+        Some(&mut plus),
+    );
+}
+
+/// Which end of the title bar: before the tabs in the theme's order, or after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Leading,
+    Trailing,
 }
 
 /// The maximize control's icon and tooltip, which depend on where the window is
@@ -406,31 +476,86 @@ fn maximize_icon(ui: &Ui) -> (Icon, &'static str) {
     }
 }
 
-/// Draws the three controls at the left-hand end of the row, in Aqua's order.
+/// Draws what the theme puts before the tabs, at the left-hand end of the row.
 ///
-/// Called before anything else in the title bar, so they sit where a Mac puts
-/// them; the drag area is still claimed at the end by
-/// [`title_bar_controls`].
+/// Called before anything else in the title bar; the drag area is still
+/// claimed at the end by [`title_bar_controls`]. See [`title_bar_controls`]
+/// for the arguments.
 pub fn leading_window_buttons(
     ui: &mut Ui,
     style: &WindowButtons,
+    window_controls: bool,
     settings: Option<&mut bool>,
+    on_top: Option<bool>,
+    new_tab: Option<&mut dyn FnMut(&mut Ui)>,
+) -> Option<WindowAction> {
+    controls(
+        ui,
+        style,
+        window_controls,
+        settings,
+        on_top,
+        Side::Leading,
+        new_tab,
+    )
+}
+
+/// One end of the bar, in the theme's order.
+///
+/// `window_controls` false leaves out close, minimize and maximize - the
+/// setting that hides them - but not the gear or the pin, which are the app's
+/// own. `settings`, `on_top` and `new_tab` are `None` for a window without
+/// them; `new_tab` draws the `+`, which only its caller knows how to.
+fn controls(
+    ui: &mut Ui,
+    style: &WindowButtons,
+    window_controls: bool,
+    mut settings: Option<&mut bool>,
+    on_top: Option<bool>,
+    side: Side,
+    mut new_tab: Option<&mut dyn FnMut(&mut Ui)>,
 ) -> Option<WindowAction> {
     let mut action = None;
-    if clicked(optional_button(ui, Icon::Close, tr("Close"), style)) {
-        action = Some(WindowAction::Close);
-    }
-    if clicked(optional_button(ui, Icon::Minimize, tr("Minimize"), style)) {
-        action = Some(WindowAction::Minimize);
-    }
-    let (icon, hint) = maximize_icon(ui);
-    if clicked(optional_button(ui, icon, hint, style)) {
-        action = Some(WindowAction::ToggleMaximize);
-    }
-    // After the three, which in a left-hand group puts it beside minimize the
-    // way it is beside minimize on the right.
-    if let Some(open) = settings {
-        settings_toggle(ui, style, open);
+    let group = match side {
+        Side::Leading => style.leading().to_vec(),
+        // A right-to-left row places the last one first.
+        Side::Trailing => style.trailing().iter().rev().copied().collect(),
+    };
+    for button in group {
+        match button {
+            TitleButton::Close if window_controls => {
+                if clicked(optional_button(ui, Icon::Close, tr("Close"), style)) {
+                    action = Some(WindowAction::Close);
+                }
+            }
+            TitleButton::Minimize if window_controls => {
+                if clicked(optional_button(ui, Icon::Minimize, tr("Minimize"), style)) {
+                    action = Some(WindowAction::Minimize);
+                }
+            }
+            TitleButton::Maximize if window_controls => {
+                let (icon, hint) = maximize_icon(ui);
+                if clicked(optional_button(ui, icon, hint, style)) {
+                    action = Some(WindowAction::ToggleMaximize);
+                }
+            }
+            TitleButton::OnTop => {
+                if on_top_toggle(ui, style, on_top) {
+                    action = Some(WindowAction::ToggleOnTop);
+                }
+            }
+            TitleButton::Settings => {
+                if let Some(open) = settings.as_deref_mut() {
+                    settings_toggle(ui, style, open);
+                }
+            }
+            TitleButton::NewTab => {
+                if let Some(draw) = new_tab.as_deref_mut() {
+                    draw(ui);
+                }
+            }
+            _ => {}
+        }
     }
     action
 }
@@ -454,15 +579,74 @@ fn settings_toggle(ui: &mut Ui, style: &WindowButtons, open: &mut bool) {
     // about a pressed state, and a gear that looks pressed while the window is
     // open is worth more than making all three learn about one.
     if *open {
-        ui.painter().rect_stroke(
-            response.rect.shrink(1.0),
-            egui::Rounding::same(2.0),
-            Stroke::new(1.0_f32, ui.visuals().widgets.active.fg_stroke.color),
-        );
+        pressed_outline(ui, response.rect);
     }
     if response.clicked() {
         *open = !*open;
     }
+}
+
+/// The always-on-top pin, when this window has one. Reports a click.
+///
+/// Not hidden with the window controls: it is the only way to what it does
+/// from the title bar, and a setting that hides close has not asked for it to
+/// be put out of reach. Only the theme's own switch for it does that.
+fn on_top_toggle(ui: &mut Ui, style: &WindowButtons, on_top: Option<bool>) -> bool {
+    let Some(pinned) = on_top else {
+        return false;
+    };
+    let hint = if pinned {
+        tr("Stop keeping the window above the others")
+    } else {
+        tr("Keep the window above all other windows")
+    };
+    // The filled head alone is a few pixels' difference, too little to read
+    // the state by. So off is faded, and on wears the gear's pressed outline:
+    // the one mark this title bar already uses for "this is switched on".
+    let response = ui
+        .scope(|ui| {
+            if !pinned {
+                ui.multiply_opacity(PIN_OFF_OPACITY);
+            }
+            optional_button(ui, Icon::Pin { pinned }, hint, style)
+        })
+        .inner;
+    if let (true, Some(response)) = (pinned, &response) {
+        pressed_outline(ui, response.rect);
+    }
+    clicked(response)
+}
+
+/// How faint the pin is drawn while it is off. Faint enough to read as "not
+/// on" beside the window controls, not so faint that it reads as disabled.
+const PIN_OFF_OPACITY: f32 = 0.45;
+
+/// The frame a toggle wears while it is on.
+fn pressed_outline(ui: &Ui, rect: Rect) {
+    ui.painter().rect_stroke(
+        rect.shrink(1.0),
+        egui::Rounding::same(2.0),
+        Stroke::new(1.0_f32, ui.visuals().widgets.active.fg_stroke.color),
+    );
+}
+
+/// The `+` that opens a session, in the theme's button style.
+pub fn new_tab_button(ui: &mut Ui, style: &WindowButtons) -> Response {
+    bare_button(ui, Icon::NewTab, style)
+}
+
+/// The cross inside a tab, in the theme's button style.
+pub fn close_tab_button(ui: &mut Ui, style: &WindowButtons) -> Response {
+    bare_button(ui, Icon::CloseTab, style)
+}
+
+/// A control with no tooltip, for callers whose tooltip needs text this module
+/// has no business knowing.
+fn bare_button(ui: &mut Ui, icon: Icon, style: &WindowButtons) -> Response {
+    let side = ui.spacing().interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+    paint(ui, rect, icon, response.hovered(), style);
+    response
 }
 
 /// Whether a control that may not be there was clicked.
@@ -513,47 +697,39 @@ pub fn drag_text(
     drag_area(ui, handle, Id::new(("nit-titlebar-text", window, tag)))
 }
 
-/// Draws minimize / maximize / close at the right-hand end of the row, then
-/// makes whatever space is left draggable.
+/// Draws what the theme puts after the tabs, at the right-hand end of the row,
+/// then makes whatever space is left draggable.
 ///
 /// Buttons first, dragging second: the drag area is the leftover rectangle, so
-/// it cannot swallow the buttons however narrow the window gets.
+/// it cannot swallow the buttons however narrow the window gets. It is claimed
+/// even when nothing at all is drawn here: without it the window could not be
+/// moved.
 ///
-/// `buttons` is false when the controls are not wanted here at all - either the
-/// setting has them hidden, or the theme has already had them drawn on the left
-/// by [`leading_window_buttons`]. The drag area is claimed either way: without
-/// it the window could not be moved.
-///
-/// `settings` is the gear, drawn beside minimize when this is the group minimize
-/// is in; `None` for a window that has no settings to open.
+/// `buttons` is false when the setting has the window controls hidden.
+/// `settings` is the gear and `on_top` whether the window is kept above the
+/// others; `new_tab` draws the `+`. Each is `None` for a window without it, and
+/// each is drawn only if the theme puts it at this end.
 pub fn title_bar_controls(
     ui: &mut Ui,
     style: &WindowButtons,
     buttons: bool,
     window: &'static str,
     settings: Option<&mut bool>,
+    on_top: Option<bool>,
+    new_tab: Option<&mut dyn FnMut(&mut Ui)>,
 ) -> Option<WindowAction> {
     let mut action = None;
 
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if buttons {
-            if clicked(optional_button(ui, Icon::Close, tr("Close"), style)) {
-                action = Some(WindowAction::Close);
-            }
-            let (icon, hint) = maximize_icon(ui);
-            if clicked(optional_button(ui, icon, hint, style)) {
-                action = Some(WindowAction::ToggleMaximize);
-            }
-            if clicked(optional_button(ui, Icon::Minimize, tr("Minimize"), style)) {
-                action = Some(WindowAction::Minimize);
-            }
-        }
-        // Last in a right-to-left row, so it lands to the left of minimize -
-        // which is where it was asked for, and which keeps the three controls
-        // together at the corner where the pointer goes looking for them.
-        if let Some(open) = settings {
-            settings_toggle(ui, style, open);
-        }
+        action = controls(
+            ui,
+            style,
+            buttons,
+            settings,
+            on_top,
+            Side::Trailing,
+            new_tab,
+        );
 
         // Everything between the buttons and whatever the caller has already
         // put on the left, all of it: a title bar you can only take hold of by
@@ -613,6 +789,7 @@ pub fn apply(ctx: &Context, action: WindowAction) {
             ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
         }
         WindowAction::Close => ctx.send_viewport_cmd(ViewportCommand::Close),
+        WindowAction::ToggleOnTop => {}
     }
 }
 

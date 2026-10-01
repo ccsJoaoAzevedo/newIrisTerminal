@@ -114,6 +114,92 @@ pub enum WindowButtonSlot {
     Maximize,
 }
 
+/// One of the things a theme lays out along the title bar.
+///
+/// `Tabs` is the stretch in the middle - the tabs when they share the title
+/// bar, the session's own line when they do not - and it is what splits the
+/// row: whatever comes before it sits at the left-hand end, whatever comes
+/// after it at the right. The gear, the `+` and the middle can be placed but
+/// not hidden: the gear is the only way into Settings, the `+` the only way to
+/// the server menu, and the middle is where the window is dragged by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleButton {
+    Close,
+    Minimize,
+    Maximize,
+    /// Keeps the window above every other window. See `Settings::always_on_top`.
+    OnTop,
+    Settings,
+    NewTab,
+    Tabs,
+}
+
+impl TitleButton {
+    pub const ALL: [TitleButton; 7] = [
+        TitleButton::Close,
+        TitleButton::Minimize,
+        TitleButton::Maximize,
+        TitleButton::OnTop,
+        TitleButton::Settings,
+        TitleButton::NewTab,
+        TitleButton::Tabs,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TitleButton::Close => "close",
+            TitleButton::Minimize => "minimize",
+            TitleButton::Maximize => "maximize",
+            TitleButton::OnTop => "on_top",
+            TitleButton::Settings => "settings",
+            TitleButton::NewTab => "new_tab",
+            TitleButton::Tabs => "tabs",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|b| b.name().eq_ignore_ascii_case(name.trim()))
+    }
+}
+
+/// Everything on the title bar, left to right as drawn. Always all of it:
+/// hiding a button is the `show_*` flags' business, so one switched back on
+/// returns to the place it was given rather than to the end.
+pub type ButtonOrder = [TitleButton; 7];
+
+/// The layout from before a theme could choose one. `left` is the old
+/// `window_buttons_left`, which is how a theme written then still opens the
+/// way it always did: close at the outer corner either way, and the gear on
+/// the inside beside minimize.
+pub fn default_order(left: bool) -> ButtonOrder {
+    use TitleButton::*;
+    if left {
+        [Close, OnTop, Minimize, Maximize, Settings, NewTab, Tabs]
+    } else {
+        [NewTab, Tabs, Settings, Minimize, Maximize, OnTop, Close]
+    }
+}
+
+/// Reads an order from a theme file. Unknown names and repeats are dropped,
+/// and whatever the file left out goes back at the place the usual order has
+/// it, so a hand-edited list can never lose a button - least of all the gear.
+fn resolve_order(names: &[String], left: bool) -> ButtonOrder {
+    let mut order: Vec<TitleButton> = Vec::with_capacity(7);
+    for button in names.iter().filter_map(|n| TitleButton::from_name(n)) {
+        if !order.contains(&button) {
+            order.push(button);
+        }
+    }
+    for (at, button) in default_order(left).into_iter().enumerate() {
+        if !order.contains(&button) {
+            order.insert(at.min(order.len()), button);
+        }
+    }
+    order.try_into().expect("every button exactly once")
+}
+
 /// Resolved appearance of the three window controls.
 ///
 /// Every colour is optional: `None` means "whatever the widget colours say",
@@ -123,8 +209,6 @@ pub enum WindowButtonSlot {
 #[derive(Clone, Copy, Debug)]
 pub struct WindowButtons {
     pub style: WindowButtonStyle,
-    /// Draw them at the left-hand end of the title bar, as Aqua does.
-    pub left: bool,
     /// Which of the three are drawn at all.
     ///
     /// A window that cannot be closed from its own title bar is a real choice
@@ -134,6 +218,11 @@ pub struct WindowButtons {
     pub show_close: bool,
     pub show_minimize: bool,
     pub show_maximize: bool,
+    /// The always-on-top pin. Not a window control, but a theme that wants a
+    /// quiet title bar may still not want it.
+    pub show_on_top: bool,
+    /// Where everything on the title bar sits, left to right.
+    pub order: ButtonOrder,
     pub close: Option<Color32>,
     pub minimize: Option<Color32>,
     pub maximize: Option<Color32>,
@@ -158,16 +247,47 @@ pub struct WindowButtons {
     pub new_tab: Option<Color32>,
 }
 
+impl WindowButtons {
+    /// What sits at the left-hand end of the bar, left to right.
+    pub fn leading(&self) -> &[TitleButton] {
+        &self.order[..self.tabs_at()]
+    }
+
+    /// What sits at the right-hand end of the bar, left to right.
+    pub fn trailing(&self) -> &[TitleButton] {
+        &self.order[self.tabs_at() + 1..]
+    }
+
+    fn tabs_at(&self) -> usize {
+        self.order
+            .iter()
+            .position(|b| *b == TitleButton::Tabs)
+            .expect("the order always holds the tabs")
+    }
+
+    /// Whether `button` is drawn at all, before any setting has its say.
+    pub fn shows(&self, button: TitleButton) -> bool {
+        match button {
+            TitleButton::Close => self.show_close,
+            TitleButton::Minimize => self.show_minimize,
+            TitleButton::Maximize => self.show_maximize,
+            TitleButton::OnTop => self.show_on_top,
+            TitleButton::Settings | TitleButton::NewTab | TitleButton::Tabs => true,
+        }
+    }
+}
+
 /// All three shown, stroked, on the right: what a theme that says nothing about
 /// its window buttons gets.
 impl Default for WindowButtons {
     fn default() -> Self {
         WindowButtons {
             style: WindowButtonStyle::default(),
-            left: false,
             show_close: true,
             show_minimize: true,
             show_maximize: true,
+            show_on_top: true,
+            order: default_order(false),
             close: None,
             minimize: None,
             maximize: None,
@@ -381,8 +501,10 @@ pub struct ThemeFile {
     /// default, and what every theme written before this got) or `"aqua"`.
     #[serde(default)]
     pub window_button_style: String,
-    /// Put the controls at the left-hand end of the title bar.
-    #[serde(default)]
+    /// Read from themes written before `window_button_order`, where it put the
+    /// controls at the left-hand end; never written, since the order now says
+    /// where everything goes.
+    #[serde(default, skip_serializing)]
     pub window_buttons_left: bool,
     /// Which controls the title bar has. All three unless a theme says
     /// otherwise, which is what every theme written before this said.
@@ -392,6 +514,13 @@ pub struct ThemeFile {
     pub window_button_show_minimize: bool,
     #[serde(default = "yes")]
     pub window_button_show_maximize: bool,
+    #[serde(default = "yes")]
+    pub window_button_show_on_top: bool,
+    /// The title bar left to right, by name: `close`, `minimize`, `maximize`,
+    /// `on_top`, `settings`, `new_tab` and `tabs`. Empty is the usual order,
+    /// and is what gets written when the theme has not changed it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub window_button_order: Vec<String>,
     /// Colours for the three controls. Empty leaves one to the widget colours,
     /// except under `aqua`, where an unset slot becomes its traffic light.
     #[serde(default)]
@@ -474,6 +603,8 @@ impl Default for ThemeFile {
             window_button_show_close: true,
             window_button_show_minimize: true,
             window_button_show_maximize: true,
+            window_button_show_on_top: true,
+            window_button_order: Vec::new(),
             window_button_close: String::new(),
             window_button_minimize: String::new(),
             window_button_maximize: String::new(),
@@ -512,10 +643,11 @@ fn window_buttons(file: &ThemeFile) -> WindowButtons {
     };
     WindowButtons {
         style,
-        left: file.window_buttons_left,
         show_close: file.window_button_show_close,
         show_minimize: file.window_button_show_minimize,
         show_maximize: file.window_button_show_maximize,
+        show_on_top: file.window_button_show_on_top,
+        order: resolve_order(&file.window_button_order, file.window_buttons_left),
         close: fill(&file.window_button_close, WindowButtonSlot::Close),
         minimize: fill(&file.window_button_minimize, WindowButtonSlot::Minimize),
         maximize: fill(&file.window_button_maximize, WindowButtonSlot::Maximize),
@@ -679,10 +811,20 @@ impl Theme {
             syntax_routine: to_hex(self.syntax_routine),
             syntax_extrinsic: to_hex(self.syntax_extrinsic),
             window_button_style: self.window_buttons.style.name().to_string(),
-            window_buttons_left: self.window_buttons.left,
+            window_buttons_left: false,
             window_button_show_close: self.window_buttons.show_close,
             window_button_show_minimize: self.window_buttons.show_minimize,
             window_button_show_maximize: self.window_buttons.show_maximize,
+            window_button_show_on_top: self.window_buttons.show_on_top,
+            window_button_order: if self.window_buttons.order == default_order(false) {
+                Vec::new()
+            } else {
+                self.window_buttons
+                    .order
+                    .iter()
+                    .map(|b| b.name().to_string())
+                    .collect()
+            },
             window_button_close: hex_or_empty(self.window_buttons.close),
             window_button_minimize: hex_or_empty(self.window_buttons.minimize),
             window_button_maximize: hex_or_empty(self.window_buttons.maximize),
@@ -1250,6 +1392,68 @@ mod tests {
         assert!(back.show_close);
         assert!(back.show_minimize);
         assert!(!back.show_maximize, "the hidden one came back");
+    }
+
+    #[test]
+    fn a_theme_without_an_order_keeps_the_order_the_buttons_always_had() {
+        let mut file = ThemeFile::default();
+        assert_eq!(
+            Theme::from_file(&file).window_buttons.order,
+            default_order(false)
+        );
+        file.window_buttons_left = true;
+        assert_eq!(
+            Theme::from_file(&file).window_buttons.order,
+            default_order(true)
+        );
+    }
+
+    #[test]
+    fn a_chosen_order_round_trips_and_an_untouched_one_is_not_written() {
+        let mut theme = Theme::from_file(&ThemeFile::default());
+        assert!(theme.to_file().window_button_order.is_empty());
+        use TitleButton::*;
+        let chosen = [Close, Tabs, Maximize, Minimize, NewTab, Settings, OnTop];
+        theme.window_buttons.order = chosen;
+        theme.window_buttons.show_on_top = false;
+        let back = Theme::from_file(&theme.to_file()).window_buttons;
+        assert_eq!(back.order, chosen);
+        assert_eq!(back.leading(), [Close]);
+        assert_eq!(
+            back.trailing(),
+            [Maximize, Minimize, NewTab, Settings, OnTop]
+        );
+        assert!(!back.show_on_top);
+    }
+
+    #[test]
+    fn a_hand_edited_order_can_never_lose_a_button() {
+        let names = ["close", "bogus", "close", "TABS", "maximize"].map(String::from);
+        use TitleButton::*;
+        let order = resolve_order(&names, false);
+        for button in TitleButton::ALL {
+            assert!(order.contains(&button), "{button:?} was lost");
+        }
+        assert_eq!(
+            &order[..2],
+            [NewTab, Close],
+            "the + went back where it usually is"
+        );
+    }
+
+    #[test]
+    fn a_theme_that_had_its_buttons_on_the_left_still_opens_with_them_there() {
+        let file = ThemeFile {
+            window_buttons_left: true,
+            ..ThemeFile::default()
+        };
+        let buttons = Theme::from_file(&file).window_buttons;
+        use TitleButton::*;
+        assert_eq!(
+            buttons.leading(),
+            [Close, OnTop, Minimize, Maximize, Settings, NewTab]
+        );
+        assert!(buttons.trailing().is_empty());
     }
 
     #[test]

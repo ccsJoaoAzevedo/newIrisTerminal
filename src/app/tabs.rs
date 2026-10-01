@@ -63,7 +63,10 @@ impl App {
                 session.request_halt();
             }
         }
-        self.tabs.remove(index);
+        let closed = self.tabs.remove(index);
+        if !closed.is_game() {
+            self.remember_closed(saved_tab(&closed));
+        }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
@@ -86,10 +89,34 @@ impl App {
         }
         // Ask IRIS to halt so it releases its locks; dropping the session kills
         // anything that ignores the request.
-        if let Some(going) = tab.pane(at.pane).and_then(|pane| pane.session.as_ref()) {
-            going.request_halt();
+        let Some(going) = tab.pane(at.pane) else {
+            return;
+        };
+        if let Some(session) = going.session.as_ref() {
+            session.request_halt();
         }
+        let closed = saved_pane(going);
         tab.close_pane(at.pane);
+        self.remember_closed(closed);
+    }
+
+    fn remember_closed(&mut self, tab: SavedTab) {
+        if self.closed_tabs.len() == CLOSED_TABS_KEPT {
+            self.closed_tabs.remove(0);
+        }
+        self.closed_tabs.push(tab);
+    }
+
+    /// Opens the most recently closed tab again, in front: same profile, same
+    /// name and split, back in the namespace it was in, or - for a shell that
+    /// reports one - the folder. Each press goes one further back.
+    pub(super) fn reopen_closed_tab(&mut self) {
+        let Some(entry) = self.closed_tabs.pop() else {
+            self.set_status(tr("No closed tab to reopen."));
+            return;
+        };
+        self.restore_tab(entry);
+        self.active = self.tabs.len() - 1;
     }
 
     /// The session the user is working in: the focused pane of the active tab.
@@ -157,6 +184,7 @@ impl App {
         let mut to_unsplit = None;
         let mut to_activate = None;
         let with_namespace = self.settings.show_namespace_in_tab;
+        let buttons = self.theme().window_buttons;
         // Shrunk to the tabs rather than filling the row: in the title bar the
         // space left over is what the window is dragged by, and a scroll area
         // that claimed the whole width would take all of it.
@@ -306,7 +334,7 @@ impl App {
                             ui.close_menu();
                         }
                     });
-                    let close = icon_button(ui, icons::Glyph::SmallCross, None)
+                    let close = chrome::close_tab_button(ui, &buttons)
                         .on_hover_text(tr("Close this tab."));
                     if close.clicked() {
                         to_close = Some(index);
@@ -446,24 +474,7 @@ impl App {
             .tabs
             .iter()
             .filter(|tab| !tab.is_game())
-            .map(|tab| SavedTab {
-                profile: saved_profile(tab),
-                namespace: saved_namespace(tab),
-                title: tab.custom_title.clone(),
-                screen: saved_screen(tab),
-                split: tab.split.as_ref().map(|split| SavedSplit {
-                    dir: match split.dir {
-                        SplitDir::Right => SavedDir::Right,
-                        SplitDir::Bottom => SavedDir::Bottom,
-                    },
-                    ratio: split.ratio,
-                    profile: saved_profile(&split.tab),
-                    namespace: saved_namespace(&split.tab),
-                    title: split.tab.custom_title.clone(),
-                    screen: saved_screen(&split.tab),
-                }),
-                second_focused: tab.split.is_some() && tab.focus == Pane::Second,
-            })
+            .map(saved_tab)
             .collect();
         SavedSession {
             active: kept_index(self.active, &kept),
@@ -478,35 +489,40 @@ impl App {
     /// the profile is all it keeps, and the password was never in it.
     pub(super) fn restore_session(&mut self, saved: SavedSession) {
         for entry in saved.tabs {
-            self.open_tab(entry.profile);
-            let index = self.tabs.len() - 1;
-            self.tabs[index].custom_title = entry.title;
-            self.tabs[index].replay(&entry.screen);
-            self.tabs[index].resume_namespace = entry.namespace;
-            if let Some(split) = entry.split {
-                let dir = match split.dir {
-                    SavedDir::Right => SplitDir::Right,
-                    SavedDir::Bottom => SplitDir::Bottom,
-                };
-                // The file can be edited by hand, and a NaN would survive
-                // every clamp the layout applies to it.
-                let ratio = if split.ratio.is_finite() {
-                    split.ratio.clamp(0.0, 1.0)
-                } else {
-                    0.5
-                };
-                self.open_split(index, dir, split.profile, ratio);
-                if let Some(opened) = self.tabs[index].split.as_mut() {
-                    opened.tab.custom_title = split.title;
-                    opened.tab.replay(&split.screen);
-                    opened.tab.resume_namespace = split.namespace;
-                }
-                if entry.second_focused {
-                    self.tabs[index].focus = Pane::Second;
-                }
-            }
+            self.restore_tab(entry);
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Opens one saved tab at the end of the strip.
+    fn restore_tab(&mut self, entry: SavedTab) {
+        self.open_tab(entry.profile);
+        let index = self.tabs.len() - 1;
+        self.tabs[index].custom_title = entry.title;
+        self.tabs[index].replay(&entry.screen);
+        self.tabs[index].resume_namespace = entry.namespace;
+        if let Some(split) = entry.split {
+            let dir = match split.dir {
+                SavedDir::Right => SplitDir::Right,
+                SavedDir::Bottom => SplitDir::Bottom,
+            };
+            // The file can be edited by hand, and a NaN would survive every
+            // clamp the layout applies to it.
+            let ratio = if split.ratio.is_finite() {
+                split.ratio.clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            self.open_split(index, dir, split.profile, ratio);
+            if let Some(opened) = self.tabs[index].split.as_mut() {
+                opened.tab.custom_title = split.title;
+                opened.tab.replay(&split.screen);
+                opened.tab.resume_namespace = split.namespace;
+            }
+            if entry.second_focused {
+                self.tabs[index].focus = Pane::Second;
+            }
+        }
     }
 
     /// Takes a split tab back to one session, and gives the other one a tab of
@@ -701,6 +717,41 @@ fn moved_index(index: usize, from: usize, to: usize) -> usize {
         index + 1
     } else {
         index
+    }
+}
+
+/// How many closed tabs Ctrl+Alt+T can go back through. Each one holds up to
+/// [`SAVED_SCREEN_LINES`] of text, so the list is not left to grow all day.
+const CLOSED_TABS_KEPT: usize = 20;
+
+/// A tab as [`SavedTab`] keeps it, split included.
+fn saved_tab(tab: &Tab) -> SavedTab {
+    SavedTab {
+        split: tab.split.as_ref().map(|split| SavedSplit {
+            dir: match split.dir {
+                SplitDir::Right => SavedDir::Right,
+                SplitDir::Bottom => SavedDir::Bottom,
+            },
+            ratio: split.ratio,
+            profile: saved_profile(&split.tab),
+            namespace: saved_namespace(&split.tab),
+            title: split.tab.custom_title.clone(),
+            screen: saved_screen(&split.tab),
+        }),
+        second_focused: tab.split.is_some() && tab.focus == Pane::Second,
+        ..saved_pane(tab)
+    }
+}
+
+/// One pane on its own, as a tab of its own: what closing one side of a split
+/// leaves to reopen.
+fn saved_pane(tab: &Tab) -> SavedTab {
+    SavedTab {
+        profile: saved_profile(tab),
+        namespace: saved_namespace(tab),
+        title: tab.custom_title.clone(),
+        screen: saved_screen(tab),
+        ..SavedTab::default()
     }
 }
 

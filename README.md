@@ -145,7 +145,7 @@ The tests that talk to a real instance are ignored by default; they open a
 session and read the banner, never logging in and never writing data:
 
 ```sh
-cargo test --test live_session -- --ignored --nocapture
+cargo test --test integration live_session:: -- --ignored --nocapture
 ```
 
 `IRIS_TEST_INSTANCE` picks the instance; otherwise the first discovered one is

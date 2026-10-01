@@ -93,6 +93,7 @@ impl App {
         }
         let cmd = Modifiers::COMMAND;
         let new_tab = consume_exact(ctx, cmd, Key::T);
+        let reopen_tab = consume_exact(ctx, Modifiers::CTRL | Modifiers::ALT, Key::T);
         let close_tab = consume_exact(ctx, cmd, Key::W);
         let next_tab = consume_exact(ctx, cmd, Key::Tab);
         let zoom_in = consume_exact(ctx, cmd, Key::Plus) | consume_exact(ctx, cmd, Key::Equals);
@@ -120,6 +121,9 @@ impl App {
 
         if new_tab {
             self.open_new_tab();
+        }
+        if reopen_tab {
+            self.reopen_closed_tab();
         }
         if close_tab && !self.tabs.is_empty() {
             self.close_tab(self.active);
@@ -212,6 +216,132 @@ impl App {
         }
     }
 
+    /// The `+` that opens a session, and the menu behind it. Reports a click on
+    /// the button itself, and anything picked from the menu.
+    fn new_tab_control(
+        &self,
+        ui: &mut egui::Ui,
+        buttons: &crate::config::theme::WindowButtons,
+    ) -> (bool, Option<Profile>) {
+        let mut open_default = false;
+        let mut pick: Option<Profile> = None;
+        let endpoint = self.new_tab_profile.endpoint();
+        let new_tab = chrome::new_tab_button(ui, buttons).on_hover_text(tr1(
+            "New session on {} (Ctrl+T).\nRight-click to connect somewhere else.",
+            &endpoint,
+        ));
+        if new_tab.clicked() {
+            open_default = true;
+        }
+        // The escape hatch that replaces the dialog: everything it used to
+        // offer - the profiles and the instances found on this machine -
+        // one click away instead of in front of every new session.
+        new_tab.context_menu(|ui| {
+            // The launcher's servers first: they are the whole reason this
+            // menu is worth opening, and the preferred one is already what
+            // the button does.
+            if !self.servers.is_empty() {
+                ui.weak(tr("IRIS servers"));
+                let preferred = self.new_tab_profile.name.clone();
+                for server in self.servers.others(Some(&preferred)) {
+                    let mut button = ui.button(server.menu_label());
+                    // What the entry actually does, since a local server
+                    // opens an instance and a remote one asks for a login.
+                    let hint = match server.target(&self.instances) {
+                        crate::config::servers::Target::Local { instance } => {
+                            tr1("Local session on instance {}", &instance)
+                        }
+                        crate::config::servers::Target::Telnet { address, port } => {
+                            tr1("Telnet login to {}", &format!("{address}:{port}"))
+                        }
+                    };
+                    let hint = if server.comment.trim().is_empty() {
+                        hint
+                    } else {
+                        format!("{hint}\n{}", server.comment.trim())
+                    };
+                    button = button.on_hover_text(hint);
+                    if button.clicked() {
+                        pick = Some(Profile::for_server(
+                            server,
+                            &self.instances,
+                            &self.new_tab_profile,
+                        ));
+                        ui.close_menu();
+                    }
+                }
+                let loose_instances = self
+                    .instances
+                    .iter()
+                    .any(|name| !self.servers.covers_instance(&self.instances, name));
+                if !self.settings.profiles.is_empty() || loose_instances {
+                    ui.separator();
+                }
+            }
+            for profile in &self.settings.profiles {
+                let label = if profile.instance.is_empty() {
+                    profile.name.clone()
+                } else {
+                    format!("{}  ({})", profile.name, profile.instance)
+                };
+                if ui.button(label).clicked() {
+                    pick = Some(profile.clone());
+                    ui.close_menu();
+                }
+            }
+            if !self.settings.profiles.is_empty() && !self.instances.is_empty() {
+                ui.separator();
+            }
+            for name in &self.instances {
+                // Skipped when a server entry already opens it: the same
+                // session under two names is not a choice.
+                if self.servers.covers_instance(&self.instances, name) {
+                    continue;
+                }
+                if ui.button(name).clicked() {
+                    // Built through the same path as a server, which is what
+                    // guarantees a local instance opens locally. Inheriting
+                    // the current profile wholesale used to carry its
+                    // `remote` across, so picking the instance `CONSISTEM`
+                    // while a Telnet tab was current opened Telnet again.
+                    pick = Some(Profile::for_server(
+                        &crate::config::servers::Server::for_instance(name),
+                        &self.instances,
+                        &self.new_tab_profile,
+                    ));
+                    ui.close_menu();
+                }
+            }
+            if self.settings.profiles.is_empty()
+                && self.instances.is_empty()
+                && self.servers.is_empty()
+            {
+                ui.weak(tr("No servers, profiles or instances found."));
+            }
+
+            // The shells this machine has, under the IRIS entries rather
+            // than among them: they are a different kind of session, and
+            // nothing about a profile or a namespace applies to one. See
+            // [`crate::plugins::shells`].
+            let shells = crate::plugins::shells::available();
+            if !shells.is_empty() {
+                ui.separator();
+                ui.weak(tr("Shells"));
+                for shell in &shells {
+                    if ui
+                        .button(&shell.name)
+                        .on_hover_text(shell.command_line())
+                        .clicked()
+                    {
+                        pick = Some(Profile::for_shell(shell));
+                        ui.close_menu();
+                    }
+                }
+            }
+        });
+        (open_default, pick)
+    }
+
     /// The top row: app controls on the left, and - when the app is drawing its
     /// own frame - the window buttons and the draggable area on the right.
     pub(super) fn menu_bar(
@@ -235,139 +365,28 @@ impl App {
         // handed to `chrome` as a `&mut bool` while the closure still holds
         // `self` for the tab strip.
         let mut show_settings = self.panels.show_settings;
-        // Which end the gear goes on: beside minimize, which means the leading
-        // group when that group is the one being drawn. Worked out once,
-        // because getting it from each end separately is how the gear ended up
-        // on neither - a theme with left-hand buttons and the buttons switched
-        // off drew no leading group for it to join and skipped the trailing
-        // one because the theme said left. Settings was then unreachable.
-        let leading_buttons = own_buttons && buttons.left;
+        // Both ends are drawn whatever the theme says, and each draws only what
+        // the order puts there. That is what keeps the gear reachable: it was
+        // once decided per end, and a theme with left-hand buttons and the
+        // buttons switched off drew it on neither.
+        let pin = Some(self.settings.always_on_top);
         ui.horizontal(|ui| {
-            // Drawn before anything else when the theme puts them on the left,
-            // which is where Aqua has them.
-            if leading_buttons {
-                if let Some(asked) =
-                    chrome::leading_window_buttons(ui, buttons, Some(&mut show_settings))
-                {
-                    action = Some(asked);
-                }
-                ui.add_space(6.0);
+            let mut new_tab = |ui: &mut egui::Ui| {
+                let (clicked, picked) = self.new_tab_control(ui, buttons);
+                open_default |= clicked;
+                pick = pick.take().or(picked);
+            };
+            if let Some(asked) = chrome::leading_window_buttons(
+                ui,
+                buttons,
+                own_buttons,
+                Some(&mut show_settings),
+                pin,
+                Some(&mut new_tab),
+            ) {
+                action = Some(asked);
             }
-            let endpoint = self.new_tab_profile.endpoint();
-            let new_tab = icon_button(ui, icons::Glyph::Plus, buttons.new_tab).on_hover_text(tr1(
-                "New session on {} (Ctrl+T).\nRight-click to connect somewhere else.",
-                &endpoint,
-            ));
-            let new_tab_right = new_tab.rect.right();
-            if new_tab.clicked() {
-                open_default = true;
-            }
-            // The escape hatch that replaces the dialog: everything it used to
-            // offer - the profiles and the instances found on this machine -
-            // one click away instead of in front of every new session.
-            new_tab.context_menu(|ui| {
-                // The launcher's servers first: they are the whole reason this
-                // menu is worth opening, and the preferred one is already what
-                // the button does.
-                if !self.servers.is_empty() {
-                    ui.weak(tr("IRIS servers"));
-                    let preferred = self.new_tab_profile.name.clone();
-                    for server in self.servers.others(Some(&preferred)) {
-                        let mut button = ui.button(server.menu_label());
-                        // What the entry actually does, since a local server
-                        // opens an instance and a remote one asks for a login.
-                        let hint = match server.target(&self.instances) {
-                            crate::config::servers::Target::Local { instance } => {
-                                tr1("Local session on instance {}", &instance)
-                            }
-                            crate::config::servers::Target::Telnet { address, port } => {
-                                tr1("Telnet login to {}", &format!("{address}:{port}"))
-                            }
-                        };
-                        let hint = if server.comment.trim().is_empty() {
-                            hint
-                        } else {
-                            format!("{hint}\n{}", server.comment.trim())
-                        };
-                        button = button.on_hover_text(hint);
-                        if button.clicked() {
-                            pick = Some(Profile::for_server(
-                                server,
-                                &self.instances,
-                                &self.new_tab_profile,
-                            ));
-                            ui.close_menu();
-                        }
-                    }
-                    let loose_instances = self
-                        .instances
-                        .iter()
-                        .any(|name| !self.servers.covers_instance(&self.instances, name));
-                    if !self.settings.profiles.is_empty() || loose_instances {
-                        ui.separator();
-                    }
-                }
-                for profile in &self.settings.profiles {
-                    let label = if profile.instance.is_empty() {
-                        profile.name.clone()
-                    } else {
-                        format!("{}  ({})", profile.name, profile.instance)
-                    };
-                    if ui.button(label).clicked() {
-                        pick = Some(profile.clone());
-                        ui.close_menu();
-                    }
-                }
-                if !self.settings.profiles.is_empty() && !self.instances.is_empty() {
-                    ui.separator();
-                }
-                for name in &self.instances {
-                    // Skipped when a server entry already opens it: the same
-                    // session under two names is not a choice.
-                    if self.servers.covers_instance(&self.instances, name) {
-                        continue;
-                    }
-                    if ui.button(name).clicked() {
-                        // Built through the same path as a server, which is what
-                        // guarantees a local instance opens locally. Inheriting
-                        // the current profile wholesale used to carry its
-                        // `remote` across, so picking the instance `CONSISTEM`
-                        // while a Telnet tab was current opened Telnet again.
-                        pick = Some(Profile::for_server(
-                            &crate::config::servers::Server::for_instance(name),
-                            &self.instances,
-                            &self.new_tab_profile,
-                        ));
-                        ui.close_menu();
-                    }
-                }
-                if self.settings.profiles.is_empty()
-                    && self.instances.is_empty()
-                    && self.servers.is_empty()
-                {
-                    ui.weak(tr("No servers, profiles or instances found."));
-                }
-
-                // The shells this machine has, under the IRIS entries rather
-                // than among them: they are a different kind of session, and
-                // nothing about a profile or a namespace applies to one. See
-                // [`crate::plugins::shells`].
-                let shells = crate::plugins::shells::available();
-                if !shells.is_empty() {
-                    ui.separator();
-                    ui.weak(tr("Shells"));
-                    for shell in &shells {
-                        if ui
-                            .button(&shell.name)
-                            .on_hover_text(shell.command_line())
-                            .clicked()
-                        {
-                            pick = Some(Profile::for_shell(shell));
-                            ui.close_menu();
-                        }
-                    }
-                }
-            });
+            let leading_right = ui.min_rect().right();
             // One rule after the new-session button, and none at all when the
             // tabs are up here: the first tab's own edge is the divider, and a
             // rule in front of it - there used to be two, with a gap between
@@ -378,7 +397,7 @@ impl App {
             // than about the app, and all three are now on the terminal's own
             // right-click menu, beside the session they act on; writing macros
             // is in Settings, with the themes.
-            if !inline_tabs {
+            if !inline_tabs && !buttons.leading().is_empty() {
                 ui.separator();
             }
 
@@ -402,7 +421,7 @@ impl App {
                 // drags the window now instead of doing nothing.
                 if let Some(asked) = chrome::drag_span(
                     ui,
-                    new_tab_right..tabs_from,
+                    leading_right..tabs_from,
                     true,
                     "nit-main",
                     "before-tabs",
@@ -444,10 +463,20 @@ impl App {
             // above did not take. Claimed even when the window controls are
             // hidden or already drawn on the left: without it there is nothing
             // to drag the window by.
-            let trailing = own_buttons && !buttons.left;
-            let gear = (!leading_buttons).then_some(&mut show_settings);
-            if let Some(asked) = chrome::title_bar_controls(ui, buttons, trailing, "nit-main", gear)
-            {
+            let mut new_tab = |ui: &mut egui::Ui| {
+                let (clicked, picked) = self.new_tab_control(ui, buttons);
+                open_default |= clicked;
+                pick = pick.take().or(picked);
+            };
+            if let Some(asked) = chrome::title_bar_controls(
+                ui,
+                buttons,
+                own_buttons,
+                "nit-main",
+                Some(&mut show_settings),
+                pin,
+                Some(&mut new_tab),
+            ) {
                 action = Some(asked);
             }
         });
@@ -500,6 +529,7 @@ impl App {
                 // settings the user just changed.
                 App::apply_style(ctx, &self.theme(), &self.settings);
                 self.apply_font(ctx);
+                crate::ui::desktop::set_pinned(self.settings.pin_to_desktop);
                 self.history.set_persist(
                     &config::command_history_path(),
                     self.settings.save_command_history,
@@ -510,6 +540,10 @@ impl App {
                 if let Err(e) = self.settings.save() {
                     self.set_status(tr1("Could not save settings: {}", &format!("{e:#}")));
                 }
+            }
+            UiRequest::ToggleAlwaysOnTop => {
+                self.settings.always_on_top = !self.settings.always_on_top;
+                self.handle_request(ctx, UiRequest::SettingsChanged);
             }
             UiRequest::OpenFolder(path) => {
                 if let Err(e) = config::open_in_file_manager(&path) {

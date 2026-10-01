@@ -3,7 +3,7 @@
 //! Ignored by default — it starts a process on this machine. Run with:
 //!
 //! ```text
-//! cargo test --test live_shell -- --ignored --nocapture
+//! cargo test --test integration live_shell:: -- --ignored --nocapture
 //! ```
 //!
 //! Harmless: it opens each shell in turn, asks it to echo one word, and kills

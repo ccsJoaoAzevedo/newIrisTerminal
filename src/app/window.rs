@@ -210,6 +210,40 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Keeps the window's level in step with the pin.
+    ///
+    /// Only while the theme shows the pin: hiding the button, or switching to
+    /// a theme without it, must not leave the window stuck above everything
+    /// with nothing on screen to undo it. Checked every frame because either
+    /// side can change - the setting from the pin, the theme from the theme
+    /// manager - and sent only when the answer does.
+    pub(super) fn apply_always_on_top(&mut self, ctx: &Context) {
+        // Looked up rather than through `theme()`, which clones the whole
+        // theme - too much for every frame of an idle terminal.
+        let shown = self
+            .themes
+            .iter()
+            .find(|t| t.name == self.settings.theme)
+            .map_or(
+                crate::config::theme::WindowButtons::default().show_on_top,
+                |t| t.window_buttons.show_on_top,
+            );
+        let on_top = self.settings.always_on_top && shown;
+        if self.on_top_applied != Some(on_top) {
+            self.on_top_applied = Some(on_top);
+            crate::ui::desktop::set_always_on_top(ctx, on_top);
+        }
+    }
+
+    /// Whether a close should hide the window to the tray instead.
+    ///
+    /// Not for a close already decided on - the confirmation's "Close anyway",
+    /// the update's restart, the tray menu's own Exit - or there would be no
+    /// way left to quit.
+    pub(super) fn should_close_to_tray(&self) -> bool {
+        self.settings.close_to_tray && !self.close_confirmed && !crate::ui::tray::quitting()
+    }
+
     /// Whether closing should stop and ask first.
     pub(super) fn should_confirm_close(&self) -> bool {
         !self.close_confirmed
@@ -264,20 +298,27 @@ impl App {
         }
     }
 
-    /// How much of the title-bar row is kept back from the tabs: the window
-    /// controls and the gear, plus the strip that is always draggable.
+    /// How much of the title-bar row is kept back from the tabs: whatever the
+    /// theme puts to their right, plus the strip that is always draggable.
     ///
     /// Measured rather than guessed, because a theme can hide any of the three
     /// controls and the row height decides how wide one is. The tabs are given
     /// what is left, so a long strip of them scrolls instead of running under
     /// the close button. See [`TITLE_FREE_STRIP`] for the rest of it.
     pub(super) fn title_bar_reserve(&self) -> f32 {
-        // The gear is always there; the other three are the theme's to hide.
-        let buttons = if self.settings.show_window_buttons {
-            4
-        } else {
-            1
-        };
+        // Only what the theme puts to the right of the tabs: whatever is to
+        // their left was drawn before them and has already taken its room.
+        let style = self.theme().window_buttons;
+        let own = self.settings.show_window_buttons;
+        let buttons = style
+            .trailing()
+            .iter()
+            .filter(|b| style.shows(**b))
+            .filter(|b| {
+                use crate::config::theme::TitleButton::*;
+                own || !matches!(b, Close | Minimize | Maximize)
+            })
+            .count();
         let side = TITLE_CONTROL_SIDE;
         buttons as f32 * side + TITLE_FREE_STRIP
     }

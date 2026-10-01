@@ -290,6 +290,9 @@ pub struct Settings {
     /// Open the default profile automatically at launch.
     pub open_on_start: bool,
     pub confirm_close_with_live_session: bool,
+    /// Closing the window hides it behind a notification-area icon instead,
+    /// and the sessions stay connected. The icon's menu is what quits.
+    pub close_to_tray: bool,
     /// Draw the minimize / maximize / close controls in the app's own title
     /// bar. Off leaves the row to the tabs and the drag area: the window can
     /// still be moved, maximized by double-click, and closed with Ctrl+W or
@@ -313,6 +316,14 @@ pub struct Settings {
     pub default_rows: u16,
     /// Reopen where the window was last closed. Off centres it on the monitor.
     pub save_window_position: bool,
+    /// Keep the window on screen when the desktop is shown (Win+D). It is an
+    /// ordinary window otherwise: others cover it, and clicking raises it.
+    pub pin_to_desktop: bool,
+    /// Keep the window above every other window, whichever has the focus.
+    /// The pin in the title bar switches it, and there is deliberately no
+    /// other switch: it only takes effect while the theme shows the pin, so a
+    /// window can never be stuck on top with no button left to undo it.
+    pub always_on_top: bool,
     /// Reopen the tabs, splits and tab names that were open when the app last
     /// closed, instead of the default profile. The list is kept in
     /// [`session_path`], and only while this is on.
@@ -388,12 +399,15 @@ impl Default for Settings {
             default_profile: String::new(),
             open_on_start: true,
             confirm_close_with_live_session: true,
+            close_to_tray: false,
             show_window_buttons: true,
             tabs_in_title_bar: false,
             save_terminal_size: false,
             default_cols: DEFAULT_TERMINAL_COLS,
             default_rows: DEFAULT_TERMINAL_ROWS,
             save_window_position: false,
+            pin_to_desktop: false,
+            always_on_top: false,
             remember_open_tabs: false,
             window_size: None,
             window_position: None,
@@ -791,6 +805,18 @@ mod tests {
         assert_eq!(settings.window_size, None);
         assert_eq!(settings.window_position, None);
         assert!(!settings.window_maximized);
+    }
+
+    #[test]
+    fn an_old_settings_file_still_closes_instead_of_hiding_to_the_tray() {
+        let settings: Settings = toml::from_str("theme = \"Tokyo\"").expect("parse");
+        assert!(!settings.close_to_tray);
+    }
+
+    #[test]
+    fn an_old_settings_file_does_not_pin_the_window_to_the_desktop() {
+        let settings: Settings = toml::from_str("theme = \"Tokyo\"").expect("parse");
+        assert!(!settings.pin_to_desktop);
     }
 
     /// The marker is what lets `load_themes` recognise a copy of a built-in

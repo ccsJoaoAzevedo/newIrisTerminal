@@ -44,11 +44,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --lib --tests
 
       # The plugin host is behind a feature flag, so it would otherwise rot.
       - name: Test with plugins
-        run: cargo test --features plugins --all-targets
+        run: cargo test --features plugins --lib --tests
 
       - name: Build release
         run: cargo build --release

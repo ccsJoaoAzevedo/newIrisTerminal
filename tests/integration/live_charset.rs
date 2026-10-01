@@ -1,7 +1,7 @@
 //! Accented text, end to end, against a live instance.
 //!
 //! ```text
-//! cargo test --test live_charset -- --ignored --nocapture --test-threads=1
+//! cargo test --test integration live_charset:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Everything about character encoding that can only be settled by measurement
