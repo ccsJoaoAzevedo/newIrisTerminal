@@ -27,6 +27,8 @@ pub mod input;
 pub mod macro_manager;
 pub mod monitors;
 pub mod panels;
+pub mod screensaver_manager;
+pub mod screensaver_view;
 pub mod search;
 pub mod shading;
 pub mod shortcut;

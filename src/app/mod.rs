@@ -187,6 +187,8 @@ pub struct App {
     /// A split, unsplit or close asked for from a pane's right-click menu,
     /// waiting for the panes to have finished drawing. See [`LayoutAction`].
     pending_layout: Option<LayoutAction>,
+    /// The screen saver, while one is covering the window.
+    screensaver: Option<crate::ui::screensaver_view::Running>,
 }
 
 /// Shortest gap between two frames asked for by session output.
@@ -333,6 +335,7 @@ impl App {
             font_request: String::new(),
             renaming: None,
             pending_layout: None,
+            screensaver: None,
             settings_placement,
             confirm_close: false,
             close_confirmed: false,

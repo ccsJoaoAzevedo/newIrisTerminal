@@ -93,7 +93,11 @@ impl App {
         }
         let cmd = Modifiers::COMMAND;
         let new_tab = consume_exact(ctx, cmd, Key::T);
-        let reopen_tab = consume_exact(ctx, Modifiers::CTRL | Modifiers::ALT, Key::T);
+        // Ctrl+Shift+T is what every browser uses, and what people press.
+        // Ctrl+Alt+T stays for anyone who learned it, though on Windows Ctrl+Alt
+        // is AltGr and often never reaches the app at all.
+        let reopen_tab = consume_exact(ctx, Modifiers::CTRL | Modifiers::SHIFT, Key::T)
+            | consume_exact(ctx, Modifiers::CTRL | Modifiers::ALT, Key::T);
         let close_tab = consume_exact(ctx, cmd, Key::W);
         let next_tab = consume_exact(ctx, cmd, Key::Tab);
         let zoom_in = consume_exact(ctx, cmd, Key::Plus) | consume_exact(ctx, cmd, Key::Equals);

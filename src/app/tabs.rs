@@ -183,6 +183,8 @@ impl App {
         let mut to_split = None;
         let mut to_unsplit = None;
         let mut to_activate = None;
+        let mut to_reopen = false;
+        let can_reopen = !self.closed_tabs.is_empty();
         let with_namespace = self.settings.show_namespace_in_tab;
         let buttons = self.theme().window_buttons;
         // Shrunk to the tabs rather than filling the row: in the title bar the
@@ -333,6 +335,19 @@ impl App {
                             to_close = Some(index);
                             ui.close_menu();
                         }
+                        // Here as well as on the keyboard, so the gesture can
+                        // be found by anyone who does not know the chord.
+                        if ui
+                            .add_enabled(
+                                can_reopen,
+                                egui::Button::new(tr("Reopen closed tab"))
+                                    .shortcut_text("Ctrl+Shift+T"),
+                            )
+                            .clicked()
+                        {
+                            to_reopen = true;
+                            ui.close_menu();
+                        }
                     });
                     let close = chrome::close_tab_button(ui, &buttons)
                         .on_hover_text(tr("Close this tab."));
@@ -401,6 +416,9 @@ impl App {
         if let Some(index) = to_close {
             self.close_tab(index);
         }
+        if to_reopen {
+            self.reopen_closed_tab();
+        }
     }
 
     /// Moves the tab at `from` to `to`, shifting the ones between along.
@@ -445,9 +463,13 @@ impl App {
         {
             return;
         }
+        // The tab's own profile, not the one Ctrl+T would open: splitting a CMD
+        // tab is asking for a second CMD beside it, and it used to come up as
+        // an IRIS session because that was the new-tab default.
+        let profile = self.tabs[index].profile.clone();
         // Down the middle to start with. The divider between them is what moves
         // it from there.
-        self.open_split(index, dir, self.new_tab_profile.clone(), 0.5);
+        self.open_split(index, dir, profile, 0.5);
         self.tabs[index].focus = Pane::Second;
         self.active = index;
     }

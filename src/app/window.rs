@@ -13,6 +13,7 @@ impl App {
     /// spacing has to be set separately or the switch would do nothing.
     pub(super) fn apply_style(ctx: &Context, theme: &Theme, settings: &Settings) {
         ctx.set_visuals(theme.visuals());
+        crate::ui::shading::set_backdrop(ctx, theme.ui_gradient);
         ctx.style_mut(|style| {
             // Floating bars are egui's default and are the reason the
             // scrollbars read as absent: they stay a hairline until hovered.

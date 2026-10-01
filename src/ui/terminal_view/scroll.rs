@@ -74,7 +74,8 @@ pub(super) fn h_scrollbar(
 
 /// The handle, in whichever look the theme calls for.
 ///
-/// An Aqua theme gets the glass capsule, because a Tiger window with a flat
+/// An Aqua theme gets the glass capsule (and a materia one, the same capsule
+/// in steel), because a Tiger window with a flat
 /// grey scroll handle reads as two applications in one frame; everything else
 /// keeps the flat bar, which is what a modern theme wants.
 fn paint_thumb(painter: &egui::Painter, thumb: Rect, theme: &Theme, active: bool, vertical: bool) {
@@ -82,7 +83,7 @@ fn paint_thumb(painter: &egui::Painter, thumb: Rect, theme: &Theme, active: bool
     use crate::ui::shading;
 
     match (theme.window_buttons.style, theme.scrollbar_handle) {
-        (WindowButtonStyle::Aqua, Some(base)) => {
+        (WindowButtonStyle::Aqua | WindowButtonStyle::Materia, Some(base)) => {
             let base = if active {
                 shading::lighten(base, 0.12)
             } else {

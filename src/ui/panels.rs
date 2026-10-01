@@ -64,6 +64,8 @@ pub struct PanelState {
     pub themes: crate::ui::theme_manager::ThemeManagerState,
     /// The macro manager, which keeps its own selection and editing draft.
     pub macros: crate::ui::macro_manager::MacroManagerState,
+    /// The screen saver dialog, which keeps its draft until OK or Apply.
+    pub screensaver: crate::ui::screensaver_manager::ScreensaverManagerState,
     /// A macro waiting on parameter values and/or confirmation.
     pub pending: Option<PendingMacro>,
     /// An IRIS helper waiting on its fields.
@@ -640,6 +642,17 @@ pub fn settings_dialog(
                         .clicked()
                     {
                         action = Some(UiRequest::OpenFolder(crate::config::themes_dir()));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr("Screen saver"));
+                    ui.weak(tr(settings.screensaver.kind.label()));
+                    if ui
+                        .button(tr("Screen saver..."))
+                        .on_hover_text(tr("What covers the window after a while without a key or a mouse movement."))
+                        .clicked()
+                    {
+                        state.screensaver.open = true;
                     }
                 });
                 ui.horizontal(|ui| {

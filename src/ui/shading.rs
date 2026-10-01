@@ -165,3 +165,134 @@ pub fn aqua_capsule(painter: &Painter, rect: Rect, base: Color32, vertical: bool
     );
     painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, darken(base, 0.55)));
 }
+
+/// A gradient with a colour at each corner, for one that runs on a diagonal:
+/// `from` at the top-left, `to` at the bottom-right, their mix at the other two.
+pub fn diagonal(painter: &Painter, rect: Rect, from: Color32, to: Color32) {
+    let mid = crate::term::palette::blend(from, to, 0.5);
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(rect.left_top(), from);
+    mesh.colored_vertex(rect.right_top(), mid);
+    mesh.colored_vertex(rect.left_bottom(), mid);
+    mesh.colored_vertex(rect.right_bottom(), to);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    painter.add(Shape::mesh(mesh));
+}
+
+/// A chrome gradient across `rect`, whichever way it runs.
+pub fn ui_gradient(painter: &Painter, rect: Rect, g: &crate::config::theme::UiGradient) {
+    use crate::config::theme::GradientDirection;
+    match g.direction {
+        GradientDirection::Vertical => gradient(painter, rect, g.from, g.to),
+        GradientDirection::Horizontal => gradient_across(painter, rect, g.from, g.to),
+        GradientDirection::Diagonal => diagonal(painter, rect, g.from, g.to),
+    }
+}
+
+fn backdrop_id() -> egui::Id {
+    egui::Id::new("nit-ui-gradient")
+}
+
+/// Records the active theme's chrome gradient, for every window to paint.
+///
+/// Kept in the context rather than passed down, because the dialogs that have
+/// to paint it are drawn by `detach`, which is handed the window buttons and
+/// nothing else of the theme.
+pub fn set_backdrop(ctx: &egui::Context, gradient: Option<crate::config::theme::UiGradient>) {
+    ctx.data_mut(|d| d.insert_temp(backdrop_id(), gradient));
+}
+
+/// Paints the chrome gradient, if the theme has one, behind everything in the
+/// window being drawn. The panels are left unfilled under a gradient (see
+/// `Theme::visuals`), so this is what shows through them.
+pub fn paint_backdrop(ctx: &egui::Context) {
+    let Some(gradient) = ctx
+        .data(|d| d.get_temp::<Option<crate::config::theme::UiGradient>>(backdrop_id()))
+        .flatten()
+    else {
+        return;
+    };
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    ui_gradient(&painter, ctx.screen_rect(), &gradient);
+}
+
+/// A materia orb in its socket, as Final Fantasy VII drew them in the weapon
+/// and armour slots: a steel ring, then the stone, lit from the upper left,
+/// with a swirl inside it and a hard white glint.
+///
+/// The swirl is what sets it apart from an Aqua bubble, which is glass and
+/// shows nothing inside: materia is crystallised, and has a grain.
+pub fn materia_orb(painter: &Painter, center: Pos2, radius: f32, base: Color32, glow: bool) {
+    // The halo it gives off under the pointer, the way equipped materia
+    // pulsed.
+    if glow {
+        radial(
+            painter,
+            center,
+            radius * 1.75,
+            Vec2::ZERO,
+            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 120),
+            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 0),
+        );
+    }
+    // The socket: a ring of steel, bright along its top and dark below.
+    let socket = radius * 1.28;
+    radial(
+        painter,
+        center,
+        socket,
+        Vec2::new(-socket * 0.3, -socket * 0.45),
+        Color32::from_rgb(232, 234, 240),
+        Color32::from_rgb(70, 74, 86),
+    );
+    painter.circle_stroke(
+        center,
+        socket,
+        Stroke::new(1.0_f32, Color32::from_rgb(30, 32, 40)),
+    );
+    painter.circle_filled(center, radius * 1.04, Color32::from_rgb(24, 26, 34));
+
+    // The stone, deepest at the rim.
+    radial(
+        painter,
+        center,
+        radius,
+        Vec2::new(-radius * 0.28, -radius * 0.30),
+        lighten(base, 0.42),
+        darken(base, 0.42),
+    );
+    // The grain: arcs of a lighter and a darker tone wound round off-centre,
+    // which is the swirl the in-game sprites have.
+    for (turn, tone, alpha) in [(0.0_f32, true, 70_u8), (2.1, false, 90), (4.2, true, 50)] {
+        let colour = if tone {
+            Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
+        } else {
+            let d = darken(base, 0.35);
+            Color32::from_rgba_unmultiplied(d.r(), d.g(), d.b(), alpha)
+        };
+        let points: Vec<Pos2> = (0..=10)
+            .map(|i| {
+                let t = i as f32 / 10.0;
+                let angle = turn + t * 2.4;
+                let r = radius * (0.25 + 0.5 * t);
+                center + Vec2::angled(angle) * r
+            })
+            .collect();
+        painter.add(Shape::line(points, Stroke::new(radius * 0.16, colour)));
+    }
+    // The glint, small and hard, and the soft gloss under it.
+    gloss(
+        painter,
+        center + Vec2::new(-radius * 0.18, -radius * 0.38),
+        radius * 0.55,
+        radius * 0.34,
+        150,
+    );
+    painter.circle_filled(
+        center + Vec2::new(-radius * 0.38, -radius * 0.40),
+        (radius * 0.16).max(1.0),
+        white(235),
+    );
+    painter.circle_stroke(center, radius, Stroke::new(1.0_f32, darken(base, 0.30)));
+}

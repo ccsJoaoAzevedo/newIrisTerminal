@@ -569,7 +569,20 @@ fn editor(
                     ("Background", ui_background),
                     ("Text", ui_foreground),
                 );
+                if optional_colour_row(
+                    ui,
+                    "Border",
+                    &mut theme.ui_border,
+                    theme.ui_foreground,
+                    editable,
+                    None,
+                ) {
+                    changed = true;
+                }
             });
+            if gradient_editor(ui, theme, editable) {
+                changed = true;
+            }
 
             ui.add_space(8.0);
             ui.strong(tr("Base"));
@@ -606,6 +619,7 @@ fn editor(
                             WindowButtonStyle::Stroke => "Stroked",
                             WindowButtonStyle::Aqua => "Aqua",
                             WindowButtonStyle::Luna => "Luna",
+                            WindowButtonStyle::Materia => "Materia",
                         };
                         if ui
                             .selectable_label(theme.window_buttons.style == style, tr(label))
@@ -779,6 +793,59 @@ fn editor(
     changed
 }
 
+/// The chrome gradient: none, or which way it runs and its two ends.
+fn gradient_editor(ui: &mut Ui, theme: &mut Theme, editable: bool) -> bool {
+    use crate::config::theme::{GradientDirection, UiGradient};
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(tr("Gradient"));
+        ui.add_enabled_ui(editable, |ui| {
+            if ui
+                .selectable_label(theme.ui_gradient.is_none(), tr("None"))
+                .clicked()
+            {
+                theme.ui_gradient = None;
+                changed = true;
+            }
+            for direction in GradientDirection::ALL {
+                let label = match direction {
+                    GradientDirection::Vertical => "Vertical",
+                    GradientDirection::Horizontal => "Horizontal",
+                    GradientDirection::Diagonal => "Diagonal",
+                };
+                let on = theme.ui_gradient.map(|g| g.direction) == Some(direction);
+                if ui.selectable_label(on, tr(label)).clicked() {
+                    // Switching it on starts from the flat background lifted
+                    // and lowered a little, so the first click already shows
+                    // a gradient rather than two equal ends.
+                    let (from, to) = theme.ui_gradient.map(|g| (g.from, g.to)).unwrap_or((
+                        crate::ui::shading::lighten(theme.ui_background, 0.25),
+                        crate::ui::shading::darken(theme.ui_background, 0.55),
+                    ));
+                    theme.ui_gradient = Some(UiGradient {
+                        direction,
+                        from,
+                        to,
+                    });
+                    changed = true;
+                }
+            }
+        });
+    });
+    if let Some(gradient) = theme.ui_gradient.as_mut() {
+        Grid::new("theme-gradient").num_columns(2).show(ui, |ui| {
+            if colour_row(ui, "From", &mut gradient.from, editable) {
+                changed = true;
+            }
+            if colour_row(ui, "To", &mut gradient.to, editable) {
+                changed = true;
+            }
+        });
+        ui.small(tr("Painted behind the title bar, the tab strip and the dialogs in place of the flat background. Menus keep the flat one, so they stay readable over the terminal."));
+    }
+    changed
+}
+
 /// The lines the preview shows.
 ///
 /// Chosen to hit every token kind the scanner knows: a global, a string with a
@@ -812,6 +879,13 @@ fn preview(ui: &mut Ui, theme: &Theme) {
         .fill(theme.ui_background)
         .inner_margin(egui::Margin::symmetric(6.0, 4.0))
         .show(ui, |ui| {
+            if let Some(gradient) = theme.ui_gradient.as_ref() {
+                crate::ui::shading::ui_gradient(
+                    ui.painter(),
+                    ui.max_rect().expand2(egui::Vec2::new(6.0, 4.0)),
+                    gradient,
+                );
+            }
             ui.horizontal(|ui| {
                 crate::ui::chrome::sample_buttons(
                     ui,

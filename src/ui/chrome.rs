@@ -75,7 +75,9 @@ impl Icon {
             // already drawing at the corner of the window.
             Icon::CloseTab => match style.style {
                 WindowButtonStyle::Stroke => None,
-                WindowButtonStyle::Aqua | WindowButtonStyle::Luna => style.close,
+                WindowButtonStyle::Aqua | WindowButtonStyle::Luna | WindowButtonStyle::Materia => {
+                    style.close
+                }
             },
         }
     }
@@ -147,6 +149,7 @@ fn paint(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButtons) 
         WindowButtonStyle::Stroke => paint_stroked(ui, rect, icon, hovered, style),
         WindowButtonStyle::Aqua => paint_aqua(ui, rect, icon, hovered, style),
         WindowButtonStyle::Luna => paint_luna(ui, rect, icon, hovered, style),
+        WindowButtonStyle::Materia => paint_materia(ui, rect, icon, hovered, style),
     }
 }
 
@@ -419,6 +422,47 @@ fn paint_luna(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
             painter.line_segment([glyph.right_top(), glyph.left_bottom()], stroke);
         }
     }
+}
+
+/// Final Fantasy VII's materia: each control an orb in a steel socket.
+///
+/// Red to close, yellow to minimize, green to maximize, as the theme's three
+/// fills say; the gear is purple and the `+` blue unless the theme names
+/// colours for them, which makes five - every colour of materia there was.
+/// The glyph shows under the pointer, with the orb lit up, the way the game
+/// lit the materia the cursor was on.
+fn paint_materia(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButtons) {
+    use crate::config::theme::{MATERIA_BLUE, MATERIA_PURPLE};
+    let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
+    let painter = ui.painter();
+    let radius = (side_of(rect) * 0.25).clamp(4.0, 6.5);
+    let center = rect.center();
+
+    let mut base = icon.tint(style).unwrap_or(match icon {
+        Icon::NewTab => MATERIA_BLUE,
+        _ => MATERIA_PURPLE,
+    });
+    // An unfocused window's materia has gone dull, not grey: it is still
+    // stone of a colour.
+    if !focused {
+        base = darken(base, 0.62);
+    }
+    if hovered {
+        base = lighten(base, 0.15);
+    }
+    crate::ui::shading::materia_orb(painter, center, radius, base, hovered);
+
+    if !hovered && !icon.is_own() {
+        return;
+    }
+    let ink = style.icon.unwrap_or(Color32::WHITE);
+    icons::draw(
+        painter,
+        Rect::from_center_size(center, Vec2::splat(radius * 1.7)),
+        icon.glyph(),
+        ink,
+        darken(base, 0.45),
+    );
 }
 
 /// The side of a square hit area, which both painters size their glyphs from.

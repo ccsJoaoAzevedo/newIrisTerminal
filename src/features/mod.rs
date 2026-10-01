@@ -24,5 +24,6 @@ pub mod history;
 pub mod logging;
 pub mod macros;
 pub mod natives;
+pub mod screensaver;
 pub mod snake;
 pub mod update;

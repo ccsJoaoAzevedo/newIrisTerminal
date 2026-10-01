@@ -50,6 +50,16 @@ const AQUA_SCROLL: &str = "#4a90d9";
 const LUNA_CLOSE: &str = "#cf4a35";
 const LUNA_BUTTON: &str = "#4b7fc4";
 
+/// Final Fantasy VII's materia, by what each colour equipped: red summons for
+/// the one control that ends something, yellow commands, green magic. Purple
+/// (independent) and blue (support) are the gear's and the `+`'s when a theme
+/// names no colour for them.
+const MATERIA_RED: &str = "#d8303a";
+const MATERIA_YELLOW: &str = "#e8c22c";
+const MATERIA_GREEN: &str = "#36b54a";
+pub const MATERIA_PURPLE: Color32 = Color32::from_rgb(0xb0, 0x4a, 0xd0);
+pub const MATERIA_BLUE: Color32 = Color32::from_rgb(0x4a, 0x7e, 0xe0);
+
 /// How the minimize / maximize / close controls are drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -62,13 +72,17 @@ pub enum WindowButtonStyle {
     Aqua,
     /// Windows XP's Luna: rounded gradient tiles with the glyph always on.
     Luna,
+    /// Final Fantasy VII's materia: glowing orbs set in a steel socket, with
+    /// the swirl inside them that made them read as stone rather than glass.
+    Materia,
 }
 
 impl WindowButtonStyle {
-    pub const ALL: [WindowButtonStyle; 3] = [
+    pub const ALL: [WindowButtonStyle; 4] = [
         WindowButtonStyle::Stroke,
         WindowButtonStyle::Aqua,
         WindowButtonStyle::Luna,
+        WindowButtonStyle::Materia,
     ];
 
     /// Empty, or anything unrecognised, means the stroked style: a theme file
@@ -77,6 +91,7 @@ impl WindowButtonStyle {
         match name.trim().to_ascii_lowercase().as_str() {
             "aqua" => WindowButtonStyle::Aqua,
             "luna" => WindowButtonStyle::Luna,
+            "materia" => WindowButtonStyle::Materia,
             _ => WindowButtonStyle::Stroke,
         }
     }
@@ -93,6 +108,9 @@ impl WindowButtonStyle {
             (WindowButtonStyle::Aqua, WindowButtonSlot::Maximize) => AQUA_MAXIMIZE,
             (WindowButtonStyle::Luna, WindowButtonSlot::Close) => LUNA_CLOSE,
             (WindowButtonStyle::Luna, _) => LUNA_BUTTON,
+            (WindowButtonStyle::Materia, WindowButtonSlot::Close) => MATERIA_RED,
+            (WindowButtonStyle::Materia, WindowButtonSlot::Minimize) => MATERIA_YELLOW,
+            (WindowButtonStyle::Materia, WindowButtonSlot::Maximize) => MATERIA_GREEN,
         };
         parse_hex(hex)
     }
@@ -102,8 +120,52 @@ impl WindowButtonStyle {
             WindowButtonStyle::Stroke => "stroke",
             WindowButtonStyle::Aqua => "aqua",
             WindowButtonStyle::Luna => "luna",
+            WindowButtonStyle::Materia => "materia",
         }
     }
+}
+
+/// Which way a chrome gradient runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientDirection {
+    /// Top to bottom.
+    Vertical,
+    /// Left to right.
+    Horizontal,
+    /// Top-left corner to bottom-right, the way Final Fantasy VII lit its
+    /// windows.
+    Diagonal,
+}
+
+impl GradientDirection {
+    pub const ALL: [GradientDirection; 3] = [
+        GradientDirection::Vertical,
+        GradientDirection::Horizontal,
+        GradientDirection::Diagonal,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GradientDirection::Vertical => "vertical",
+            GradientDirection::Horizontal => "horizontal",
+            GradientDirection::Diagonal => "diagonal",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|d| d.name().eq_ignore_ascii_case(name.trim()))
+    }
+}
+
+/// A gradient behind the chrome - the title bar, the tab strip, the dialogs -
+/// in place of its flat background.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiGradient {
+    pub direction: GradientDirection,
+    pub from: Color32,
+    pub to: Color32,
 }
 
 /// Which of the three controls a colour belongs to.
@@ -457,6 +519,21 @@ pub struct ThemeFile {
     /// Background for the chrome. Empty falls back to `background`.
     #[serde(default)]
     pub ui_background: String,
+    /// A gradient behind the chrome instead of `ui_background`: `vertical`,
+    /// `horizontal` or `diagonal`. Empty, or anything else, is the flat
+    /// background every theme had before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ui_gradient: String,
+    /// Where the gradient starts and ends. Either one left empty falls back to
+    /// `ui_background`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ui_gradient_from: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ui_gradient_to: String,
+    /// The edge drawn round dialogs, menus and group boxes. Empty leaves it to
+    /// the widget colours.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ui_border: String,
     /// ObjectScript colours for the terminal, one per token kind the scanner
     /// knows about ([`crate::term::syntax::Kind`]). Named after the semantic
     /// token scopes of the InterSystems VS Code extension, so an editor colour
@@ -582,6 +659,10 @@ impl Default for ThemeFile {
             ansi: Vec::new(),
             ui_foreground: String::new(),
             ui_background: String::new(),
+            ui_gradient: String::new(),
+            ui_gradient_from: String::new(),
+            ui_gradient_to: String::new(),
+            ui_border: String::new(),
             syntax_global: String::new(),
             syntax_string: String::new(),
             syntax_label: String::new(),
@@ -668,6 +749,8 @@ pub struct Theme {
     pub ansi: [Color32; 16],
     pub ui_foreground: Color32,
     pub ui_background: Color32,
+    pub ui_gradient: Option<UiGradient>,
+    pub ui_border: Option<Color32>,
     pub syntax_global: Color32,
     pub syntax_string: Color32,
     pub syntax_label: Color32,
@@ -728,6 +811,15 @@ impl Theme {
             selection: parse_hex(&file.selection).unwrap_or(Color32::DARK_BLUE),
             ui_foreground: parse_hex(&file.ui_foreground).unwrap_or(foreground),
             ui_background: parse_hex(&file.ui_background).unwrap_or(background),
+            ui_gradient: GradientDirection::from_name(&file.ui_gradient).map(|direction| {
+                let flat = parse_hex(&file.ui_background).unwrap_or(background);
+                UiGradient {
+                    direction,
+                    from: parse_hex(&file.ui_gradient_from).unwrap_or(flat),
+                    to: parse_hex(&file.ui_gradient_to).unwrap_or(flat),
+                }
+            }),
+            ui_border: parse_hex(&file.ui_border),
             // Every syntax colour falls back to the ObjectScript palette
             // rather than to a terminal colour: a theme that says nothing about
             // syntax still highlights, and the fallback is a colour chosen for
@@ -794,6 +886,13 @@ impl Theme {
             ansi: self.ansi.iter().map(|c| to_hex(*c)).collect(),
             ui_foreground: to_hex(self.ui_foreground),
             ui_background: to_hex(self.ui_background),
+            ui_gradient: self
+                .ui_gradient
+                .map(|g| g.direction.name().to_string())
+                .unwrap_or_default(),
+            ui_gradient_from: self.ui_gradient.map(|g| to_hex(g.from)).unwrap_or_default(),
+            ui_gradient_to: self.ui_gradient.map(|g| to_hex(g.to)).unwrap_or_default(),
+            ui_border: hex_or_empty(self.ui_border),
             syntax_global: to_hex(self.syntax_global),
             syntax_string: to_hex(self.syntax_string),
             syntax_label: to_hex(self.syntax_label),
@@ -917,6 +1016,19 @@ impl Theme {
         v.widgets.hovered.fg_stroke.color = lift(0.82);
         v.widgets.active.fg_stroke.color = self.ui_foreground;
         v.widgets.open.fg_stroke.color = lift(0.72);
+
+        // Under a gradient the panels are left unfilled and the gradient is
+        // painted behind them, on the window's background layer: a flat fill
+        // would cover it. Popups keep `window_fill`, since a menu with the
+        // terminal showing through it could not be read.
+        if self.ui_gradient.is_some() {
+            v.panel_fill = Color32::TRANSPARENT;
+        }
+        if let Some(border) = self.ui_border {
+            v.window_stroke.color = border;
+            v.window_stroke.width = v.window_stroke.width.max(1.5);
+            v.widgets.noninteractive.bg_stroke.color = border;
+        }
         v
     }
 }
@@ -1149,6 +1261,36 @@ pub fn builtin_files() -> Vec<ThemeFile> {
             builtin: true,
             ..with_syntax(DEFAULT_SYNTAX)
         },
+        // Final Fantasy VII's menus: the blue that darkens from the top-left
+        // corner down, edged in silver, with materia for window controls. The
+        // grid is the same blue taken nearly to black, so the white text the
+        // game was written in still reads over it.
+        ThemeFile {
+            name: "Final Fantasy VII".into(),
+            background: "#04082a".into(),
+            foreground: "#eef0f8".into(),
+            cursor: "#ffffff".into(),
+            selection: "#3050b0".into(),
+            ansi: ansi([
+                "#04082a", "#e04848", "#58d068", "#e8c22c", "#4a7ee0", "#b04ad0", "#40c8d8",
+                "#c8cce0", "#606890", "#ff6a6a", "#80f090", "#ffe060", "#7aa6ff", "#d880f0",
+                "#70e8f0", "#ffffff",
+            ]),
+            ui_foreground: "#e6ecff".into(),
+            ui_background: "#0b1c78".into(),
+            ui_gradient: "diagonal".into(),
+            ui_gradient_from: "#2f5bd0".into(),
+            ui_gradient_to: "#040a3a".into(),
+            ui_border: "#c8ccd8".into(),
+            window_button_style: "materia".into(),
+            window_button_icon: "#ffffff".into(),
+            scrollbar_handle: "#8c94b0".into(),
+            font_family: default_font_family(),
+            font_size: 14.0,
+            dark: true,
+            builtin: true,
+            ..with_syntax(DEFAULT_SYNTAX)
+        },
         ThemeFile {
             name: "Light".into(),
             background: "#fdfdfd".into(),
@@ -1327,7 +1469,7 @@ mod tests {
     /// or one of them is painted in nothing at all.
     #[test]
     fn a_filled_style_has_three_colours() {
-        for name in ["aqua", "luna"] {
+        for name in ["aqua", "luna", "materia"] {
             let file = ThemeFile {
                 name: "T".into(),
                 window_button_style: name.into(),
@@ -1454,6 +1596,44 @@ mod tests {
             [Close, OnTop, Minimize, Maximize, Settings, NewTab]
         );
         assert!(buttons.trailing().is_empty());
+    }
+
+    #[test]
+    fn a_gradient_and_a_border_round_trip_and_an_old_theme_has_neither() {
+        let old = Theme::from_file(&ThemeFile::default());
+        assert!(old.ui_gradient.is_none());
+        assert!(old.ui_border.is_none());
+        assert!(
+            old.to_file().ui_gradient.is_empty(),
+            "nothing invented on save"
+        );
+
+        let ff7 = builtin_files()
+            .into_iter()
+            .find(|f| f.name == "Final Fantasy VII")
+            .expect("shipped");
+        let theme = Theme::from_file(&ff7);
+        let gradient = theme.ui_gradient.expect("the FF7 theme has one");
+        assert_eq!(gradient.direction, GradientDirection::Diagonal);
+        assert_eq!(theme.window_buttons.style, WindowButtonStyle::Materia);
+        let back = Theme::from_file(&theme.to_file());
+        assert_eq!(back.ui_gradient, theme.ui_gradient);
+        assert_eq!(back.ui_border, theme.ui_border);
+    }
+
+    #[test]
+    fn a_gradient_leaves_the_panels_unfilled_so_it_shows() {
+        let ff7 = builtin_files()
+            .into_iter()
+            .find(|f| f.name == "Final Fantasy VII")
+            .unwrap();
+        let visuals = Theme::from_file(&ff7).visuals();
+        assert_eq!(visuals.panel_fill, Color32::TRANSPARENT);
+        assert_ne!(
+            visuals.window_fill,
+            Color32::TRANSPARENT,
+            "menus stay readable"
+        );
     }
 
     #[test]

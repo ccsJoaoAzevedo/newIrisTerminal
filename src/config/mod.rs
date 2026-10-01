@@ -365,6 +365,9 @@ pub struct Settings {
     /// release assets from will not let the download past without it - which
     /// is what left the updater checking successfully and never downloading.
     pub proxy_user: String,
+    /// Which screen saver covers the window after a while without input, and
+    /// how long that while is. Set from its own dialog, reached from Settings.
+    pub screensaver: crate::features::screensaver::Config,
 }
 
 impl Default for Settings {
@@ -417,6 +420,7 @@ impl Default for Settings {
             enable_plugins: false,
             check_for_updates: true,
             proxy_user: String::new(),
+            screensaver: crate::features::screensaver::Config::default(),
         }
     }
 }

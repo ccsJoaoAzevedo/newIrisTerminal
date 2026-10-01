@@ -109,6 +109,8 @@ pub fn shell(
             return;
         }
 
+        crate::ui::screensaver_view::note_activity(ctx);
+        crate::ui::shading::paint_backdrop(ctx);
         {
             egui::TopBottomPanel::top(egui::Id::new((id, "title-bar"))).show(ctx, |ui| {
                 if let Some(action) = title_bar(ui, id, title, buttons) {

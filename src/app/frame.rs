@@ -15,6 +15,7 @@ impl eframe::App for App {
         let mut fit: Option<(usize, usize, egui::Vec2)> = None;
 
         self.track_window_geometry(ctx);
+        crate::ui::shading::paint_backdrop(ctx);
         // Refilled as the panes draw, below, and read by the resize grips at
         // the end of the frame.
         self.pane_rects.clear();
@@ -38,6 +39,10 @@ impl eframe::App for App {
                 crate::plugins::api::Hook::RegisterCommand(_) => {}
             }
         }
+
+        // Before anything reads the keyboard: the key that wakes the saver is
+        // the user asking for the terminal back, not something to type into it.
+        let saver_woken = self.screensaver_tick(ctx);
 
         self.apply_always_on_top(ctx);
         self.poll_updates();
@@ -352,8 +357,48 @@ impl eframe::App for App {
             }
         }
 
+        let current_saver = self.settings.screensaver;
+        let saver_actions = crate::ui::screensaver_manager::screensaver_manager(
+            ctx,
+            &mut self.panels.screensaver,
+            &current_saver,
+            &theme.window_buttons,
+        );
+        for action in saver_actions {
+            use crate::ui::screensaver_manager::ScreensaverAction;
+            match action {
+                ScreensaverAction::Apply(config) => {
+                    self.settings.screensaver = config;
+                    requests.push(UiRequest::SettingsChanged);
+                }
+                ScreensaverAction::Preview(config) => {
+                    self.screensaver = Some(crate::ui::screensaver_view::Running::new(
+                        config.kind,
+                        config.speed,
+                    ));
+                }
+            }
+        }
+
         for request in requests {
             self.handle_request(ctx, request);
+        }
+
+        // Last of everything drawn, so it covers everything. Also on the frame
+        // it was woken in, so the click that woke it lands on it and not on
+        // the terminal underneath.
+        if let Some(saver) = self.screensaver.as_mut() {
+            saver.show(ctx);
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+        if let Some(saver) = saver_woken {
+            let mut saver = saver;
+            saver.show(ctx);
+        } else if self.screensaver.is_none() && self.settings.screensaver.kind != Kind::None {
+            // One frame at the moment it is due, which is all an idle window
+            // pays for having a saver set.
+            let idle = crate::ui::screensaver_view::last_activity(ctx).elapsed();
+            ctx.request_repaint_after(self.settings.screensaver.wait().saturating_sub(idle));
         }
 
         if let Some((view_cols, view_rows, cell)) = fit.filter(|_| !self.minimized) {
@@ -404,5 +449,37 @@ impl eframe::App for App {
             }
         }
         self.persist_window_geometry();
+    }
+}
+
+use crate::features::screensaver::Kind;
+
+impl App {
+    /// Starts the screen saver once the window has been idle long enough, and
+    /// stops it on the first key or movement since.
+    ///
+    /// Returns the saver it has just stopped, so it can be drawn one last time
+    /// to catch the click that stopped it.
+    fn screensaver_tick(&mut self, ctx: &Context) -> Option<crate::ui::screensaver_view::Running> {
+        crate::ui::screensaver_view::note_activity(ctx);
+        if let Some(saver) = &self.screensaver {
+            if saver.woken(ctx) {
+                // Swallowed: XP never typed the key that woke it either.
+                ctx.input_mut(|i| i.events.clear());
+                return self.screensaver.take();
+            }
+            return None;
+        }
+        let config = self.settings.screensaver;
+        if config.kind != Kind::None
+            && !self.minimized
+            && crate::ui::screensaver_view::last_activity(ctx).elapsed() >= config.wait()
+        {
+            self.screensaver = Some(crate::ui::screensaver_view::Running::new(
+                config.kind,
+                config.speed,
+            ));
+        }
+        None
     }
 }
