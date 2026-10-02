@@ -14,20 +14,6 @@ use super::*;
 /// margin rather than wrapping it, so a session opened at 80 columns loses
 /// everything past column 80 until it is resized. Opening at the real size
 /// means nothing is cut in the first place.
-/// A strip of the title bar kept free of tabs, in front of the window
-/// controls.
-///
-/// The handle that is always there. A row of tabs long enough to fill the bar
-/// would otherwise leave nothing to drag the window by, and with the system's
-/// frame turned off there is then no way to move it at all. Held back at the
-/// end of the row rather than in front of the tabs, where an empty gap looks
-/// like a tab that failed to draw.
-pub(super) const TITLE_FREE_STRIP: f32 = 28.0;
-
-/// How wide one title-bar control is, for working out what to keep back for
-/// them. egui sizes them from the row height, which is `interact_size.y`.
-pub(super) const TITLE_CONTROL_SIDE: f32 = 24.0;
-
 pub(super) const FALLBACK_COLS: u16 = 80;
 
 pub(super) const FALLBACK_ROWS: u16 = 24;

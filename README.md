@@ -36,10 +36,16 @@ A terminal emulator for InterSystems IRIS — Windows, Linux and macOS.
 * **Command history that outlives the session:** Up offers a tab the commands
   typed at its own prompt first, then the ones earlier runs left behind. Lines a
   macro sent are never offered back.
+* **SQL mode:** type `/sql` at an IRIS prompt (or press Ctrl+Shift+Q) to drop
+  into the IRIS SQL shell; the same gesture leaves it. While the prompt reads
+  `NAMESPACE>>`, the line is coloured as SQL.
+* **Autocomplete at the prompt:** commands, `$` functions, `^` globals,
+  routines, `##class(` names and, in SQL mode, keywords and tables — from your
+  history and what has been on screen. Up/Down choose, Tab accepts, Esc closes.
 * **Macros from XML:** `{{param}}` substitution, `confirm="true"` for anything
   that writes, a keyboard shortcut per macro, and `hide_command="true"` for a
-  command line carrying a password. Written and edited in the built-in macro
-  manager.
+  command line carrying a password. The macro editor checks every parameter
+  against the command, and one the command never uses is not asked for.
 * **IRIS utilities:** compile a package, compile a routine group, generate an
   interface — each with a field per argument and the exact line it will send
   shown underneath.
@@ -50,11 +56,22 @@ A terminal emulator for InterSystems IRIS — Windows, Linux and macOS.
 * **A clear-screen that keeps the transcript:** `W #` files the old screen into
   scrollback instead of destroying it, the way the native IrisTerm does.
   Ctrl+Delete is the deliberate gesture that really throws it away.
-* **Themes you can edit in the app:** ten built-in and immutable — IRIS Dark,
-  IRIS Classic Green, Tokyo, Light, Tiger Aqua, Tiger Graphite, Windows XP, KDE
-  Plastik, Hello Kitty and Hello Kitty Dark. Duplicate one and every colour is
-  yours, including the sixteen ANSI slots and the sixteen ObjectScript ones,
-  with a live sample beside the editor.
+* **Themes you can edit in the app:** eleven built-in and immutable — IRIS
+  Dark, IRIS Classic Green, Tokyo, Light, Tiger Aqua, Tiger Graphite, Windows
+  XP, KDE Plastik, Hello Kitty, Hello Kitty Dark and Final Fantasy VII.
+  Duplicate one and every colour is yours: the terminal, its scrollbar and the
+  chrome (each with an optional gradient), the window buttons, the selected
+  tab, the sixteen ANSI slots and the sixteen ObjectScript ones. Point at a
+  swatch and press Ctrl+C / Ctrl+V to copy a colour between elements. The
+  title bar's layout is the theme's too: drag its items into any order, with a
+  left and a right space to pack things left, right or centred.
+* **Settings with search:** one window, macOS/GNOME style — a sidebar of
+  pages, the themes, macros and screen savers among them, and a search field
+  that finds any setting by name or description, in English or Portuguese.
+  An interface scale from 100% to 200% enlarges everything but the terminal.
+* **Screen savers:** Matrix (in any colours), a bouncing DVD logo or your own
+  text, and a floating logo — Windows XP, Windows XP Pirated Edition, your text
+  or your own PNG/GIF.
 * **Export and logging:** screen or full scrollback, as text or
   colour-preserving HTML, to a file or the clipboard. Per-session transcripts
   are written through as the session runs, with password redaction and rotation.

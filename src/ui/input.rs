@@ -49,6 +49,22 @@ pub struct InputContext {
     /// from `line`: a shell never shows an IRIS prompt, so without this it is
     /// indistinguishable from a routine painting its own screen.
     pub shell: bool,
+    /// The autocomplete popup is open, and whether the user has moved through
+    /// it. While it is open Up, Down, Tab and Escape are its keys; Enter is
+    /// too, but only once the user has moved - see
+    /// [`crate::features::autocomplete::Popup::navigated`].
+    pub completion: Option<bool>,
+}
+
+/// What a key press asked of the autocomplete popup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionKey {
+    Next,
+    Previous,
+    Accept,
+    /// Escape, or any key that is not typing: the popup goes, and stays gone
+    /// until the next character typed.
+    Dismiss,
 }
 
 impl InputContext {
@@ -439,6 +455,12 @@ pub struct InputAction {
     /// Backspace or Delete was pressed with part of the command line selected,
     /// so what is selected should go rather than the character at the cursor.
     pub erase_selection: bool,
+    /// What the keys pressed asked of the autocomplete popup, in order.
+    pub completion: Vec<CompletionKey>,
+    /// A character was typed or rubbed out: the word under the cursor may have
+    /// changed, so the autocomplete should look at it again once IRIS has
+    /// echoed it.
+    pub typing: bool,
 }
 
 impl InputAction {
@@ -461,6 +483,8 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
         move_cursor: None,
         collapse_selection: false,
         erase_selection: false,
+        completion: Vec::new(),
+        typing: false,
     };
 
     // Anywhere on a command line when the setting allows it: the native IRIS
@@ -489,6 +513,7 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
                 // egui already filters out text produced while a command
                 // modifier is held, so this is genuine typed input.
                 action.text.push_str(text);
+                action.typing = true;
             }
             // Text an input method composed and committed. It arrives here
             // rather than as `Event::Text` because the composition happens
@@ -507,6 +532,37 @@ pub fn translate(events: &[Event], ctx: &InputContext) -> InputAction {
                 modifiers,
                 ..
             } => {
+                // An open autocomplete popup has first claim on the keys that
+                // move through a list, ahead of the history: Up while it is
+                // open picks the suggestion above rather than recalling.
+                if let Some(navigated) = ctx.completion.filter(|_| modifiers.is_none()) {
+                    let claimed = match key {
+                        Key::ArrowDown => Some(CompletionKey::Next),
+                        Key::ArrowUp => Some(CompletionKey::Previous),
+                        Key::Tab => Some(CompletionKey::Accept),
+                        // Only once a suggestion has been chosen. Otherwise
+                        // Enter on a word that happens to have suggestions
+                        // would complete it instead of running the line.
+                        Key::Enter if navigated => Some(CompletionKey::Accept),
+                        Key::Escape => Some(CompletionKey::Dismiss),
+                        _ => None,
+                    };
+                    if let Some(claimed) = claimed {
+                        action.completion.push(claimed);
+                        continue;
+                    }
+                }
+                // Typing goes on; any other key moves away from the word, and
+                // the popup with it. A letter arrives as a key event too, with
+                // its text behind it, and that is typing: the keys that are
+                // not are exactly the ones that send something of their own.
+                if *key == Key::Backspace && modifiers.is_none() {
+                    action.typing = true;
+                } else if ctx.completion.is_some()
+                    && key_bytes(*key, modifiers, ctx.reader(), ctx.app_cursor_keys).is_some()
+                {
+                    action.completion.push(CompletionKey::Dismiss);
+                }
                 // Up and Down over a command line are the app's history, and
                 // nothing else reaches IRIS from them - not the bare arrow, and
                 // not any chord built on it. Forwarding one would reach IRIS's
@@ -1255,6 +1311,87 @@ mod tests {
         let down = translate(&[press(Key::ArrowDown)], &ctx);
         assert_eq!(down.recall, Some(Recall::Forward));
         assert!(down.bytes.is_empty());
+    }
+
+    /// While the autocomplete popup is open its keys come before the history:
+    /// Up picks the suggestion above instead of recalling, and nothing of any
+    /// of them reaches IRIS.
+    #[test]
+    fn an_open_popup_takes_the_arrows_tab_and_escape_before_the_history() {
+        let ctx = InputContext {
+            line: Some(line()),
+            can_recall: true,
+            completion: Some(false),
+            ..InputContext::default()
+        };
+        for (key, expected) in [
+            (Key::ArrowDown, CompletionKey::Next),
+            (Key::ArrowUp, CompletionKey::Previous),
+            (Key::Tab, CompletionKey::Accept),
+            (Key::Escape, CompletionKey::Dismiss),
+        ] {
+            let action = translate(&[press(key)], &ctx);
+            assert_eq!(action.completion, vec![expected], "{key:?}");
+            assert_eq!(action.recall, None, "{key:?}");
+            assert!(action.bytes.is_empty(), "{key:?} reached IRIS");
+        }
+    }
+
+    /// Enter accepts only a suggestion the user moved to. Otherwise it runs
+    /// the line, as it would with no popup at all.
+    #[test]
+    fn enter_accepts_only_once_the_popup_has_been_navigated() {
+        let open = InputContext {
+            line: Some(line()),
+            completion: Some(false),
+            ..InputContext::default()
+        };
+        let action = translate(&[press(Key::Enter)], &open);
+        assert!(action.submitted.is_some());
+        assert_eq!(action.bytes, vec![b'\r']);
+
+        let navigated = InputContext {
+            completion: Some(true),
+            ..open
+        };
+        let action = translate(&[press(Key::Enter)], &navigated);
+        assert_eq!(action.completion, vec![CompletionKey::Accept]);
+        assert!(action.submitted.is_none());
+        assert!(action.bytes.is_empty());
+    }
+
+    /// Typing keeps the popup and asks for it to be worked out again; a key
+    /// that moves away from the word closes it, and still does what it does.
+    #[test]
+    fn typing_keeps_the_popup_and_any_other_key_closes_it() {
+        let ctx = InputContext {
+            line: Some(line()),
+            completion: Some(false),
+            ..InputContext::default()
+        };
+        let typed = translate(
+            &[
+                press(Key::A),
+                Event::Text("a".into()),
+                press(Key::Backspace),
+            ],
+            &ctx,
+        );
+        assert!(typed.typing);
+        assert!(typed.completion.is_empty(), "{:?}", typed.completion);
+
+        let left = translate(&[press(Key::ArrowLeft)], &ctx);
+        assert_eq!(left.completion, vec![CompletionKey::Dismiss]);
+        assert_eq!(left.bytes, b"\x1b[D".to_vec());
+
+        // And with no popup, Tab is IRIS's as it always was.
+        let closed = InputContext {
+            completion: None,
+            ..ctx
+        };
+        let tab = translate(&[press(Key::Tab)], &closed);
+        assert!(tab.completion.is_empty());
+        assert_eq!(tab.bytes, vec![b'\t']);
     }
 
     /// With nothing to recall the arrow does nothing at all - it used to fall

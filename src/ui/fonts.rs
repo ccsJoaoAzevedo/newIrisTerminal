@@ -68,8 +68,11 @@ pub fn generation() -> u64 {
 /// name reach a `FontFamily::Name`.
 pub fn install(ctx: &Context, family: &str) -> bool {
     if family.is_empty() || family == "monospace" {
-        ctx.set_fonts(FontDefinitions::default());
+        let mut defs = FontDefinitions::default();
+        add_display_faces(&mut defs);
+        ctx.set_fonts(defs);
         GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        remember_terminal_font("");
         return true;
     }
 
@@ -79,6 +82,7 @@ pub fn install(ctx: &Context, family: &str) -> bool {
     };
 
     let mut defs = FontDefinitions::default();
+    add_display_faces(&mut defs);
     defs.font_data.insert(
         TERMINAL_FONT.to_owned(),
         FontData {
@@ -105,7 +109,122 @@ pub fn install(ctx: &Context, family: &str) -> bool {
 
     ctx.set_fonts(defs);
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    remember_terminal_font(family);
     true
+}
+
+/// The family the last successful [`install`] put in place, so the display
+/// faces can be added later without changing the terminal's font under it.
+fn remember_terminal_font(family: &str) {
+    if let Ok(mut last) = TERMINAL_FAMILY.lock() {
+        family.clone_into(&mut last);
+    }
+}
+
+static TERMINAL_FAMILY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Set once something has asked for a [`Display`] face. Until then none is
+/// loaded: they are only for the screen saver's logos, and reading the system
+/// font list for them would cost every start-up a tenth of a second.
+static DISPLAY_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A lettering face for the screen saver's logos, which egui's bundled light
+/// sans cannot do: there is no bold in it and no serif at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Display {
+    /// The XP wordmark's "Windows".
+    Heavy,
+    /// Its "xp", which leans.
+    HeavyItalic,
+    /// "Pirated Edition": an old-style serif.
+    Serif,
+}
+
+impl Display {
+    const ALL: [Display; 3] = [Display::Heavy, Display::HeavyItalic, Display::Serif];
+
+    fn key(self) -> &'static str {
+        match self {
+            Display::Heavy => "nit-display-heavy",
+            Display::HeavyItalic => "nit-display-heavy-italic",
+            Display::Serif => "nit-display-serif",
+        }
+    }
+
+    /// Families tried in order, and the weight and slant wanted of each.
+    /// Franklin Gothic is what the XP wordmark is lettered in, and Palatino
+    /// the nearest old-style serif Windows ships; the rest are for a machine
+    /// without them.
+    fn candidates(self) -> (&'static [&'static str], u16, bool) {
+        const HEAVY: &[&str] = &["Franklin Gothic Medium", "Franklin Gothic Demi", "Arial"];
+        match self {
+            Display::Heavy => (HEAVY, 700, false),
+            Display::HeavyItalic => (HEAVY, 700, true),
+            Display::Serif => (
+                &[
+                    "Palatino Linotype",
+                    "Book Antiqua",
+                    "Georgia",
+                    "Times New Roman",
+                ],
+                700,
+                false,
+            ),
+        }
+    }
+}
+
+/// Registers whichever display faces this machine has, each as a family of
+/// its own with the bundled proportional font behind it for missing glyphs.
+fn add_display_faces(defs: &mut FontDefinitions) {
+    if !DISPLAY_WANTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let fallback = defs
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    for display in Display::ALL {
+        let (families, weight, italic) = display.candidates();
+        let Some((bytes, index)) = families
+            .iter()
+            .find_map(|family| face_matching(family, weight, italic))
+        else {
+            continue;
+        };
+        defs.font_data.insert(
+            display.key().to_owned(),
+            FontData {
+                font: std::borrow::Cow::Owned(bytes),
+                index,
+                tweak: Default::default(),
+            },
+        );
+        let mut chain = vec![display.key().to_owned()];
+        chain.extend(fallback.iter().cloned());
+        defs.families
+            .insert(FontFamily::Name(display.key().into()), chain);
+    }
+}
+
+/// The family to letter `display` in, or `None` for the bundled proportional
+/// font - which is what the first frame that asks gets, because that request
+/// is what loads the faces, and egui only takes new fonts at the next frame.
+///
+/// Never hands out a family egui does not have yet: asking for one panics.
+pub fn display_family(ctx: &Context, display: Display) -> Option<FontFamily> {
+    if !DISPLAY_WANTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let family = TERMINAL_FAMILY
+            .lock()
+            .map(|f| f.clone())
+            .unwrap_or_default();
+        install(ctx, &family);
+        return None;
+    }
+    let family = FontFamily::Name(display.key().into());
+    ctx.fonts(|f| f.families().contains(&family))
+        .then_some(family)
 }
 
 /// Bytes and face index of the regular face of `family`.
@@ -114,6 +233,12 @@ pub fn install(ctx: &Context, family: &str) -> bool {
 /// happily pick Bold or Italic, whichever the enumeration reached first, and
 /// the terminal would then render everything bold with no way to undo it.
 fn face_data(family: &str) -> Option<(Vec<u8>, u32)> {
+    face_matching(family, fontdb::Weight::NORMAL.0, false)
+}
+
+/// Bytes and face index of the face of `family` nearest `weight`, upright or
+/// italic as asked; the slant counts before the weight does.
+fn face_matching(family: &str, weight: u16, italic: bool) -> Option<(Vec<u8>, u32)> {
     let db = database();
     let wanted = family.to_lowercase();
 
@@ -125,11 +250,11 @@ fn face_data(family: &str) -> Option<(Vec<u8>, u32)> {
                 .any(|(name, _)| name.to_lowercase() == wanted)
         })
         .min_by_key(|face| {
-            let upright = face.style != fontdb::Style::Normal;
-            // Distance from Regular, so a family shipping only Light or Medium
-            // still resolves instead of being rejected.
-            let weight = face.weight.0.abs_diff(fontdb::Weight::NORMAL.0);
-            (upright, weight)
+            let slant = (face.style != fontdb::Style::Normal) != italic;
+            // Distance from what was asked, so a family shipping only Light or
+            // Medium still resolves instead of being rejected.
+            let weight = face.weight.0.abs_diff(weight);
+            (slant, weight)
         })?;
 
     let index = best.index;

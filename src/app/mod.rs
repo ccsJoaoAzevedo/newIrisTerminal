@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::config::session::{SavedDir, SavedSession, SavedSplit, SavedTab};
 use crate::config::{self, ensure_config_tree, load_themes, LogMode, Profile, Settings, Theme};
 use crate::features::analyze;
+use crate::features::autocomplete::{self, Completion, Vocabulary};
 use crate::features::autologon::{Autologon, State as AutoState};
 use crate::features::doc_lookup::{self, DocLookup, Lookup};
 use crate::features::export::{self, Range};
@@ -23,10 +24,9 @@ use crate::pty::launcher::launcher;
 use crate::pty::Session;
 use crate::term::{lineedit, Grid, Motion};
 use crate::ui::chrome::{self, WindowAction};
-use crate::ui::macro_manager;
 use crate::ui::panels::{self, PanelState, PendingMacro, UiRequest};
+use crate::ui::settings_view::{self, themes::ThemeAction};
 use crate::ui::terminal_view::{self, RenderOpts, Selection, ViewState};
-use crate::ui::theme_manager::{self, ThemeAction};
 use crate::ui::{fonts, input, shortcut, snake_view};
 
 // The shell is split by what each part is responsible for, and every one of
@@ -54,8 +54,7 @@ pub use updates::UpdateState;
 
 use layout::{
     draw_pane, fitted_inner_size, split_divider, split_extent, At, LayoutAction, PaneMeasure,
-    WindowFit, FALLBACK_COLS, FALLBACK_ROWS, FIT_ATTEMPTS, SPLIT_DIVIDER, TITLE_CONTROL_SIDE,
-    TITLE_FREE_STRIP,
+    WindowFit, FALLBACK_COLS, FALLBACK_ROWS, FIT_ATTEMPTS, SPLIT_DIVIDER,
 };
 use tab::{close_down, cursor_bytes, one_char, selection_in_line};
 use tabs::Renaming;
@@ -116,6 +115,11 @@ pub struct App {
     /// Commands typed at an IRIS prompt, shared by every tab so a new one opens
     /// knowing what was run in the last.
     history: History,
+    /// Names the autocomplete has seen - globals, routines, classes, tables -
+    /// learned from the history and from every command recorded since. Shared
+    /// by every tab for the same reason the history is: a global inspected in
+    /// one session is the one about to be typed in the next.
+    vocabulary: Vocabulary,
     plugins: PluginHost,
     panels: PanelState,
     /// The tab whose terminal last took keyboard focus, so a tab switch can
@@ -307,15 +311,24 @@ impl App {
             seen: crate::ui::detach::Geometry::default(),
         };
 
+        let history = History::load(
+            &config::command_history_path(),
+            settings.save_command_history,
+        );
+        // Once, at startup: every command recorded from here on is learned
+        // from as it is recorded - see `App::record_command`.
+        let mut vocabulary = Vocabulary::default();
+        for command in history.entries() {
+            vocabulary.harvest_line(command);
+        }
+
         let mut app = App {
             new_tab_profile: default_profile,
             closed_tabs: Vec::new(),
             macro_groups: load_macros(&settings).groups,
             pane_rects: Vec::new(),
-            history: History::load(
-                &config::command_history_path(),
-                settings.save_command_history,
-            ),
+            history,
+            vocabulary,
             settings,
             themes,
             tabs: Vec::new(),

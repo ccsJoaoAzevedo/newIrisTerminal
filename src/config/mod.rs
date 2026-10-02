@@ -247,6 +247,26 @@ pub struct Settings {
     /// see `selection_in_line`. A selection in the scrollback is highlighted
     /// text and nothing else, so typing over it is not an edit of anything.
     pub surround_selection: bool,
+    /// Offer the rest of the word being typed at an IRIS prompt - commands,
+    /// `$` functions, globals, routines, classes, and SQL in the SQL shell -
+    /// in a popup at the cursor. See [`crate::features::autocomplete`].
+    ///
+    /// A switch because the popup claims Up, Down, Tab and Escape while it is
+    /// open, and someone used to those reaching IRIS may want them back.
+    pub autocomplete: bool,
+    /// Colour a line typed at the SQL shell's prompt (`USER>>`) as SQL rather
+    /// than as ObjectScript. Only matters while
+    /// `terminal_syntax_highlight` is on; off, such a line is coloured as
+    /// ObjectScript like every other.
+    pub sql_highlight: bool,
+    /// How much larger than egui's own size the interface is drawn - the
+    /// tabs, the title bar, the dialogs - from 1 to 2. The terminal is left at
+    /// `font_size`: it is a character grid sized to the window, and scaling it
+    /// as well would only be a second font-size setting.
+    pub ui_scale: f32,
+    /// How opaque the pages of Settings and the managers are over a theme
+    /// that paints a gradient behind the chrome, from 0 (clear glass) to 1.
+    pub sheet_opacity: f32,
     /// Keep the commands typed at an IRIS prompt in a file, so Up recalls what
     /// was typed in earlier sessions and not only in this one.
     ///
@@ -276,8 +296,9 @@ pub struct Settings {
     /// Never written to: it is shared, so the app treats it as read-only and
     /// keeps personal edits in [`personal_macros_path`].
     pub org_macros_path: PathBuf,
-    /// Chord that opens the macro manager, e.g. `Ctrl+Shift+M`. `None` means
-    /// the manager is only reachable from the settings window.
+    /// Chord that opens Settings on the macros, e.g. `Ctrl+Shift+M`. `None`
+    /// means they are only reached through the settings window. Named for the
+    /// manager window it used to open, so a settings file that set it keeps it.
     ///
     /// Text, like a macro's own binding, and read by the same parser: see
     /// [`crate::ui::shortcut`]. A value it cannot understand never fires,
@@ -293,11 +314,6 @@ pub struct Settings {
     /// Closing the window hides it behind a notification-area icon instead,
     /// and the sessions stay connected. The icon's menu is what quits.
     pub close_to_tray: bool,
-    /// Draw the minimize / maximize / close controls in the app's own title
-    /// bar. Off leaves the row to the tabs and the drag area: the window can
-    /// still be moved, maximized by double-click, and closed with Ctrl+W or
-    /// Alt+F4.
-    pub show_window_buttons: bool,
     /// Put the tabs in the title bar, on the same row as the window controls,
     /// instead of on a strip of their own below it.
     ///
@@ -388,6 +404,10 @@ impl Default for Settings {
             intellisense: IntellisenseMode::default(),
             recall_mid_line: true,
             surround_selection: true,
+            autocomplete: true,
+            sql_highlight: true,
+            ui_scale: 1.0,
+            sheet_opacity: crate::ui::prefs::DEFAULT_OPACITY,
             save_command_history: true,
             show_pid: true,
             show_namespace_in_tab: true,
@@ -403,7 +423,6 @@ impl Default for Settings {
             open_on_start: true,
             confirm_close_with_live_session: true,
             close_to_tray: false,
-            show_window_buttons: true,
             tabs_in_title_bar: false,
             save_terminal_size: false,
             default_cols: DEFAULT_TERMINAL_COLS,
@@ -725,7 +744,6 @@ mod tests {
         assert!(settings.font_family.is_empty());
         assert!(settings.copy_on_select);
         assert!(settings.save_command_history);
-        assert!(settings.show_window_buttons);
         assert!(!settings.remember_open_tabs);
         assert_eq!(settings.status_timeout_secs, 8);
         assert_eq!(
@@ -815,6 +833,22 @@ mod tests {
     fn an_old_settings_file_still_closes_instead_of_hiding_to_the_tray() {
         let settings: Settings = toml::from_str("theme = \"Tokyo\"").expect("parse");
         assert!(!settings.close_to_tray);
+    }
+
+    /// Both arrived after settings files were already out there, and both are
+    /// meant to be on for someone who has never seen them.
+    #[test]
+    fn an_old_settings_file_draws_the_interface_at_its_usual_size() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.ui_scale, 1.0);
+        assert_eq!(Settings::default().ui_scale, 1.0);
+    }
+
+    #[test]
+    fn an_old_settings_file_turns_autocomplete_and_sql_colouring_on() {
+        let settings: Settings = toml::from_str("theme = \"Tokyo\"").expect("parse");
+        assert!(settings.autocomplete);
+        assert!(settings.sql_highlight);
     }
 
     #[test]

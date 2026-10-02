@@ -29,11 +29,7 @@ pub(super) fn h_scrollbar(
     max_offset: usize,
 ) {
     let painter = ui.painter_at(track);
-    painter.rect_filled(
-        track,
-        0.0,
-        palette::blend(theme.background, theme.foreground, 0.07),
-    );
+    paint_track(&painter, track, theme, false);
 
     if max_offset == 0 {
         return;
@@ -72,16 +68,99 @@ pub(super) fn h_scrollbar(
     );
 }
 
+/// The strip the handle runs in, when the theme does not name one: the
+/// background lifted a little towards the text.
+pub fn track_colour(theme: &Theme) -> Color32 {
+    theme
+        .scrollbar_track
+        .unwrap_or_else(|| palette::blend(theme.background, theme.foreground, 0.07))
+}
+
+/// The handle's resting colour, before hovering lifts it.
+pub fn handle_colour(theme: &Theme) -> Color32 {
+    use crate::config::theme::WindowButtonStyle;
+    match (theme.window_buttons.style, theme.scrollbar_handle) {
+        (WindowButtonStyle::Aqua | WindowButtonStyle::Materia, Some(base)) => base,
+        (_, handle) => palette::blend(handle.unwrap_or(theme.selection), theme.foreground, 0.1),
+    }
+}
+
+/// Where a scroll bar gradient ends when the theme names no end: the colour
+/// darkened, so switching a gradient on already shows one.
+pub fn gradient_end(from: Color32) -> Color32 {
+    crate::ui::shading::darken(from, 0.6)
+}
+
+/// A scroll bar gradient laid over `rect`, turned for the bar it is on.
+///
+/// The theme's direction is read as the vertical bar sees it, so "vertical"
+/// always means along the bar. The bar along the bottom therefore swaps the
+/// two, or a handle shaded along its length in one bar would be shaded across
+/// it in the other.
+fn bar_gradient(
+    painter: &egui::Painter,
+    rect: Rect,
+    direction: crate::config::theme::GradientDirection,
+    from: Color32,
+    to: Color32,
+    vertical: bool,
+) {
+    use crate::config::theme::{GradientDirection, UiGradient};
+    let direction = match (vertical, direction) {
+        (false, GradientDirection::Vertical) => GradientDirection::Horizontal,
+        (false, GradientDirection::Horizontal) => GradientDirection::Vertical,
+        (_, direction) => direction,
+    };
+    crate::ui::shading::ui_gradient(
+        painter,
+        rect,
+        &UiGradient {
+            direction,
+            from,
+            to,
+        },
+    );
+}
+
+fn paint_track(painter: &egui::Painter, track: Rect, theme: &Theme, vertical: bool) {
+    let base = track_colour(theme);
+    match theme.scrollbar_gradient {
+        Some(direction) => {
+            let to = theme
+                .scrollbar_track_to
+                .unwrap_or_else(|| gradient_end(base));
+            bar_gradient(painter, track, direction, base, to, vertical);
+        }
+        None => {
+            painter.rect_filled(track, 0.0, base);
+        }
+    }
+}
+
 /// The handle, in whichever look the theme calls for.
 ///
 /// An Aqua theme gets the glass capsule (and a materia one, the same capsule
-/// in steel), because a Tiger window with a flat
-/// grey scroll handle reads as two applications in one frame; everything else
-/// keeps the flat bar, which is what a modern theme wants.
+/// in steel), because a Tiger window with a flat grey scroll handle reads as
+/// two applications in one frame; everything else keeps the flat bar, which is
+/// what a modern theme wants. A gradient, once the theme asks for one, wins
+/// over both: it is the more specific thing to have asked for.
 fn paint_thumb(painter: &egui::Painter, thumb: Rect, theme: &Theme, active: bool, vertical: bool) {
     use crate::config::theme::WindowButtonStyle;
     use crate::ui::shading;
 
+    if let Some(direction) = theme.scrollbar_gradient {
+        let base = handle_colour(theme);
+        let to = theme
+            .scrollbar_handle_to
+            .unwrap_or_else(|| gradient_end(base));
+        let (from, to) = if active {
+            (shading::lighten(base, 0.15), shading::lighten(to, 0.15))
+        } else {
+            (base, to)
+        };
+        bar_gradient(painter, thumb, direction, from, to, vertical);
+        return;
+    }
     match (theme.window_buttons.style, theme.scrollbar_handle) {
         (WindowButtonStyle::Aqua | WindowButtonStyle::Materia, Some(base)) => {
             let base = if active {
@@ -170,11 +249,7 @@ pub(super) fn scrollbar(
     let painter = ui.painter_at(track);
     // The track is drawn even with nothing to scroll, so the reserved strip
     // reads as part of the terminal rather than as a gap beside it.
-    painter.rect_filled(
-        track,
-        0.0,
-        palette::blend(theme.background, theme.foreground, 0.07),
-    );
+    paint_track(&painter, track, theme, true);
 
     if max_top == wrap::Top::default() {
         return;

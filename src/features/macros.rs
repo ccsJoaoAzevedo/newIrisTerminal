@@ -79,30 +79,169 @@ impl Macro {
     /// Substitutes `{{name}}` placeholders. Unknown placeholders are left
     /// alone rather than blanked, so a typo is visible instead of silently
     /// producing a valid-but-wrong command.
+    ///
+    /// Placeholders are found by [`placeholders`] and nothing else, so the
+    /// macro editor's checker, which asks the same function, can never call a
+    /// parameter used when it would not be substituted. One pass per line: a
+    /// value that itself contains `{{other}}` is sent as typed, where replacing
+    /// one name after another used to substitute it a second time.
     pub fn expand(&self, values: &[(String, String)]) -> Vec<String> {
         self.body
             .iter()
             .map(|line| {
-                let mut out = line.clone();
-                for (name, value) in values {
-                    out = out.replace(&format!("{{{{{name}}}}}"), value);
+                let mut out = String::with_capacity(line.len());
+                let mut copied = 0;
+                for found in placeholders(line) {
+                    // The first of two values with the same name wins, as it
+                    // did when each name was replaced in turn.
+                    let Some((_, value)) = values.iter().find(|(name, _)| name == found.name)
+                    else {
+                        continue;
+                    };
+                    out.push_str(&line[copied..found.range.start]);
+                    out.push_str(value);
+                    copied = found.range.end;
                 }
+                out.push_str(&line[copied..]);
                 out
             })
             .collect()
     }
 
     /// Parameter values pre-filled with their defaults, ready for the dialog.
+    ///
+    /// Only the parameters that can reach the command: a value for one that
+    /// cannot would be asked for and then thrown away.
     pub fn default_values(&self) -> Vec<(String, String)> {
-        self.params
-            .iter()
+        self.usable_params()
             .map(|p| (p.name.clone(), p.default.clone()))
             .collect()
     }
 
+    /// Whether running it has to stop and ask for values first.
     pub fn needs_input(&self) -> bool {
-        !self.params.is_empty()
+        self.usable_params().next().is_some()
     }
+
+    /// The parameters worth asking for, in declaration order.
+    pub fn usable_params(&self) -> impl Iterator<Item = &Param> {
+        self.params
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| matches!(self.param_use(*at), ParamUse::Used { .. }))
+            .map(|(_, p)| p)
+    }
+
+    /// What the parameter at `index` does to the command.
+    pub fn param_use(&self, index: usize) -> ParamUse {
+        let Some(param) = self.params.get(index) else {
+            return ParamUse::Unused;
+        };
+        if param.name.trim().is_empty() {
+            return ParamUse::Blank;
+        }
+        if self.params[..index].iter().any(|p| p.name == param.name) {
+            return ParamUse::Duplicate;
+        }
+        let mut lines = Vec::new();
+        let mut count = 0;
+        for (at, line) in self.body.iter().enumerate() {
+            let here = placeholders(line)
+                .filter(|found| found.name == param.name)
+                .count();
+            if here > 0 {
+                count += here;
+                lines.push(at + 1);
+            }
+        }
+        if count == 0 {
+            ParamUse::Unused
+        } else {
+            ParamUse::Used { lines, count }
+        }
+    }
+
+    /// Placeholders no parameter fills, as (1-based line, name), each once per
+    /// line. `expand` leaves these in the command exactly as they are typed.
+    pub fn undeclared_placeholders(&self) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        for (at, line) in self.body.iter().enumerate() {
+            for found in placeholders(line) {
+                let declared = self.params.iter().any(|p| p.name == found.name);
+                if !declared && !out.contains(&(at + 1, found.name)) {
+                    out.push((at + 1, found.name));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// What one declared parameter does to the command it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParamUse {
+    /// Substituted `count` times, on these 1-based body lines.
+    Used { lines: Vec<usize>, count: usize },
+    /// No name, so no placeholder can name it.
+    Blank,
+    /// An earlier parameter has the same name and takes every placeholder.
+    Duplicate,
+    /// No placeholder in the body names it.
+    Unused,
+}
+
+/// One `{{name}}` found in a body line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placeholder<'a> {
+    /// Byte range of the whole placeholder, braces included.
+    pub range: std::ops::Range<usize>,
+    /// The text between the braces, exactly as typed - case and spaces are
+    /// part of the name, as they always were when matching it.
+    pub name: &'a str,
+}
+
+/// Every placeholder on one line, left to right.
+///
+/// A name is anything between `{{` and `}}` that has no brace in it and is not
+/// only spaces. In a run of opening braces the last two open the placeholder,
+/// so `{{{g}}}` is a `{`, then `{{g}}`, then a `}` - what replacing `{{g}}` in
+/// the text always made of it. This is the one definition of a placeholder:
+/// substitution and the editor's checker both go through it, so they cannot
+/// disagree.
+pub fn placeholders(line: &str) -> impl Iterator<Item = Placeholder<'_>> {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while at + 1 < bytes.len() {
+            if bytes[at] != b'{' || bytes[at + 1] != b'{' {
+                at += 1;
+                continue;
+            }
+            let mut start = at;
+            while bytes.get(start + 2) == Some(&b'{') {
+                start += 1;
+            }
+            let name_start = start + 2;
+            // Braces are ASCII, so every index here is on a char boundary.
+            let Some(len) = line[name_start..].find(['{', '}']) else {
+                at = bytes.len();
+                return None;
+            };
+            let name_end = name_start + len;
+            let name = &line[name_start..name_end];
+            if line[name_end..].starts_with("}}") && !name.trim().is_empty() {
+                at = name_end + 2;
+                return Some(Placeholder {
+                    range: start..name_end + 2,
+                    name,
+                });
+            }
+            // Nothing before the brace that ended the name can open a
+            // placeholder, so the search resumes there.
+            at = name_end.max(at + 1);
+        }
+        None
+    })
 }
 
 /// One body line per line of text, blank lines dropped and each line trimmed.
@@ -639,6 +778,130 @@ mod tests {
         assert_eq!(
             m.expand(&[("global".into(), "X".into())]),
             vec!["ZWRITE ^{{typo}}".to_string()]
+        );
+    }
+
+    fn param(name: &str) -> Param {
+        Param {
+            name: name.into(),
+            prompt: name.into(),
+            default: "D".into(),
+        }
+    }
+
+    fn with_params(names: &[&str], body: &[&str]) -> Macro {
+        Macro {
+            params: names.iter().map(|n| param(n)).collect(),
+            body: body.iter().map(|l| l.to_string()).collect(),
+            ..Macro::default()
+        }
+    }
+
+    #[test]
+    fn a_blank_parameter_is_not_asked_for() {
+        let m = with_params(&["", "  "], &["Write 1"]);
+        assert_eq!(m.param_use(0), ParamUse::Blank);
+        assert_eq!(m.param_use(1), ParamUse::Blank);
+        assert!(!m.needs_input());
+        assert!(m.default_values().is_empty());
+    }
+
+    #[test]
+    fn a_parameter_no_placeholder_names_is_not_asked_for() {
+        let m = with_params(&["g"], &["ZWRITE ^{{G}}", "Write {{ g}}"]);
+        assert_eq!(m.param_use(0), ParamUse::Unused);
+        assert!(!m.needs_input());
+    }
+
+    #[test]
+    fn a_referenced_parameter_is_still_asked_for_and_the_others_are_not() {
+        let m = with_params(&["", "g", "unused"], &["Set ^{{g}} = 1", "ZWRITE ^{{g}}"]);
+        assert!(m.needs_input());
+        assert_eq!(
+            m.param_use(1),
+            ParamUse::Used {
+                lines: vec![1, 2],
+                count: 2
+            }
+        );
+        let asked: Vec<_> = m.usable_params().map(|p| p.name.as_str()).collect();
+        assert_eq!(asked, vec!["g"]);
+        assert_eq!(m.default_values(), vec![("g".into(), "D".into())]);
+    }
+
+    /// The second of two same-named parameters is never the one substituted,
+    /// so asking for it would be asking for a value that goes nowhere.
+    #[test]
+    fn a_second_parameter_of_the_same_name_is_not_asked_for() {
+        let m = with_params(&["g", "g"], &["ZWRITE ^{{g}}"]);
+        assert_eq!(m.param_use(1), ParamUse::Duplicate);
+        assert_eq!(m.usable_params().count(), 1);
+    }
+
+    #[test]
+    fn a_placeholder_without_a_parameter_is_reported_once_per_line() {
+        let m = with_params(&["g"], &["Set ^{{g}} = {{x}} + {{x}}", "Write {{y}}"]);
+        assert_eq!(m.undeclared_placeholders(), vec![(1, "x"), (2, "y")]);
+        assert_eq!(
+            m.expand(&m.default_values()),
+            vec![
+                "Set ^D = {{x}} + {{x}}".to_string(),
+                "Write {{y}}".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_braces_and_braces_inside_a_name_are_not_placeholders() {
+        let names: Vec<_> = placeholders("{{}} {{ }} {{a}b}} {{{g}}} {{h")
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["g"]);
+    }
+
+    /// Whatever the checker calls used is exactly what `expand` replaces, and
+    /// whatever it calls unused or undeclared survives expansion untouched.
+    #[test]
+    fn the_checker_and_expansion_agree() {
+        let bodies = [
+            "ZWRITE ^{{g}}",
+            "{{{g}}} {{G}} {{ g }} {{g }}",
+            "{{}} {{a}b}} {{g}}{{g}}",
+            "Set x = \"{{h}}\" Write {{undeclared}}",
+            "{{g",
+        ];
+        let names = ["g", "G", " g ", "h", "", "a}b", "absent"];
+        for body in bodies {
+            let m = with_params(&names, &[body]);
+            for (index, p) in m.params.iter().enumerate() {
+                let marker = format!("<{index}>");
+                let only_this = vec![(p.name.clone(), marker.clone())];
+                let substituted = m.expand(&only_this)[0].matches(&marker).count();
+                let expected = match m.param_use(index) {
+                    ParamUse::Used { count, .. } => count,
+                    // The names above are all different, so a duplicate here
+                    // would be the checker inventing one.
+                    ParamUse::Duplicate => panic!("{:?} is not a duplicate", p.name),
+                    ParamUse::Blank | ParamUse::Unused => 0,
+                };
+                assert_eq!(substituted, expected, "{:?} in {body:?}", p.name);
+            }
+            let expanded = m.expand(&m.default_values())[0].clone();
+            for (_, name) in m.undeclared_placeholders() {
+                assert!(
+                    expanded.contains(&format!("{{{{{name}}}}}")),
+                    "{name:?} vanished from {expanded:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_is_not_itself_expanded() {
+        let m = with_params(&["a", "b"], &["{{a}} {{b}}"]);
+        assert_eq!(
+            m.expand(&[("a".into(), "{{b}}".into()), ("b".into(), "B".into())]),
+            vec!["{{b}} B".to_string()]
         );
     }
 

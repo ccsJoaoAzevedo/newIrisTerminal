@@ -89,7 +89,122 @@ impl App {
         // session's own recall, and what the next start will inherit.
         tab.remember_command(&command);
         self.history.record(&command);
+        // The autocomplete learns from what was run, under the same guard as
+        // the history: a line that may not be recorded may not be learned
+        // from either.
+        self.vocabulary.harvest_line(&command);
         true
+    }
+
+    /// Enters the IRIS SQL shell from an ObjectScript prompt, or leaves it from
+    /// the shell's own. Ctrl+Shift+Q and the right-click menu.
+    ///
+    /// Typed into the session like anything else, because the shell is IRIS's:
+    /// whatever is half typed on the line is rubbed out first, then the
+    /// command goes in with its Enter. Nothing is switched on this side. The
+    /// prompt that comes back is what says which mode the tab is in - see
+    /// `Tab::sql` - so this can never disagree with the screen.
+    ///
+    /// Not recorded in the history: the user did not type it, and recalling it
+    /// would be recalling a menu click.
+    pub(super) fn toggle_sql_mode(&mut self, at: At) {
+        let Some(tab) = self.pane(at) else {
+            return;
+        };
+        if tab.profile.is_shell() || tab.session.is_none() {
+            self.set_status(tr("SQL mode needs an IRIS session."));
+            return;
+        }
+        let (Some(line), Some(prompt)) =
+            (lineedit::current(&tab.grid), lineedit::prompt(&tab.grid))
+        else {
+            self.set_status(tr("SQL mode can only be switched at a prompt."));
+            return;
+        };
+        let Some(command) = sql_switch(prompt) else {
+            self.set_status(tr(
+                "The SQL shell is in the middle of a multi-line statement. Finish it with GO first.",
+            ));
+            return;
+        };
+        let app_cursor = tab.grid.app_cursor_keys;
+        let encoding = tab.profile.wire_encoding();
+        let mut wire = cursor_bytes(line.end as i64 - line.cursor as i64, app_cursor);
+        wire.extend(std::iter::repeat_n(0x7f, line.len()));
+        wire.extend_from_slice(&encoding.encode(&format!("{command}\r")));
+        let wire = self.plugins.on_input(&wire);
+        if let Some(tab) = self.pane_mut(at) {
+            tab.view.clear_selection();
+            tab.view.scroll_to_bottom();
+            tab.recall_step = None;
+            tab.completion.close();
+            tab.send(&wire);
+        }
+    }
+
+    /// `/sql` submitted at an IRIS prompt switches SQL mode, the way it does in
+    /// WebTerminal, instead of reaching IRIS - which would only answer
+    /// `<SYNTAX>`.
+    ///
+    /// Any IRIS session, local or remote: unlike `/snake`, this is a command
+    /// rather than a joke, and the SQL shell is on every instance. At a shell
+    /// tab `/sql` could be a path, so it is left alone there. Answers whether
+    /// the line was the command, so the caller drops the Enter that would
+    /// otherwise run the rubbed-out line.
+    pub(super) fn take_sql_command(&mut self, at: At, unechoed: &str) -> bool {
+        let Some(tab) = self.pane(at) else {
+            return false;
+        };
+        if tab.profile.is_shell() {
+            return false;
+        }
+        let Some(typed) = lineedit::typed_text(&tab.grid) else {
+            return false;
+        };
+        // In the middle of a multi-line statement `/sql` is one more line of
+        // it, and the shell can say what it makes of that.
+        let continuing = lineedit::prompt(&tab.grid).is_some_and(|p| p.continuation());
+        if continuing || !is_sql_command(&format!("{typed}{unechoed}")) {
+            return false;
+        }
+        // The characters typed in this same frame never go out - the caller
+        // drops them with the Enter - so only what the screen shows is in
+        // IRIS's buffer to be rubbed out.
+        self.toggle_sql_mode(at);
+        true
+    }
+
+    /// Sends the suggestion selected in the autocomplete popup: the missing
+    /// part of the word, after rubbing out whatever was typed in the wrong case
+    /// for a name where case matters.
+    ///
+    /// Read against the screen again first. The popup was worked out from the
+    /// line as it was echoed, and if the cursor has since moved off the end of
+    /// it - or the prompt has gone - the suffix would land somewhere it was
+    /// never meant for.
+    pub(super) fn accept_completion(&mut self, at: At) {
+        let Some(tab) = self.pane(at) else {
+            return;
+        };
+        let edit = tab.completion.popup().and_then(autocomplete::Popup::edit);
+        let at_end = lineedit::current(&tab.grid).is_some_and(|line| line.at_end());
+        let encoding = tab.profile.wire_encoding();
+        let wire = match edit {
+            Some(edit) if at_end => {
+                let mut wire = vec![0x7f; edit.rubouts];
+                wire.extend_from_slice(&encoding.encode(&edit.insert));
+                Some(self.plugins.on_input(&wire))
+            }
+            _ => None,
+        };
+        if let Some(tab) = self.pane_mut(at) {
+            tab.completion.close();
+            if let Some(wire) = wire {
+                tab.recall_step = None;
+                tab.view.scroll_to_bottom();
+                tab.send(&wire);
+            }
+        }
     }
 
     /// The easter egg: `/snake` submitted at a local IRIS prompt opens the
@@ -599,9 +714,58 @@ fn is_easter_egg(typed: &str) -> bool {
     typed.trim().eq_ignore_ascii_case(SNAKE_COMMAND)
 }
 
+/// What switches SQL mode when submitted at a prompt, as WebTerminal spells it.
+const SQL_COMMAND: &str = "/sql";
+
+fn is_sql_command(typed: &str) -> bool {
+    typed.trim().eq_ignore_ascii_case(SQL_COMMAND)
+}
+
+/// What enters the SQL shell. The method rather than the `:sql` alias, which
+/// only the newer versions have; this one is on every instance the team runs.
+const ENTER_SQL_SHELL: &str = "do $SYSTEM.SQL.Shell()";
+
+/// What leaves it.
+const LEAVE_SQL_SHELL: &str = "quit";
+
+/// The line that switches SQL mode from the prompt the session is at, or
+/// `None` where nothing can: on a continuation line of a multi-line statement
+/// `quit` would only be one more line of it.
+fn sql_switch(prompt: crate::term::syntax::Prompt) -> Option<&'static str> {
+    if prompt.continuation() {
+        None
+    } else if prompt.sql {
+        Some(LEAVE_SQL_SHELL)
+    } else {
+        Some(ENTER_SQL_SHELL)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompt(text: &str) -> crate::term::syntax::Prompt {
+        let chars: Vec<char> = text.chars().collect();
+        crate::term::syntax::prompt_in(&chars).expect("a prompt")
+    }
+
+    #[test]
+    fn the_sql_switch_enters_from_objectscript_and_leaves_from_the_shell() {
+        assert_eq!(sql_switch(prompt("USER>")), Some(ENTER_SQL_SHELL));
+        assert_eq!(sql_switch(prompt("USER>>")), Some(LEAVE_SQL_SHELL));
+        assert_eq!(sql_switch(prompt("[SQL]USER>>")), Some(LEAVE_SQL_SHELL));
+        assert_eq!(sql_switch(prompt("2>>")), None, "mid-statement");
+    }
+
+    #[test]
+    fn slash_sql_is_the_whole_line_and_nothing_else() {
+        assert!(is_sql_command("/sql"));
+        assert!(is_sql_command(" /SQL "));
+        assert!(!is_sql_command("w /sql"));
+        assert!(!is_sql_command("/sqlx"));
+        assert!(!is_sql_command("sql"));
+    }
 
     #[test]
     fn the_egg_is_the_whole_line_and_nothing_else() {

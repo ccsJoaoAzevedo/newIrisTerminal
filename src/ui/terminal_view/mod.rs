@@ -35,6 +35,7 @@ use mouse::handle_mouse;
 use paint::{paint_row, syntax_overrides};
 pub use pieces::{GlobalTarget, KeySelection, PieceSelection};
 use scroll::{autoscroll_lines, h_scrollbar, scroll_lines, scrollbar, SCROLLBAR_WIDTH};
+pub use scroll::{gradient_end, handle_colour, track_colour};
 
 /// Everything about how the grid should be drawn that is not the grid itself.
 ///
@@ -71,6 +72,13 @@ pub struct RenderOpts {
     /// wraps into a hundred display rows of blanks. Shells therefore get the
     /// window's own width, which is what they are drawing into anyway.
     pub wide_grid: bool,
+    /// Colour a line typed at the SQL shell's prompt as SQL. See
+    /// [`crate::term::syntax::scan_row`].
+    pub sql_syntax: bool,
+    /// Whether the session is in the SQL shell, for the right-click entry that
+    /// enters or leaves it. `None` hides the entry: a shell has no SQL shell
+    /// to enter.
+    pub sql_mode: Option<bool>,
 }
 
 impl Default for RenderOpts {
@@ -86,6 +94,8 @@ impl Default for RenderOpts {
             copy_on_select: false,
             intellisense: IntellisenseMode::default(),
             wide_grid: true,
+            sql_syntax: true,
+            sql_mode: None,
         }
     }
 }
@@ -377,6 +387,9 @@ pub struct RenderResult {
     /// tooltip, and `None` whenever the pointer is over anything else or the
     /// tooltip is switched off.
     pub piece_hover: Option<GlobalTarget>,
+    /// The cursor's cell on screen, while this pane has the keyboard and the
+    /// cursor is in view. What the autocomplete popup is anchored to.
+    pub caret: Option<Rect>,
 }
 
 /// Draws the grid into the remaining space of `ui`.
@@ -468,7 +481,15 @@ pub fn show(
     }
 
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, theme.background);
+    // Cells left at the default background are not filled by `paint_row`, so
+    // a gradient laid here shows through every one of them, and a cell IRIS
+    // coloured on purpose still covers it.
+    match theme.background_gradient.as_ref() {
+        Some(gradient) => crate::ui::shading::ui_gradient(&painter, rect, gradient),
+        None => {
+            painter.rect_filled(rect, 0.0, theme.background);
+        }
+    }
 
     let total = grid.total_lines();
     let cursor_line = grid.scrollback.len() + grid.cursor.row;
@@ -639,7 +660,7 @@ pub fn show(
                     // walk every one of the grid's columns.
                     overrides.clear();
                 } else {
-                    syntax_overrides(&row.cells, theme, &mut overrides);
+                    syntax_overrides(&row.cells, opts.sql_syntax, theme, &mut overrides);
                 }
             }
             let y = rect.top() + screen_row as f32 * cell.y;
@@ -771,21 +792,24 @@ pub fn show(
     // Only the pane holding the keyboard says it, and only until something with
     // a real text field - a dialog's own `TextEdit`, drawn later in the frame -
     // says otherwise.
+    let caret = response
+        .has_focus()
+        .then(|| wrap::row_of(&segments, mode, cursor_line, grid.cursor.col))
+        .flatten()
+        .map(|screen_row| {
+            let offset = grid.cursor.col.saturating_sub(segments[screen_row].start);
+            Rect::from_min_size(
+                Pos2::new(
+                    glyph_x(rect.left(), offset, cell),
+                    rect.top() + screen_row as f32 * cell.y,
+                ),
+                cell,
+            )
+        });
     if response.has_focus() {
-        let caret = wrap::row_of(&segments, mode, cursor_line, grid.cursor.col)
-            .map(|screen_row| {
-                let offset = grid.cursor.col.saturating_sub(segments[screen_row].start);
-                Rect::from_min_size(
-                    Pos2::new(
-                        glyph_x(rect.left(), offset, cell),
-                        rect.top() + screen_row as f32 * cell.y,
-                    ),
-                    cell,
-                )
-            })
-            // Off screen: the top-left of the terminal is where a candidate
-            // window is least in the way.
-            .unwrap_or_else(|| Rect::from_min_size(rect.min, cell));
+        // Off screen: the top-left of the terminal is where a candidate
+        // window is least in the way.
+        let caret = caret.unwrap_or_else(|| Rect::from_min_size(rect.min, cell));
         ui.ctx().output_mut(|o| {
             o.ime = Some(egui::output::IMEOutput {
                 rect,
@@ -891,6 +915,23 @@ pub fn show(
             context_action = Some(ContextAction::ClearTerminal);
             ui.close_menu();
         }
+        // Read off the prompt rather than remembered, so it is right however
+        // the shell was entered - this entry, `/sql`, or `:sql` typed by hand.
+        if let Some(in_sql) = opts.sql_mode {
+            let label = if in_sql {
+                tr("Leave SQL mode")
+            } else {
+                tr("SQL mode")
+            };
+            if ui
+                .button(label)
+                .on_hover_text(tr("Ctrl+Shift+Q, or /sql at the prompt. Runs the IRIS SQL shell, which formats the results itself; quit leaves it."))
+                .clicked()
+            {
+                context_action = Some(ContextAction::ToggleSqlMode);
+                ui.close_menu();
+            }
+        }
         // The layout of the tab this pane is in, offered where the pane is
         // rather than only up in the strip: splitting is something you decide
         // while looking at the output, not while looking at the tab's name.
@@ -949,6 +990,7 @@ pub fn show(
         view_rows: rows,
         cell,
         piece_hover,
+        caret,
     }
 }
 

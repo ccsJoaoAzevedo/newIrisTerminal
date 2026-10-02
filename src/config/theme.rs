@@ -1,6 +1,6 @@
 //! Colour and font definitions.
 //!
-//! The built-ins below live in the binary and are immutable: the theme manager
+//! The built-ins below live in the binary and are immutable: the Themes page
 //! duplicates one to give the user something to edit. A duplicate is a plain
 //! TOML file under `<config>/themes/`, and dropping a file in that folder by
 //! hand makes it selectable just the same.
@@ -178,12 +178,17 @@ pub enum WindowButtonSlot {
 
 /// One of the things a theme lays out along the title bar.
 ///
-/// `Tabs` is the stretch in the middle - the tabs when they share the title
-/// bar, the session's own line when they do not - and it is what splits the
-/// row: whatever comes before it sits at the left-hand end, whatever comes
-/// after it at the right. The gear, the `+` and the middle can be placed but
-/// not hidden: the gear is the only way into Settings, the `+` the only way to
-/// the server menu, and the middle is where the window is dragged by.
+/// `Tabs` is the tabs when they share the title bar, the session's own line
+/// when they do not. The two spaces are not drawn at all: they are where the
+/// empty, draggable stretch of the bar goes, and they are what split the row.
+/// Whatever comes before `LeftSpace` packs against the left-hand end, whatever
+/// comes after `RightSpace` against the right, and anything between the two is
+/// centred. Without them the tabs had to be the split, so nothing could sit
+/// just after the last tab - a `+` put there went to the far corner.
+///
+/// The gear, the `+`, the tabs and the spaces can be placed but not hidden:
+/// the gear is the only way into Settings, the `+` the only way to the server
+/// menu, and the spaces are where the window is dragged by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TitleButton {
     Close,
@@ -194,10 +199,12 @@ pub enum TitleButton {
     Settings,
     NewTab,
     Tabs,
+    LeftSpace,
+    RightSpace,
 }
 
 impl TitleButton {
-    pub const ALL: [TitleButton; 7] = [
+    pub const ALL: [TitleButton; 9] = [
         TitleButton::Close,
         TitleButton::Minimize,
         TitleButton::Maximize,
@@ -205,7 +212,14 @@ impl TitleButton {
         TitleButton::Settings,
         TitleButton::NewTab,
         TitleButton::Tabs,
+        TitleButton::LeftSpace,
+        TitleButton::RightSpace,
     ];
+
+    /// Whether this is one of the two stretches rather than something drawn.
+    pub fn is_space(self) -> bool {
+        matches!(self, TitleButton::LeftSpace | TitleButton::RightSpace)
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -216,6 +230,8 @@ impl TitleButton {
             TitleButton::Settings => "settings",
             TitleButton::NewTab => "new_tab",
             TitleButton::Tabs => "tabs",
+            TitleButton::LeftSpace => "left_space",
+            TitleButton::RightSpace => "right_space",
         }
     }
 
@@ -229,37 +245,96 @@ impl TitleButton {
 /// Everything on the title bar, left to right as drawn. Always all of it:
 /// hiding a button is the `show_*` flags' business, so one switched back on
 /// returns to the place it was given rather than to the end.
-pub type ButtonOrder = [TitleButton; 7];
+pub type ButtonOrder = [TitleButton; 9];
 
 /// The layout from before a theme could choose one. `left` is the old
 /// `window_buttons_left`, which is how a theme written then still opens the
 /// way it always did: close at the outer corner either way, and the gear on
-/// the inside beside minimize.
+/// the inside beside minimize. The spaces sit straight after the tabs, which
+/// is where the empty stretch of the bar always was.
 pub fn default_order(left: bool) -> ButtonOrder {
     use TitleButton::*;
     if left {
-        [Close, OnTop, Minimize, Maximize, Settings, NewTab, Tabs]
+        [
+            Close, OnTop, Minimize, Maximize, Settings, NewTab, Tabs, LeftSpace, RightSpace,
+        ]
     } else {
-        [NewTab, Tabs, Settings, Minimize, Maximize, OnTop, Close]
+        [
+            NewTab, Tabs, LeftSpace, RightSpace, Settings, Minimize, Maximize, OnTop, Close,
+        ]
     }
 }
 
 /// Reads an order from a theme file. Unknown names and repeats are dropped,
 /// and whatever the file left out goes back at the place the usual order has
 /// it, so a hand-edited list can never lose a button - least of all the gear.
+///
+/// The spaces go back by a rule of their own. A theme written before they
+/// existed split the bar at the tabs, so both go straight after them, which
+/// lays it out exactly as it was; one that names only one of them gets the
+/// other beside it. The left one always comes first, since two stretches the
+/// other way round would describe the same bar.
 fn resolve_order(names: &[String], left: bool) -> ButtonOrder {
-    let mut order: Vec<TitleButton> = Vec::with_capacity(7);
+    use TitleButton::*;
+    let mut order: Vec<TitleButton> = Vec::with_capacity(TitleButton::ALL.len());
     for button in names.iter().filter_map(|n| TitleButton::from_name(n)) {
         if !order.contains(&button) {
             order.push(button);
         }
     }
-    for (at, button) in default_order(left).into_iter().enumerate() {
-        if !order.contains(&button) {
-            order.insert(at.min(order.len()), button);
+    // Counted among the drawn buttons only, so a space in the file does not
+    // shift where a missing button goes back to.
+    let drawn = default_order(left).into_iter().filter(|b| !b.is_space());
+    for (at, button) in drawn.enumerate() {
+        if order.contains(&button) {
+            continue;
         }
+        let index = order
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !b.is_space())
+            .nth(at)
+            .map_or(order.len(), |(i, _)| i);
+        order.insert(index, button);
+    }
+    let find = |order: &[TitleButton], wanted| order.iter().position(|b| *b == wanted);
+    match (find(&order, LeftSpace), find(&order, RightSpace)) {
+        (None, None) => {
+            let tabs = find(&order, Tabs).expect("the tabs were put back");
+            order.insert(tabs + 1, LeftSpace);
+            order.insert(tabs + 2, RightSpace);
+        }
+        (Some(left), None) => order.insert(left + 1, RightSpace),
+        (None, Some(right)) => order.insert(right, LeftSpace),
+        (Some(left), Some(right)) if right < left => order.swap(left, right),
+        _ => {}
     }
     order.try_into().expect("every button exactly once")
+}
+
+/// Moves the item at `from` to `to`, shifting everything between them along,
+/// the way a dragged row lands in a list.
+///
+/// The two spaces are interchangeable - each is just a stretch of bar - so a
+/// move that would put the right one before the left swaps their names
+/// instead: what the bar looks like is the same, and `leading`, `middle` and
+/// `trailing` can go on assuming the left one comes first.
+pub fn move_in_order(order: &mut ButtonOrder, from: usize, to: usize) {
+    if from >= order.len() || to >= order.len() || from == to {
+        return;
+    }
+    if from < to {
+        order[from..=to].rotate_left(1);
+    } else {
+        order[to..=from].rotate_right(1);
+    }
+    let left = order.iter().position(|b| *b == TitleButton::LeftSpace);
+    let right = order.iter().position(|b| *b == TitleButton::RightSpace);
+    if let (Some(left), Some(right)) = (left, right) {
+        if right < left {
+            order.swap(left, right);
+        }
+    }
 }
 
 /// Resolved appearance of the three window controls.
@@ -307,24 +382,37 @@ pub struct WindowButtons {
     /// end of the row - and the two are the marks people actually aim at, so
     /// both are worth a theme being able to pick out.
     pub new_tab: Option<Color32>,
+    /// The always-on-top pin. Unset follows the gear, which is what it was
+    /// painted in before it had a slot: the two sit together on most bars, but
+    /// a theme can now tell them apart.
+    pub on_top: Option<Color32>,
+    /// The cross inside each tab. Unset is the tab's own ink under the stroked
+    /// style and the close colour under the others, as it always was.
+    pub close_tab: Option<Color32>,
 }
 
 impl WindowButtons {
-    /// What sits at the left-hand end of the bar, left to right.
+    /// What packs against the left-hand end of the bar, left to right.
     pub fn leading(&self) -> &[TitleButton] {
-        &self.order[..self.tabs_at()]
+        &self.order[..self.space_at(TitleButton::LeftSpace)]
     }
 
-    /// What sits at the right-hand end of the bar, left to right.
+    /// What is centred between the two spaces, left to right.
+    pub fn middle(&self) -> &[TitleButton] {
+        let from = self.space_at(TitleButton::LeftSpace) + 1;
+        &self.order[from..self.space_at(TitleButton::RightSpace)]
+    }
+
+    /// What packs against the right-hand end of the bar, left to right.
     pub fn trailing(&self) -> &[TitleButton] {
-        &self.order[self.tabs_at() + 1..]
+        &self.order[self.space_at(TitleButton::RightSpace) + 1..]
     }
 
-    fn tabs_at(&self) -> usize {
+    fn space_at(&self, space: TitleButton) -> usize {
         self.order
             .iter()
-            .position(|b| *b == TitleButton::Tabs)
-            .expect("the order always holds the tabs")
+            .position(|b| *b == space)
+            .expect("the order always holds both spaces")
     }
 
     /// Whether `button` is drawn at all, before any setting has its say.
@@ -334,7 +422,11 @@ impl WindowButtons {
             TitleButton::Minimize => self.show_minimize,
             TitleButton::Maximize => self.show_maximize,
             TitleButton::OnTop => self.show_on_top,
-            TitleButton::Settings | TitleButton::NewTab | TitleButton::Tabs => true,
+            TitleButton::Settings
+            | TitleButton::NewTab
+            | TitleButton::Tabs
+            | TitleButton::LeftSpace
+            | TitleButton::RightSpace => true,
         }
     }
 }
@@ -357,6 +449,8 @@ impl Default for WindowButtons {
             hover_close: None,
             settings: None,
             new_tab: None,
+            on_top: None,
+            close_tab: None,
         }
     }
 }
@@ -615,12 +709,47 @@ pub struct ThemeFile {
     pub settings_icon: String,
     #[serde(default)]
     pub new_tab_icon: String,
+    /// The always-on-top pin and the cross inside each tab. Empty leaves the
+    /// pin following the gear and the cross following the tab's ink (or the
+    /// close colour, under a filled style).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_top_icon: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub close_tab_icon: String,
+    /// The selected tab's fill and text. Empty leaves both to the widget
+    /// colours, which is how every tab was drawn before these existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tab_selected: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tab_selected_text: String,
     /// The terminal's scroll handle. Empty leaves it derived from the selection
     /// and foreground colours, which is what every theme did before this - and
     /// what still happens under the stroked button style, where there is no
     /// period look to match.
     #[serde(default)]
     pub scrollbar_handle: String,
+    /// The strip the handle runs in. Empty is the background lifted a little
+    /// towards the foreground, as it always was.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scrollbar_track: String,
+    /// A gradient along the handle and the track instead of flat fills:
+    /// `vertical`, `horizontal` or `diagonal`, read as the vertical bar sees
+    /// it. Each one runs from its own colour above to the `_to` colour here;
+    /// an empty `_to` is its colour darkened.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scrollbar_gradient: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scrollbar_handle_to: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scrollbar_track_to: String,
+    /// A gradient behind the terminal's text instead of `background`. Cells
+    /// IRIS gave a background colour of their own keep it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub background_gradient: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub background_gradient_from: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub background_gradient_to: String,
     #[serde(default = "default_font_family")]
     pub font_family: String,
     #[serde(default = "default_font_size")]
@@ -693,7 +822,18 @@ impl Default for ThemeFile {
             window_button_hover_close: String::new(),
             settings_icon: String::new(),
             new_tab_icon: String::new(),
+            on_top_icon: String::new(),
+            close_tab_icon: String::new(),
+            tab_selected: String::new(),
+            tab_selected_text: String::new(),
             scrollbar_handle: String::new(),
+            scrollbar_track: String::new(),
+            scrollbar_gradient: String::new(),
+            scrollbar_handle_to: String::new(),
+            scrollbar_track_to: String::new(),
+            background_gradient: String::new(),
+            background_gradient_from: String::new(),
+            background_gradient_to: String::new(),
             font_family: default_font_family(),
             font_size: default_font_size(),
             dark: true,
@@ -736,7 +876,19 @@ fn window_buttons(file: &ThemeFile) -> WindowButtons {
         hover_close: parse_hex(&file.window_button_hover_close),
         settings: parse_hex(&file.settings_icon),
         new_tab: parse_hex(&file.new_tab_icon),
+        on_top: parse_hex(&file.on_top_icon),
+        close_tab: parse_hex(&file.close_tab_icon),
     }
+}
+
+/// A gradient read from a direction and two ends, either of which falls back
+/// to `flat`. `None` when the direction is empty or unrecognised.
+fn read_gradient(direction: &str, from: &str, to: &str, flat: Color32) -> Option<UiGradient> {
+    GradientDirection::from_name(direction).map(|direction| UiGradient {
+        direction,
+        from: parse_hex(from).unwrap_or(flat),
+        to: parse_hex(to).unwrap_or(flat),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -771,10 +923,24 @@ pub struct Theme {
     /// Colour of the terminal's scroll handle, when the theme names one or its
     /// button style implies one.
     pub scrollbar_handle: Option<Color32>,
+    /// The strip the scroll handle runs in, when the theme names one.
+    pub scrollbar_track: Option<Color32>,
+    /// Which way the handle and the track are shaded, as the vertical bar sees
+    /// it; `None` paints both flat.
+    pub scrollbar_gradient: Option<GradientDirection>,
+    /// Where the handle's and the track's gradients end. Unset is their own
+    /// colour darkened, so switching a gradient on already shows one.
+    pub scrollbar_handle_to: Option<Color32>,
+    pub scrollbar_track_to: Option<Color32>,
+    /// The selected tab's fill and text, when the theme names them.
+    pub tab_selected: Option<Color32>,
+    pub tab_selected_text: Option<Color32>,
+    /// Behind the terminal's text in place of the flat `background`.
+    pub background_gradient: Option<UiGradient>,
     pub font_family: String,
     pub font_size: f32,
     pub dark: bool,
-    /// Shipped with the app, so the theme manager will not let it be edited or
+    /// Shipped with the app, so the Themes pages will not let it be edited or
     /// deleted. Never read from the file: a built-in is one because it came out
     /// of [`builtin_files`], not because a file claimed to be one.
     pub builtin: bool,
@@ -811,14 +977,24 @@ impl Theme {
             selection: parse_hex(&file.selection).unwrap_or(Color32::DARK_BLUE),
             ui_foreground: parse_hex(&file.ui_foreground).unwrap_or(foreground),
             ui_background: parse_hex(&file.ui_background).unwrap_or(background),
-            ui_gradient: GradientDirection::from_name(&file.ui_gradient).map(|direction| {
-                let flat = parse_hex(&file.ui_background).unwrap_or(background);
-                UiGradient {
-                    direction,
-                    from: parse_hex(&file.ui_gradient_from).unwrap_or(flat),
-                    to: parse_hex(&file.ui_gradient_to).unwrap_or(flat),
-                }
-            }),
+            ui_gradient: read_gradient(
+                &file.ui_gradient,
+                &file.ui_gradient_from,
+                &file.ui_gradient_to,
+                parse_hex(&file.ui_background).unwrap_or(background),
+            ),
+            background_gradient: read_gradient(
+                &file.background_gradient,
+                &file.background_gradient_from,
+                &file.background_gradient_to,
+                background,
+            ),
+            scrollbar_track: parse_hex(&file.scrollbar_track),
+            scrollbar_gradient: GradientDirection::from_name(&file.scrollbar_gradient),
+            scrollbar_handle_to: parse_hex(&file.scrollbar_handle_to),
+            scrollbar_track_to: parse_hex(&file.scrollbar_track_to),
+            tab_selected: parse_hex(&file.tab_selected),
+            tab_selected_text: parse_hex(&file.tab_selected_text),
             ui_border: parse_hex(&file.ui_border),
             // Every syntax colour falls back to the ObjectScript palette
             // rather than to a terminal colour: a theme that says nothing about
@@ -863,7 +1039,7 @@ impl Theme {
         }
     }
 
-    /// Marks this theme as one of the app's own, which the theme manager holds
+    /// Marks this theme as one of the app's own, which the Themes pages hold
     /// immutable.
     pub fn as_builtin(mut self) -> Self {
         self.builtin = true;
@@ -931,10 +1107,35 @@ impl Theme {
             window_button_hover_close: hex_or_empty(self.window_buttons.hover_close),
             settings_icon: hex_or_empty(self.window_buttons.settings),
             new_tab_icon: hex_or_empty(self.window_buttons.new_tab),
+            on_top_icon: hex_or_empty(self.window_buttons.on_top),
+            close_tab_icon: hex_or_empty(self.window_buttons.close_tab),
+            tab_selected: hex_or_empty(self.tab_selected),
+            tab_selected_text: hex_or_empty(self.tab_selected_text),
             scrollbar_handle: hex_or_empty(self.scrollbar_handle),
+            scrollbar_track: hex_or_empty(self.scrollbar_track),
+            scrollbar_gradient: self
+                .scrollbar_gradient
+                .map(|d| d.name().to_string())
+                .unwrap_or_default(),
+            scrollbar_handle_to: hex_or_empty(self.scrollbar_handle_to),
+            scrollbar_track_to: hex_or_empty(self.scrollbar_track_to),
+            background_gradient: self
+                .background_gradient
+                .map(|g| g.direction.name().to_string())
+                .unwrap_or_default(),
+            background_gradient_from: self
+                .background_gradient
+                .map(|g| to_hex(g.from))
+                .unwrap_or_default(),
+            background_gradient_to: self
+                .background_gradient
+                .map(|g| to_hex(g.to))
+                .unwrap_or_default(),
             font_family: self.font_family.clone(),
             font_size: self.font_size,
-            dark: self.dark,
+            // Written as the background says, which is what `visuals` goes by:
+            // a file whose flag disagreed would mislead whoever reads it.
+            dark: is_dark(self.ui_background),
             // Anything serialised back out of a runtime theme is the user's
             // copy, never one we may overwrite on the next run.
             builtin: false,
@@ -969,7 +1170,13 @@ impl Theme {
     /// egui visuals that agree with the terminal colours, so the tab strip and
     /// dialogs do not fight the grid.
     pub fn visuals(&self) -> egui::Visuals {
-        let mut v = if self.dark {
+        // Read off the chrome's own background rather than the `dark` flag.
+        // Every colour the flag used to decide is set from the theme below, so
+        // all it still chose was the handful egui keeps to itself - shadows,
+        // links, the faint stripe of a striped grid - and a flag that
+        // disagreed with the background got those wrong while looking like it
+        // did nothing at all.
+        let mut v = if is_dark(self.ui_background) {
             egui::Visuals::dark()
         } else {
             egui::Visuals::light()
@@ -1031,6 +1238,12 @@ impl Theme {
         }
         v
     }
+}
+
+/// Whether a background is dark enough that egui's dark widget set suits it.
+pub fn is_dark(color: Color32) -> bool {
+    let luma = 0.2126 * color.r() as f32 + 0.7152 * color.g() as f32 + 0.0722 * color.b() as f32;
+    luma < 128.0
 }
 
 /// xterm's standard 16, used for any slot a theme leaves unspecified.
@@ -1555,17 +1768,93 @@ mod tests {
         let mut theme = Theme::from_file(&ThemeFile::default());
         assert!(theme.to_file().window_button_order.is_empty());
         use TitleButton::*;
-        let chosen = [Close, Tabs, Maximize, Minimize, NewTab, Settings, OnTop];
+        let chosen = [
+            Close, Tabs, LeftSpace, Maximize, RightSpace, Minimize, NewTab, Settings, OnTop,
+        ];
         theme.window_buttons.order = chosen;
         theme.window_buttons.show_on_top = false;
         let back = Theme::from_file(&theme.to_file()).window_buttons;
         assert_eq!(back.order, chosen);
-        assert_eq!(back.leading(), [Close]);
+        assert_eq!(back.leading(), [Close, Tabs]);
+        assert_eq!(back.middle(), [Maximize]);
+        assert_eq!(back.trailing(), [Minimize, NewTab, Settings, OnTop]);
+        assert!(!back.show_on_top);
+    }
+
+    #[test]
+    fn an_order_written_before_the_spaces_splits_the_bar_at_the_tabs_as_it_did() {
+        let names = [
+            "close", "tabs", "maximize", "minimize", "new_tab", "settings", "on_top",
+        ]
+        .map(String::from);
+        let order = resolve_order(&names, false);
+        let buttons = WindowButtons {
+            order,
+            ..WindowButtons::default()
+        };
+        use TitleButton::*;
+        assert_eq!(buttons.leading(), [Close, Tabs]);
+        assert!(buttons.middle().is_empty());
         assert_eq!(
-            back.trailing(),
+            buttons.trailing(),
             [Maximize, Minimize, NewTab, Settings, OnTop]
         );
-        assert!(!back.show_on_top);
+    }
+
+    #[test]
+    fn the_plus_can_sit_just_after_the_tabs_instead_of_in_the_corner() {
+        let mut buttons = WindowButtons::default();
+        use TitleButton::*;
+        // The usual order has the + before the tabs; drag it past them.
+        let from = buttons.order.iter().position(|b| *b == NewTab).unwrap();
+        let tabs = buttons.order.iter().position(|b| *b == Tabs).unwrap();
+        move_in_order(&mut buttons.order, from, tabs);
+        assert_eq!(buttons.leading(), [Tabs, NewTab]);
+        assert!(!buttons.trailing().contains(&NewTab));
+    }
+
+    #[test]
+    fn a_file_naming_one_space_gets_the_other_beside_it() {
+        use TitleButton::*;
+        let only_right = ["tabs", "right_space", "close"].map(String::from);
+        let order = resolve_order(&only_right, false);
+        let left = order.iter().position(|b| *b == LeftSpace).unwrap();
+        assert_eq!(order[left + 1], RightSpace);
+        let only_left = ["left_space", "tabs"].map(String::from);
+        let order = resolve_order(&only_left, false);
+        let left = order.iter().position(|b| *b == LeftSpace).unwrap();
+        assert_eq!(order[left + 1], RightSpace);
+    }
+
+    #[test]
+    fn the_left_space_always_comes_first_however_the_rows_are_dragged() {
+        use TitleButton::*;
+        let mut order = default_order(false);
+        let right = order.iter().position(|b| *b == RightSpace).unwrap();
+        move_in_order(&mut order, right, 0);
+        let l = order.iter().position(|b| *b == LeftSpace).unwrap();
+        let r = order.iter().position(|b| *b == RightSpace).unwrap();
+        assert!(l < r);
+        assert_eq!(l, 0, "the stretch moved; only the names were swapped");
+        let reversed = ["right_space", "tabs", "left_space"].map(String::from);
+        let order = resolve_order(&reversed, false);
+        let l = order.iter().position(|b| *b == LeftSpace).unwrap();
+        let r = order.iter().position(|b| *b == RightSpace).unwrap();
+        assert!(l < r);
+    }
+
+    #[test]
+    fn a_dragged_row_lands_where_it_was_dropped_and_the_rest_close_up() {
+        use TitleButton::*;
+        let mut order = default_order(false);
+        // [NewTab, Tabs, LeftSpace, RightSpace, Settings, Minimize, Maximize, OnTop, Close]
+        move_in_order(&mut order, 8, 0);
+        assert_eq!(order[0], Close);
+        assert_eq!(order[1], NewTab);
+        move_in_order(&mut order, 0, 8);
+        assert_eq!(order, default_order(false));
+        move_in_order(&mut order, 3, 99);
+        assert_eq!(order, default_order(false), "out of range is ignored");
     }
 
     #[test]
@@ -1593,7 +1882,7 @@ mod tests {
         use TitleButton::*;
         assert_eq!(
             buttons.leading(),
-            [Close, OnTop, Minimize, Maximize, Settings, NewTab]
+            [Close, OnTop, Minimize, Maximize, Settings, NewTab, Tabs]
         );
         assert!(buttons.trailing().is_empty());
     }
@@ -1634,6 +1923,61 @@ mod tests {
             Color32::TRANSPARENT,
             "menus stay readable"
         );
+    }
+
+    #[test]
+    fn the_new_colour_slots_round_trip_and_an_old_theme_has_none_of_them() {
+        let old = Theme::from_file(&ThemeFile::default());
+        assert!(old.window_buttons.on_top.is_none());
+        assert!(old.window_buttons.close_tab.is_none());
+        assert!(old.tab_selected.is_none() && old.tab_selected_text.is_none());
+        assert!(old.scrollbar_track.is_none() && old.scrollbar_gradient.is_none());
+        assert!(old.background_gradient.is_none());
+        let file = old.to_file();
+        assert!(file.on_top_icon.is_empty() && file.background_gradient.is_empty());
+
+        let mut theme = old;
+        theme.window_buttons.on_top = parse_hex("#112233");
+        theme.window_buttons.close_tab = parse_hex("#223344");
+        theme.tab_selected = parse_hex("#334455");
+        theme.tab_selected_text = parse_hex("#445566");
+        theme.scrollbar_track = parse_hex("#556677");
+        theme.scrollbar_gradient = Some(GradientDirection::Horizontal);
+        theme.scrollbar_handle_to = parse_hex("#667788");
+        theme.scrollbar_track_to = parse_hex("#778899");
+        theme.background_gradient = Some(UiGradient {
+            direction: GradientDirection::Diagonal,
+            from: c("#000011"),
+            to: c("#110000"),
+        });
+        let back = Theme::from_file(&theme.to_file());
+        assert_eq!(back.window_buttons.on_top, theme.window_buttons.on_top);
+        assert_eq!(
+            back.window_buttons.close_tab,
+            theme.window_buttons.close_tab
+        );
+        assert_eq!(back.tab_selected, theme.tab_selected);
+        assert_eq!(back.tab_selected_text, theme.tab_selected_text);
+        assert_eq!(back.scrollbar_track, theme.scrollbar_track);
+        assert_eq!(back.scrollbar_gradient, theme.scrollbar_gradient);
+        assert_eq!(back.scrollbar_handle_to, theme.scrollbar_handle_to);
+        assert_eq!(back.scrollbar_track_to, theme.scrollbar_track_to);
+        assert_eq!(back.background_gradient, theme.background_gradient);
+    }
+
+    #[test]
+    fn the_widget_base_follows_the_chrome_background_not_the_flag() {
+        let mut theme = Theme::from_file(&ThemeFile::default());
+        theme.ui_background = c("#f4f4f4");
+        theme.dark = true;
+        assert!(!theme.visuals().dark_mode);
+        assert!(
+            !theme.to_file().dark,
+            "the file says what the background says"
+        );
+        theme.ui_background = c("#101010");
+        theme.dark = false;
+        assert!(theme.visuals().dark_mode);
     }
 
     #[test]

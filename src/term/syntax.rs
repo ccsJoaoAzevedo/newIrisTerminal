@@ -79,7 +79,7 @@ pub struct Span {
 
 /// Command words and the abbreviations IRIS accepts for them. Matched
 /// case-insensitively, and only on a command line — see the module docs.
-const COMMANDS: &[&str] = &[
+pub(crate) const COMMANDS: &[&str] = &[
     "b",
     "break",
     "c",
@@ -174,8 +174,36 @@ pub fn scan(cells: &[Cell]) -> Vec<Span> {
     scan_chars(&chars)
 }
 
+/// [`scan`], except that a row sitting at the IRIS SQL shell's prompt has
+/// what was typed on it read as SQL rather than as ObjectScript, when `sql`
+/// allows it.
+///
+/// Decided per row, off the prompt that row carries, rather than from any
+/// mode the app keeps: a statement scrolled into the history stays coloured
+/// as the SQL it was, and a shell the user entered by typing `:sql`
+/// themselves is coloured the same as one the app entered for them.
+pub fn scan_row(cells: &[Cell], sql: bool) -> Vec<Span> {
+    let chars: Vec<char> = cells.iter().map(|c| c.ch).collect();
+    match prompt_in(&chars) {
+        Some(prompt) if sql && prompt.sql => super::sql::scan(&chars, prompt.end),
+        other => scan_from(&chars, other.map_or(chars.len(), |prompt| prompt.end)),
+    }
+}
+
+/// [`scan`] over text rather than cells, for reading names out of a command
+/// that is no longer on screen - see [`crate::features::autocomplete`].
+pub fn scan_text(chars: &[char]) -> Vec<Span> {
+    scan_chars(chars)
+}
+
 fn scan_chars(chars: &[char]) -> Vec<Span> {
-    let code_from = code_start(chars);
+    scan_from(chars, code_start(chars))
+}
+
+/// The scan itself, with the column typed code starts at already known - see
+/// `code_start`. Split out so `scan_row`, which has already read the prompt,
+/// does not walk the row for it a second time.
+fn scan_from(chars: &[char], code_from: usize) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     let mut i = 0;
 
@@ -285,6 +313,29 @@ fn code_start(chars: &[char]) -> usize {
     prompt_end(chars).unwrap_or(chars.len())
 }
 
+/// An IRIS prompt, as read off the start of a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prompt {
+    /// Column just past the prompt, which is where typed text begins.
+    pub end: usize,
+    /// The prompt is the SQL shell's - `USER>>`, `[SQL]USER>>`, or the `1>>`
+    /// it numbers the lines of a multi-line statement with - so what is typed
+    /// after it is SQL, and `quit` is what leaves.
+    pub sql: bool,
+    /// Columns of the prompt's head - the namespace, and the stack level a
+    /// break appends to it - without the `[SQL]` tag or the `>`s. `None` on a
+    /// continuation line, whose head is a line number and names nothing.
+    pub head: Option<(usize, usize)>,
+}
+
+impl Prompt {
+    /// Whether this is the SQL shell numbering the lines of a statement that
+    /// has not been run yet, where `quit` would be one more line of it.
+    pub fn continuation(self) -> bool {
+        self.sql && self.head.is_none()
+    }
+}
+
 /// Column just past an IRIS prompt on this row, or `None` when there is not
 /// one.
 ///
@@ -292,40 +343,93 @@ fn code_start(chars: &[char]) -> usize {
 /// is a command line for colouring and whether Home, End and Up belong to the
 /// line being typed rather than to IRIS.
 pub fn prompt_end(chars: &[char]) -> Option<usize> {
-    prompt_end_by(chars.len(), |i| chars[i])
+    prompt_in(chars).map(|prompt| prompt.end)
 }
 
 /// The same test over a row of cells, so a caller holding those does not have
 /// to collect them into a `Vec<char>` to ask.
 pub fn prompt_end_of(cells: &[Cell]) -> Option<usize> {
-    prompt_end_by(cells.len(), |i| cells[i].ch)
+    prompt_of(cells).map(|prompt| prompt.end)
 }
+
+/// Everything the prompt on this row says, for a caller that needs more than
+/// where it ends.
+pub fn prompt_in(chars: &[char]) -> Option<Prompt> {
+    prompt_by(chars.len(), |i| chars[i])
+}
+
+/// [`prompt_in`] over a row of cells.
+pub fn prompt_of(cells: &[Cell]) -> Option<Prompt> {
+    prompt_by(cells.len(), |i| cells[i].ch)
+}
+
+/// What the SQL shell tags its prompt with, on the versions that tag it.
+const SQL_TAG: &str = "[SQL]";
 
 /// The first `>` decides the row either way: everything before it is the
 /// prompt's head, which is a namespace and — once the process is stopped inside
 /// something — the program stack level IRIS appends to it.
-fn prompt_end_by(len: usize, at: impl Fn(usize) -> char) -> Option<usize> {
-    let close = (0..len).find(|&i| at(i) == '>')?;
+///
+/// A second `>` straight after the first is the SQL shell, which spells its
+/// prompt `USER>>`, and `[SQL]USER>>` on the versions that also tag it. Both
+/// `>`s are prompt: counted as typed text, the line would start with a `>` and
+/// every rubout and recall measured off it would be one column out.
+///
+/// The price is a line typed at an ObjectScript prompt that itself starts with
+/// `>`, which reads as the SQL shell. Nothing valid in ObjectScript starts that
+/// way, so what is lost is the colouring of a line IRIS will reject anyway.
+fn prompt_by(len: usize, at: impl Fn(usize) -> char) -> Option<Prompt> {
+    let tagged = len >= SQL_TAG.len()
+        && SQL_TAG
+            .chars()
+            .enumerate()
+            .all(|(i, ch)| at(i).eq_ignore_ascii_case(&ch));
+    let head = if tagged { SQL_TAG.len() } else { 0 };
+    let close = (head..len).find(|&i| at(i) == '>')?;
+    let doubled = close + 1 < len && at(close + 1) == '>';
+    if tagged && !doubled {
+        // The tag is only ever the shell's, and the shell always doubles.
+        return None;
+    }
+    let end = if doubled { close + 2 } else { close + 1 };
+
+    // A multi-line statement numbers its lines, `1>>`, `2>>`, with nothing
+    // else in the head. That is not a namespace and must not be read as one,
+    // or the tab would be renamed `1` halfway through a query.
+    if doubled && !tagged {
+        let first = (0..close).find(|&i| at(i) != ' ').unwrap_or(close);
+        if first < close && (first..close).all(|i| at(i).is_ascii_digit()) {
+            return Some(Prompt {
+                end,
+                sql: true,
+                head: None,
+            });
+        }
+    }
+
     // The one space a prompt may contain is the one before the stack level, so
     // the head splits there: `COMP80 10f0>` is a namespace and a level, and
     // `USER>` is a namespace on its own. A row with two spaces in its head
     // fails below, because a space is not a namespace character.
-    match (0..close).rfind(|&i| at(i) == ' ') {
-        Some(space) => {
-            (is_namespace(space, &at) && is_stack_level(space + 1, close, &at)).then_some(close + 1)
-        }
-        None => is_namespace(close, &at).then_some(close + 1),
-    }
+    let valid = match (head..close).rfind(|&i| at(i) == ' ') {
+        Some(space) => is_namespace(head, space, &at) && is_stack_level(space + 1, close, &at),
+        None => is_namespace(head, close, &at),
+    };
+    valid.then_some(Prompt {
+        end,
+        sql: doubled,
+        head: Some((head, close)),
+    })
 }
 
-/// Whether columns `..end` are a namespace as a prompt spells it: `USER`,
+/// Whether columns `start..end` are a namespace as a prompt spells it: `USER`,
 /// `%SYS`, `RDB81-UL`, and the `TL1:USER` a transaction prefixes.
 ///
 /// Must end on an alphanumeric, which is what keeps the `->` and `=>` of
 /// ordinary output from reading as prompts.
-fn is_namespace(end: usize, at: &impl Fn(usize) -> char) -> bool {
+fn is_namespace(start: usize, end: usize, at: &impl Fn(usize) -> char) -> bool {
     let mut prev_alphanumeric = false;
-    for i in 0..end {
+    for i in start..end {
         let ch = at(i);
         if !(ch.is_ascii_alphanumeric() || matches!(ch, '%' | '^' | '_' | '-' | '.' | ':')) {
             return false;
@@ -881,5 +985,84 @@ mod tests {
         assert_eq!(end_of("USER >"), None, "no level after the space");
         assert_eq!(end_of(" 2x0>"), None, "no namespace before it");
         assert_eq!(end_of("set x=a-b>c"), None);
+    }
+
+    fn prompt(text: &str) -> Option<Prompt> {
+        let chars: Vec<char> = text.chars().collect();
+        prompt_in(&chars)
+    }
+
+    /// The SQL shell's prompt is both `>`s, so the line typed after it starts
+    /// where the user started typing - which is what keeps recall, Home and
+    /// clicking to move the cursor working inside the shell.
+    #[test]
+    fn the_sql_shells_prompt_ends_after_both_angle_brackets() {
+        let plain = prompt("USER>>select 1").expect("a prompt");
+        assert_eq!(plain.end, 6);
+        assert!(plain.sql);
+        assert_eq!(plain.head, Some((0, 4)));
+
+        let tagged = prompt("[SQL]RDB81-UL>>").expect("a prompt");
+        assert_eq!(tagged.end, 15);
+        assert!(tagged.sql);
+        assert_eq!(tagged.head, Some((5, 13)), "the tag is not the namespace");
+
+        let objectscript = prompt("USER>w 1").expect("a prompt");
+        assert!(!objectscript.sql);
+        assert!(!objectscript.continuation());
+    }
+
+    /// A multi-line statement's numbered lines are still the shell, still a
+    /// line being typed - and name no namespace.
+    #[test]
+    fn a_continuation_line_is_sql_with_no_namespace() {
+        for text in ["1>>from Sample.Person", "  12>>"] {
+            let line = prompt(text).expect("a prompt");
+            assert!(line.sql, "{text}");
+            assert!(line.continuation(), "{text}");
+            assert_eq!(line.head, None, "{text}");
+        }
+        assert_eq!(prompt("1>>").map(|p| p.end), Some(3));
+    }
+
+    /// The tag on its own is not a prompt, and neither is output that happens
+    /// to contain a `>>`.
+    #[test]
+    fn output_with_double_angle_brackets_is_not_a_prompt() {
+        assert_eq!(prompt("[SQL]USER>"), None);
+        assert_eq!(prompt("a >> b"), None);
+        assert_eq!(prompt(">>"), None);
+        assert_eq!(prompt("total 25>>"), None);
+    }
+
+    /// At the SQL prompt the typed line is SQL; anywhere else the same words
+    /// are ObjectScript, and switching SQL colouring off brings that back.
+    #[test]
+    fn a_row_at_the_sql_prompt_is_scanned_as_sql() {
+        let cells = |text: &str| -> Vec<Cell> {
+            text.chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Cell::default()
+                })
+                .collect()
+        };
+        let sql = cells("USER>>select 'a' from t");
+        let spans = scan_row(&sql, true);
+        assert!(spans.contains(&Span {
+            start: 6,
+            end: 12,
+            kind: Kind::Command
+        }));
+        assert!(spans.contains(&Span {
+            start: 13,
+            end: 16,
+            kind: Kind::Str
+        }));
+        // Off, the `'` is ObjectScript's not-operator again.
+        assert!(scan_row(&sql, false).iter().all(|s| s.kind != Kind::Str));
+        // And an ObjectScript prompt is unaffected by the switch.
+        let os = cells("USER>set x=1");
+        assert_eq!(scan_row(&os, true), scan(&os));
     }
 }

@@ -237,6 +237,169 @@ fn pin(painter: &Painter, box_: Rect, stroke: Stroke, pinned: bool) {
     }
 }
 
+/// The marks the Settings window draws: one per sidebar category, and the few
+/// a row needs - a magnifier for the search field, the chevrons on a pop-up
+/// menu and on a row that leads somewhere.
+///
+/// Kept apart from [`Glyph`] because they are drawn to a different brief: white
+/// on a small coloured tile, where the title-bar marks are hairlines on the
+/// chrome, so they are heavier and fill more of their box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Symbol {
+    Gear,
+    /// A circle half filled - light and dark, the mark for appearance.
+    Contrast,
+    /// A painter's palette: a ring with three dots of paint.
+    Swatch,
+    /// A monitor with a prompt on it.
+    Display,
+    Pencil,
+    Window,
+    /// Two windows, one behind the other.
+    Windows,
+    Person,
+    /// A page of text.
+    Lines,
+    Bolt,
+    /// `>_`, the shell prompt.
+    Prompt,
+    /// A lower-case "i".
+    Info,
+    Magnifier,
+    ChevronRight,
+    /// The pair of chevrons on a pop-up menu, saying it opens either way.
+    ChevronUpDown,
+}
+
+impl Symbol {
+    pub const ALL: [Symbol; 15] = [
+        Symbol::Gear,
+        Symbol::Contrast,
+        Symbol::Swatch,
+        Symbol::Display,
+        Symbol::Pencil,
+        Symbol::Window,
+        Symbol::Windows,
+        Symbol::Person,
+        Symbol::Lines,
+        Symbol::Bolt,
+        Symbol::Prompt,
+        Symbol::Info,
+        Symbol::Magnifier,
+        Symbol::ChevronRight,
+        Symbol::ChevronUpDown,
+    ];
+}
+
+/// Draws `symbol` centred in `rect`, in `colour`, as large as `rect` allows.
+pub fn symbol(painter: &Painter, rect: Rect, symbol: Symbol, colour: Color32) {
+    let side = rect.width().min(rect.height());
+    let b = Rect::from_center_size(rect.center(), Vec2::splat(side));
+    // Proportional rather than the fixed hairline the title bar uses: these
+    // are drawn from a 14-point tile up to a 20-point one, and a 1.3-point
+    // line on the larger one looks like a sketch of the mark.
+    let stroke = Stroke::new((side * 0.11).max(1.2), colour);
+    let at = |x: f32, y: f32| Pos2::new(b.left() + b.width() * x, b.top() + b.height() * y);
+    match symbol {
+        Symbol::Gear => gear(painter, b.shrink(side * 0.04), stroke),
+        Symbol::Swatch => {
+            painter.circle_stroke(b.center(), side * 0.40, stroke);
+            for (x, y) in [(0.36, 0.40), (0.56, 0.32), (0.66, 0.54)] {
+                painter.circle_filled(at(x, y), side * 0.08, colour);
+            }
+        }
+        Symbol::Display => {
+            let screen = Rect::from_min_max(at(0.10, 0.16), at(0.90, 0.72));
+            painter.rect_stroke(screen, Rounding::same(side * 0.06), stroke);
+            painter.line_segment([at(0.36, 0.88), at(0.64, 0.88)], stroke);
+            painter.line_segment([at(0.30, 0.34), at(0.42, 0.44)], stroke);
+            painter.line_segment([at(0.42, 0.44), at(0.30, 0.54)], stroke);
+        }
+        Symbol::Pencil => {
+            let thick = Stroke::new(stroke.width * 1.6, colour);
+            painter.line_segment([at(0.74, 0.20), at(0.30, 0.64)], thick);
+            painter.line_segment([at(0.30, 0.64), at(0.20, 0.80)], stroke);
+            painter.line_segment([at(0.20, 0.80), at(0.36, 0.70)], stroke);
+        }
+        Symbol::Contrast => {
+            let radius = side * 0.40;
+            painter.circle_stroke(b.center(), radius, stroke);
+            // The left half as a fan of points: egui has no arc to fill.
+            let points: Vec<Pos2> = (0..=16)
+                .map(|step| {
+                    let angle =
+                        std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * step as f32 / 16.0;
+                    let (sin, cos) = angle.sin_cos();
+                    b.center() + Vec2::new(cos, sin) * radius
+                })
+                .collect();
+            painter.add(egui::Shape::convex_polygon(points, colour, Stroke::NONE));
+        }
+        Symbol::Window => window(painter, b.shrink(side * 0.14), stroke),
+        Symbol::Windows => {
+            let front = Rect::from_min_max(at(0.10, 0.34), at(0.70, 0.86));
+            window(painter, front, stroke);
+            // Only the two edges of the back window that show past the front
+            // one: drawn whole, its lines would cross the front window's.
+            let corner = at(0.90, 0.14);
+            painter.line_segment([at(0.30, 0.14), corner], stroke);
+            painter.line_segment([corner, at(0.90, 0.66)], stroke);
+        }
+        Symbol::Person => {
+            painter.circle_stroke(at(0.5, 0.34), side * 0.17, stroke);
+            // The shoulders: the top half of an ellipse, as a polyline since
+            // egui has no arc.
+            let points: Vec<Pos2> = (0..=12)
+                .map(|step| {
+                    let angle = std::f32::consts::PI * (1.0 + step as f32 / 12.0);
+                    let (sin, cos) = angle.sin_cos();
+                    at(0.5 + 0.32 * cos, 0.86 + 0.26 * sin)
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, stroke));
+        }
+        Symbol::Lines => {
+            for (y, end) in [(0.28, 0.80), (0.46, 0.80), (0.64, 0.80), (0.82, 0.56)] {
+                painter.line_segment([at(0.20, y), at(end, y)], stroke);
+            }
+        }
+        Symbol::Bolt => {
+            // Two triangles that overlap across the middle: egui fills convex
+            // shapes only, and a lightning bolt is the textbook concave one.
+            for points in [
+                vec![at(0.62, 0.08), at(0.26, 0.58), at(0.58, 0.50)],
+                vec![at(0.38, 0.92), at(0.74, 0.42), at(0.42, 0.50)],
+            ] {
+                painter.add(egui::Shape::convex_polygon(points, colour, Stroke::NONE));
+            }
+        }
+        Symbol::Prompt => {
+            painter.line_segment([at(0.18, 0.30), at(0.42, 0.50)], stroke);
+            painter.line_segment([at(0.42, 0.50), at(0.18, 0.70)], stroke);
+            painter.line_segment([at(0.50, 0.72), at(0.82, 0.72)], stroke);
+        }
+        Symbol::Info => {
+            painter.circle_filled(at(0.5, 0.24), side * 0.09, colour);
+            let thick = Stroke::new(stroke.width * 1.4, colour);
+            painter.line_segment([at(0.5, 0.42), at(0.5, 0.82)], thick);
+        }
+        Symbol::Magnifier => {
+            painter.circle_stroke(at(0.42, 0.42), side * 0.26, stroke);
+            painter.line_segment([at(0.62, 0.62), at(0.86, 0.86)], stroke);
+        }
+        Symbol::ChevronRight => {
+            painter.line_segment([at(0.38, 0.22), at(0.64, 0.50)], stroke);
+            painter.line_segment([at(0.64, 0.50), at(0.38, 0.78)], stroke);
+        }
+        Symbol::ChevronUpDown => {
+            painter.line_segment([at(0.28, 0.40), at(0.50, 0.20)], stroke);
+            painter.line_segment([at(0.50, 0.20), at(0.72, 0.40)], stroke);
+            painter.line_segment([at(0.28, 0.60), at(0.50, 0.80)], stroke);
+            painter.line_segment([at(0.50, 0.80), at(0.72, 0.60)], stroke);
+        }
+    }
+}
+
 /// A rectangle on whole pixels, so a one-point outline comes out crisp rather
 /// than as two grey rows.
 fn align(rect: Rect) -> Rect {
@@ -249,6 +412,31 @@ fn align(rect: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sidebar symbol sits on a tile barely larger than itself, so one that
+    /// strays outside its box draws over the tile's edge and the label.
+    #[test]
+    fn every_symbol_stays_inside_the_box_it_is_drawn_in() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::splat(16.0));
+        for symbol_ in Symbol::ALL {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                symbol(&painter, rect, symbol_, Color32::WHITE);
+            });
+            let mut drawn = Rect::NOTHING;
+            for clipped in &output.shapes {
+                drawn = drawn.union(clipped.shape.visual_bounding_rect());
+            }
+            assert!(drawn.is_positive(), "{symbol_:?} draws nothing");
+            // Half a stroke of slack: a line ending on the box's edge is
+            // drawn with its caps just past it.
+            assert!(
+                rect.expand(1.5).contains_rect(drawn),
+                "{symbol_:?} reaches {drawn:?}, outside {rect:?}"
+            );
+        }
+    }
 
     /// Every glyph has to fit the box it is handed, or a title-bar control
     /// would draw over its neighbour.

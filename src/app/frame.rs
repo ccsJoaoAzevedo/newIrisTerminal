@@ -14,6 +14,15 @@ impl eframe::App for App {
         // What the terminal measured this frame, filled in once it has drawn.
         let mut fit: Option<(usize, usize, egui::Vec2)> = None;
 
+        // egui's zoom scales every window the app opens at once, which is the
+        // whole of the interface scale; the terminal undoes it in
+        // `render_opts`. Only set on a change, since setting it moves the
+        // window's measured size and would refit the grid every frame.
+        let scale = self.ui_scale();
+        if (ctx.zoom_factor() - scale).abs() > f32::EPSILON {
+            ctx.set_zoom_factor(scale);
+        }
+        crate::ui::prefs::set_opacity(ctx, self.settings.sheet_opacity);
         self.track_window_geometry(ctx);
         crate::ui::shading::paint_backdrop(ctx);
         // Refilled as the panes draw, below, and read by the resize grips at
@@ -307,78 +316,21 @@ impl eframe::App for App {
         if let Some(request) = panels::pending_native_dialog(ctx, &mut self.panels) {
             requests.push(request);
         }
-        if let Some(request) = panels::settings_dialog(
+        // The themes and the macros are edited in place, so the terminal
+        // behind the window repaints in the colour being dragged; the requests
+        // are carried out below, so a colour changed this frame is on screen
+        // in the next one.
+        requests.extend(panels::settings_dialog(
             ctx,
             &mut self.settings,
-            &self.themes,
+            &mut self.themes,
+            &mut self.macro_groups,
             &mut self.panels,
             &self.instances,
             &self.servers,
             &mut self.settings_placement,
             &theme.window_buttons,
-        ) {
-            requests.push(request);
-        }
-        // After the settings window, which is where it is opened from, and
-        // before the requests are carried out, so a colour changed this frame is
-        // on screen in the next one.
-        let active_theme = self.settings.theme.clone();
-        let theme_actions = theme_manager::theme_manager(
-            ctx,
-            &mut self.panels.themes,
-            &mut self.themes,
-            &active_theme,
-            &theme.window_buttons,
-        );
-        // An edit to the theme in use has to show at once, which is the whole
-        // point of editing it with the terminal behind the window.
-        if !theme_actions.is_empty() || self.panels.themes.open {
-            App::apply_style(ctx, &self.theme(), &self.settings);
-        }
-        for action in theme_actions {
-            self.apply_theme_action(ctx, action);
-        }
-        // Beside the theme manager, and opened from the same section of the
-        // settings window.
-        let macro_actions = macro_manager::macro_manager(
-            ctx,
-            &mut self.panels.macros,
-            &mut self.macro_groups,
-            &theme.window_buttons,
-        );
-        for action in macro_actions {
-            match action {
-                macro_manager::MacroAction::Save => {
-                    requests.push(UiRequest::SavePersonalMacros);
-                }
-                // Through the ordinary request path, so `confirm` and the
-                // parameter prompt apply exactly as they do to the menu.
-                macro_manager::MacroAction::Run(m) => requests.push(UiRequest::RunMacro(m)),
-            }
-        }
-
-        let current_saver = self.settings.screensaver;
-        let saver_actions = crate::ui::screensaver_manager::screensaver_manager(
-            ctx,
-            &mut self.panels.screensaver,
-            &current_saver,
-            &theme.window_buttons,
-        );
-        for action in saver_actions {
-            use crate::ui::screensaver_manager::ScreensaverAction;
-            match action {
-                ScreensaverAction::Apply(config) => {
-                    self.settings.screensaver = config;
-                    requests.push(UiRequest::SettingsChanged);
-                }
-                ScreensaverAction::Preview(config) => {
-                    self.screensaver = Some(crate::ui::screensaver_view::Running::new(
-                        config.kind,
-                        config.speed,
-                    ));
-                }
-            }
-        }
+        ));
 
         for request in requests {
             self.handle_request(ctx, request);
@@ -388,8 +340,8 @@ impl eframe::App for App {
         // it was woken in, so the click that woke it lands on it and not on
         // the terminal underneath.
         if let Some(saver) = self.screensaver.as_mut() {
-            saver.show(ctx);
-            ctx.request_repaint_after(Duration::from_millis(33));
+            let next = saver.show(ctx);
+            ctx.request_repaint_after(next);
         }
         if let Some(saver) = saver_woken {
             let mut saver = saver;
@@ -470,15 +422,12 @@ impl App {
             }
             return None;
         }
-        let config = self.settings.screensaver;
+        let config = &self.settings.screensaver;
         if config.kind != Kind::None
             && !self.minimized
             && crate::ui::screensaver_view::last_activity(ctx).elapsed() >= config.wait()
         {
-            self.screensaver = Some(crate::ui::screensaver_view::Running::new(
-                config.kind,
-                config.speed,
-            ));
+            self.screensaver = Some(crate::ui::screensaver_view::Running::new(config.clone()));
         }
         None
     }

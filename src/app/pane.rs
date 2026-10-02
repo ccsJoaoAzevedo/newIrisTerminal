@@ -65,6 +65,12 @@ impl App {
             // which truncates instead of drawing, needs the wide margin.
             opts.wide_grid = false;
         }
+        // The right-click entry for the SQL shell, on an IRIS session that is
+        // still there to type into.
+        opts.sql_mode = self
+            .pane(at)
+            .filter(|tab| !tab.profile.is_shell() && tab.session.is_some())
+            .map(|tab| tab.sql);
         let uid = match self.pane(at) {
             Some(tab) => tab.uid,
             // Nothing there to draw: a tab that went away between frames.
@@ -185,6 +191,7 @@ impl App {
                 }
                 ContextAction::Analyze(scope, panes) => self.analyze_with_claude(at, scope, panes),
                 ContextAction::ClearTerminal => self.clear_terminal(at),
+                ContextAction::ToggleSqlMode => self.toggle_sql_mode(at),
                 // The layout of the tab this pane is in. Recorded rather than
                 // done, because the tabs are being drawn - see
                 // [`LayoutAction`]. `at` is the pane the menu was opened over,
@@ -229,6 +236,11 @@ impl App {
         // one it is.
         let capturing = self.panels.macros.capture_shortcut || self.panels.capture_manager_shortcut;
         if !result.response.has_focus() || capturing || !window_active {
+            // A popup belongs to the keyboard. Left open on a pane the keys
+            // no longer reach, it would offer a suggestion nothing can accept.
+            if let Some(tab) = self.pane_mut(at) {
+                tab.completion.close();
+            }
             return measure;
         }
 
@@ -251,10 +263,52 @@ impl App {
                 selected_span: line.and_then(|line| selection_in_line(tab, line)),
                 insert_down,
                 delete_down,
+                completion: tab.completion.popup().map(|popup| popup.navigated),
             };
             (input_ctx, tab.profile.wire_encoding())
         };
         let mut action = input::translate(&events, &input_ctx);
+
+        // The popup's own keys, in the order they were pressed. An accept in
+        // the same frame as typed text is dropped: the suggestion was worked
+        // out before that text, and sending it ahead of the text would put the
+        // two in the wrong order on the line.
+        for key in std::mem::take(&mut action.completion) {
+            let Some(tab) = self.pane_mut(at) else {
+                break;
+            };
+            match key {
+                input::CompletionKey::Next | input::CompletionKey::Previous => {
+                    if let Some(popup) = tab.completion.popup_mut() {
+                        popup.step(key == input::CompletionKey::Next);
+                    }
+                }
+                input::CompletionKey::Accept if action.text.is_empty() => {
+                    self.accept_completion(at);
+                }
+                input::CompletionKey::Accept | input::CompletionKey::Dismiss => {
+                    tab.completion.close();
+                }
+            }
+        }
+        let autocomplete = self.settings.autocomplete;
+        if let Some(tab) = self.pane_mut(at) {
+            // Anything that rewrites the line or moves off it is not typing a
+            // word, and must not leave a popup armed to open over the result:
+            // a recalled line would otherwise offer to complete its last word,
+            // and the next Up would pick a suggestion instead of recalling.
+            let elsewhere = action.submitted.is_some()
+                || action.recall.is_some()
+                || action.paste.is_some()
+                || action.select_line
+                || action.move_cursor.is_some()
+                || action.extend_selection.is_some();
+            if elsewhere || !autocomplete || tab.profile.is_shell() {
+                tab.completion.close();
+            } else if action.typing {
+                tab.completion.arm();
+            }
+        }
 
         if action.select_line {
             self.select_typed_line(at);
@@ -310,6 +364,12 @@ impl App {
                 // prompt over a line the user never ran.
                 action.bytes.clear();
                 action.text.clear();
+            } else if self.take_sql_command(at, &unechoed) {
+                // The same reasoning: `/sql` has been rubbed out and the line
+                // that switches the mode sent with an Enter of its own, so this
+                // one would only run an empty line behind it.
+                action.bytes.clear();
+                action.text.clear();
             } else {
                 // Submitting ends the selection with the line it was on, rather
                 // than leaving it highlighted in the scrollback.
@@ -362,7 +422,36 @@ impl App {
             }
         }
 
+        self.completion_popup(ctx, theme, at, result.caret);
         measure
+    }
+
+    /// Brings the autocomplete up to date with the line on screen, and draws it
+    /// over the cursor when it has something to offer.
+    ///
+    /// Runs for the focused pane only, after its keys have been sent. What was
+    /// typed this frame is not on screen yet - IRIS has to echo it first - so
+    /// the popup catches up on the frame the echo arrives in, which the
+    /// session's reader asks for anyway.
+    fn completion_popup(
+        &mut self,
+        ctx: &Context,
+        theme: &Theme,
+        at: At,
+        caret: Option<egui::Rect>,
+    ) {
+        let Some(tab) = self
+            .tabs
+            .get_mut(at.tab)
+            .and_then(|tab| tab.pane_mut(at.pane))
+        else {
+            return;
+        };
+        tab.completion.refresh(&tab.grid, &mut self.vocabulary);
+        let (Some(popup), Some(caret)) = (tab.completion.popup(), caret) else {
+            return;
+        };
+        crate::ui::completion::show(ctx, popup, caret, theme, tab.uid);
     }
 
     /// Draws the easter egg's board in place of a terminal pane.

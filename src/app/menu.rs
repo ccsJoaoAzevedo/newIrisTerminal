@@ -179,10 +179,16 @@ impl App {
         if terminal_focus && consume_exact(ctx, Modifiers::CTRL, Key::Delete) {
             self.clear_active_terminal();
         }
+        // Ctrl+Shift+Q, for query: in or out of the IRIS SQL shell. The same
+        // entry the right-click menu has.
+        if terminal_focus && consume_exact(ctx, Modifiers::CTRL | Modifiers::SHIFT, Key::Q) {
+            self.toggle_sql_mode(self.focused_at());
+        }
 
-        // The macro manager's own chord, if the user has set one. Before the
-        // macros themselves so that a chord bound to both opens the manager -
-        // the one of the two that cannot send anything to a live session.
+        // The chord that opens the macros in Settings, if the user has set
+        // one. Before the macros themselves so that a chord bound to both
+        // opens the page - the one of the two that cannot send anything to a
+        // live session.
         if terminal_focus {
             if let Some((modifiers, key)) = self
                 .settings
@@ -191,7 +197,7 @@ impl App {
                 .and_then(shortcut::parse)
             {
                 if consume_exact(ctx, modifiers, key) {
-                    self.panels.macros.open = true;
+                    self.handle_request(ctx, UiRequest::OpenSettings(settings_view::MACROS_PAGE));
                 }
             }
         }
@@ -358,9 +364,10 @@ impl App {
         // mutably, and the bar is already holding it.
         let mut open_default = false;
         let mut pick: Option<Profile> = None;
-        // The system bar brings its own controls, and the setting can turn the
-        // app's off entirely.
-        let own_buttons = self.settings.show_window_buttons;
+        // Which controls appear is the theme's choice, per button (see
+        // `WindowButtons::shows`); a switch in Settings that hid all three on
+        // top of that was the same choice made in two places.
+        let own_buttons = true;
         // Whether the tabs share this row. Read before the closure: it decides
         // both what goes in the middle of the bar and whether the session's own
         // line is drawn at all.
@@ -375,114 +382,68 @@ impl App {
         // buttons switched off drew it on neither.
         let pin = Some(self.settings.always_on_top);
         ui.horizontal(|ui| {
+            // Both of these need the app, and the bar holds both at once; they
+            // are never called at the same time, which is all the cell has to
+            // know.
+            let app = std::cell::RefCell::new(&mut *self);
             let mut new_tab = |ui: &mut egui::Ui| {
-                let (clicked, picked) = self.new_tab_control(ui, buttons);
+                let (clicked, picked) = app.borrow().new_tab_control(ui, buttons);
                 open_default |= clicked;
                 pick = pick.take().or(picked);
             };
-            if let Some(asked) = chrome::leading_window_buttons(
-                ui,
-                buttons,
-                own_buttons,
-                Some(&mut show_settings),
-                pin,
-                Some(&mut new_tab),
-            ) {
-                action = Some(asked);
-            }
-            let leading_right = ui.min_rect().right();
-            // One rule after the new-session button, and none at all when the
-            // tabs are up here: the first tab's own edge is the divider, and a
-            // rule in front of it - there used to be two, with a gap between
-            // them - reads as a slot with something missing out of it.
+            // Whatever stands where the theme puts the tabs: the tabs, when the
+            // setting has moved them up here, and the session's own line -
+            // instance, PID, geometry - when it has not. The two cannot both
+            // have that place, and the tabs say which session it is anyway.
             //
-            // Macros, Export and the IRIS utilities all used to sit between
-            // those two rules. Every one of them was about the output rather
-            // than about the app, and all three are now on the terminal's own
-            // right-click menu, beside the session they act on; writing macros
-            // is in Settings, with the themes.
-            if !inline_tabs && !buttons.leading().is_empty() {
-                ui.separator();
-            }
-
-            // The tabs, when the setting has moved them up here. Drawn in the
-            // row rather than into a rectangle handed to `chrome`, which is
-            // what lets the row's own cursor measure them: everything after
-            // them is then the space they left, and that space is what the
-            // window is dragged by.
-            if inline_tabs {
-                // Bounded, or a strip of tabs long enough would run under the
-                // window buttons: a scroll area takes the width it is offered,
-                // and what is offered here has the buttons at the end of it.
-                // The reserve also leaves a strip in front of them that is
-                // always free, so a row filled with tabs still has somewhere
-                // to take hold of the window.
-                let tabs_from = ui.cursor().min.x;
-                let room = ui.available_width() - self.title_bar_reserve();
-                self.tab_strip_bounded(ui, room.max(60.0));
-                // The sliver between the button and the first tab. Nothing is
-                // allocated for it - it is the row's own spacing - it simply
-                // drags the window now instead of doing nothing.
-                if let Some(asked) = chrome::drag_span(
+            // Macros, Export and the IRIS utilities all used to sit beside it.
+            // Every one of them was about the output rather than about the
+            // app, and all three are now on the terminal's own right-click
+            // menu, beside the session they act on; writing macros is in
+            // Settings, with the themes.
+            let mut middle = |ui: &mut egui::Ui, room: f32| -> Option<WindowAction> {
+                let mut app = app.borrow_mut();
+                if inline_tabs {
+                    // Drawn in the row rather than into a rectangle handed to
+                    // `chrome`, which is what lets the row's own cursor
+                    // measure them. Bounded, or a strip of tabs long enough
+                    // would run under the window buttons.
+                    app.tab_strip_bounded(ui, room);
+                    return None;
+                }
+                let tab = app.active_tab()?;
+                let (cols, rows) = app.view_size;
+                // The instance, then what identifies this session of it, then
+                // how big the window is - in that order because that is how
+                // specific each one is.
+                let pid = match tab.pid().filter(|_| app.settings.show_pid) {
+                    Some(pid) => format!("  PID {pid}"),
+                    None => String::new(),
+                };
+                let info = format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint());
+                // Reading matter, and nothing else: the window is dragged by
+                // it like any other empty stretch of the bar.
+                chrome::drag_text(
                     ui,
-                    leading_right..tabs_from,
+                    egui::RichText::new(info).weak(),
                     true,
                     "nit-main",
-                    "before-tabs",
-                ) {
-                    action = Some(asked);
-                }
-            }
-
-            // The session's own line - instance, PID, geometry - unless the
-            // tabs have moved up here, in which case the row is theirs: the
-            // two cannot both have the middle of the bar, and the tabs say
-            // which session it is anyway.
-            if !inline_tabs {
-                if let Some(tab) = self.active_tab() {
-                    let (cols, rows) = self.view_size;
-                    // The instance, then what identifies this session of it,
-                    // then how big the window is - in that order because that
-                    // is how specific each one is.
-                    let pid = match tab.pid().filter(|_| self.settings.show_pid) {
-                        Some(pid) => format!("  PID {pid}"),
-                        None => String::new(),
-                    };
-                    let info = format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint());
-                    // Reading matter, and nothing else: the window is dragged
-                    // by it like any other empty stretch of the bar.
-                    if let Some(asked) = chrome::drag_text(
-                        ui,
-                        egui::RichText::new(info).weak(),
-                        true,
-                        "nit-main",
-                        "session",
-                    ) {
-                        action = Some(asked);
-                    }
-                }
-            }
-
-            // Last, so the space it claims for dragging is whatever the items
-            // above did not take. Claimed even when the window controls are
-            // hidden or already drawn on the left: without it there is nothing
-            // to drag the window by.
-            let mut new_tab = |ui: &mut egui::Ui| {
-                let (clicked, picked) = self.new_tab_control(ui, buttons);
-                open_default |= clicked;
-                pick = pick.take().or(picked);
+                    "session",
+                )
             };
-            if let Some(asked) = chrome::title_bar_controls(
+            action = chrome::title_bar(
                 ui,
-                buttons,
-                own_buttons,
-                "nit-main",
-                Some(&mut show_settings),
-                pin,
-                Some(&mut new_tab),
-            ) {
-                action = Some(asked);
-            }
+                chrome::TitleBar {
+                    style: buttons,
+                    window_controls: own_buttons,
+                    window: "nit-main",
+                    draggable: true,
+                    settings: Some(&mut show_settings),
+                    on_top: pin,
+                    new_tab: Some(&mut new_tab),
+                    tabs: &mut middle,
+                },
+            );
         });
         self.panels.show_settings = show_settings;
 
@@ -502,7 +463,9 @@ impl App {
     pub(super) fn handle_request(&mut self, ctx: &Context, request: UiRequest) {
         match request {
             UiRequest::RunMacro(m) => {
-                // Parameters or a confirmation flag both mean "ask first".
+                // Parameters or a confirmation flag both mean "ask first" - but
+                // only parameters some placeholder uses. A blank or unreferenced
+                // one would open a dialog for a value that goes nowhere.
                 if m.needs_input() || m.confirm {
                     self.panels.pending = Some(PendingMacro::new(m));
                 } else {
@@ -567,6 +530,11 @@ impl App {
                     &format!("{e:#}"),
                 )),
             },
+            UiRequest::Theme(action) => self.apply_theme_action(ctx, action),
+            UiRequest::PreviewScreensaver(config) => {
+                self.screensaver = Some(crate::ui::screensaver_view::Running::new(config));
+            }
+            UiRequest::OpenSettings(route) => self.panels.open_settings(route),
             UiRequest::SavePersonalMacros => {
                 let path = config::personal_macros_path();
                 let xml = macros::to_xml(&self.macro_groups);
@@ -581,13 +549,16 @@ impl App {
         }
     }
 
-    /// Carries out what the theme manager asked for.
+    /// Carries out what the Themes pages asked for.
     ///
-    /// The manager edits the themes in place so the window behind it repaints
+    /// The pages edit the themes in place so the window behind them repaints
     /// as a colour is dragged; this is the half that reaches the disk, which a
     /// paint pass has no business doing.
     pub(super) fn apply_theme_action(&mut self, ctx: &Context, action: ThemeAction) {
         match action {
+            // An edit to the theme in use has to show at once, which is the
+            // whole point of editing it with the terminal behind the window.
+            ThemeAction::Edited => App::apply_style(ctx, &self.theme(), &self.settings),
             ThemeAction::Activate(name) => {
                 self.settings.theme = name;
                 if let Err(e) = self.settings.save() {

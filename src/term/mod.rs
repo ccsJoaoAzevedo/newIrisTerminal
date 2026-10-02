@@ -14,7 +14,8 @@
 //! - [`grid`] holds the rows, the cursor, the scrollback and the wrapping.
 //! - [`palette`] resolves a cell's colour against the theme.
 //! - [`syntax`] colours ObjectScript on top of that, and never overrules a
-//!   colour the far side asked for.
+//!   colour the far side asked for. [`sql`] does the same for a line typed at
+//!   the IRIS SQL shell's prompt.
 //! - [`lineedit`] finds the prompt and the line being typed on it, which is how
 //!   history, recall and the namespace in the tab name are all read off the
 //!   screen rather than tracked.
@@ -27,6 +28,7 @@ pub mod grid;
 pub mod lineedit;
 pub mod palette;
 pub mod parser;
+pub mod sql;
 pub mod syntax;
 
 pub use cell::Attrs;

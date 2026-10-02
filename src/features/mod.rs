@@ -13,10 +13,12 @@
 //! - [`macros`] runs saved command sequences, with parameters.
 //! - [`natives`] is the built-in set of those.
 //! - [`analyze`] hands a transcript to Claude Code.
+//! - [`autocomplete`] suggests the rest of the word being typed at a prompt.
 //! - [`snake`] is the easter egg `/snake` opens, and is a game, not a terminal.
 //! - [`update`] checks for a newer release and installs it.
 
 pub mod analyze;
+pub mod autocomplete;
 pub mod autologon;
 pub mod doc_lookup;
 pub mod export;

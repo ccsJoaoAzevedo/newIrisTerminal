@@ -9,8 +9,11 @@
 //!   means is decided in one place rather than at every call site.
 //! - [`chrome`] draws the title bar, because the window has no system frame.
 //! - [`panels`] holds the settings, profile and update dialogs.
-//! - [`theme_manager`], [`macro_manager`] are the editors for those.
+//! - [`settings_view`] is the Settings window, laid out with [`prefs`]: a
+//!   sidebar, pages of cards, and a search over every row - including the
+//!   pages that edit themes, macros and the screen saver.
 //! - [`search`] is Ctrl+F over the transcript.
+//! - [`completion`] draws the autocomplete popup under the cursor.
 //! - [`wrap`] decides which grid line each display row shows.
 //! - [`fonts`], [`icons`], [`shading`], [`monitors`], [`shortcut`] are small
 //!   helpers named for what they do.
@@ -19,21 +22,23 @@
 //!   session at all.
 
 pub mod chrome;
+pub mod completion;
 pub mod desktop;
 pub mod detach;
 pub mod fonts;
 pub mod icons;
 pub mod input;
-pub mod macro_manager;
 pub mod monitors;
 pub mod panels;
-pub mod screensaver_manager;
+pub mod prefs;
+pub mod screensaver_image;
+pub mod screensaver_logos;
 pub mod screensaver_view;
 pub mod search;
+pub mod settings_view;
 pub mod shading;
 pub mod shortcut;
 pub mod snake_view;
 pub mod terminal_view;
-pub mod theme_manager;
 pub mod tray;
 pub mod wrap;

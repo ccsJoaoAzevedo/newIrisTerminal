@@ -97,6 +97,16 @@ pub struct Tab {
     /// The folder a shell's prompt last said it was in, so a remembered tab
     /// can reopen there. See [`lineedit::shell_cwd`].
     pub cwd: Option<String>,
+    /// The session was last seen at the IRIS SQL shell's prompt, `USER>>`.
+    ///
+    /// Read off the prompt after every chunk of output, and kept while there
+    /// is no prompt on screen - a query running - so the tab's `SQL` marker
+    /// does not blink off for the length of every result set. What enters or
+    /// leaves the shell does not set it: the prompt that follows does.
+    pub sql: bool,
+    /// The autocomplete popup and whether it is listening. See
+    /// [`crate::features::autocomplete`].
+    pub completion: Completion,
 }
 
 /// Source of [`Tab::uid`]. Never reused, so a closed tab's id cannot collide
@@ -160,6 +170,8 @@ impl Tab {
             resume_namespace: None,
             cwd: None,
             zn_sent: None,
+            sql: false,
+            completion: Completion::default(),
         };
         tab.start();
         tab
@@ -203,6 +215,8 @@ impl Tab {
             resume_namespace: None,
             cwd: None,
             zn_sent: None,
+            sql: false,
+            completion: Completion::default(),
         }
     }
 
@@ -478,6 +492,11 @@ impl Tab {
                 }
                 self.namespace = Some(namespace);
             }
+            if !self.profile.is_shell() {
+                if let Some(prompt) = lineedit::prompt(&self.grid) {
+                    self.sql = prompt.sql;
+                }
+            }
 
             let still_on_password = self.autologon.state() == AutoState::WaitPassword;
             // Everything above the row the cursor is on. A command and its
@@ -751,6 +770,8 @@ mod tests {
             resume_namespace: None,
             cwd: None,
             zn_sent: None,
+            sql: false,
+            completion: Completion::default(),
         }
     }
 

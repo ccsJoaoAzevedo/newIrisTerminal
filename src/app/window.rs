@@ -53,10 +53,23 @@ impl App {
         }
     }
 
+    /// The interface scale, held to the range the setting offers: a
+    /// hand-edited 0 would make every widget vanish.
+    pub(super) fn ui_scale(&self) -> f32 {
+        let scale = self.settings.ui_scale;
+        if scale.is_finite() {
+            scale.clamp(1.0, 2.0)
+        } else {
+            1.0
+        }
+    }
+
     /// How the terminal should be drawn, from the current settings.
     pub(super) fn render_opts(&self) -> RenderOpts {
         RenderOpts {
-            font_size: self.settings.font_size,
+            // Divided back out of the zoom that enlarges the interface, so
+            // the terminal stays the size its own setting says.
+            font_size: self.settings.font_size / self.ui_scale(),
             font_family: self.font_family.clone(),
             cursor_style: self.settings.cursor_style,
             cursor_blink: self.settings.cursor_blink,
@@ -66,6 +79,9 @@ impl App {
             copy_on_select: self.settings.copy_on_select,
             intellisense: self.settings.intellisense,
             wide_grid: true,
+            sql_syntax: self.settings.sql_highlight,
+            // Per pane, from the pane's own prompt - see `App::terminal_pane`.
+            sql_mode: None,
         }
     }
 
@@ -297,31 +313,6 @@ impl App {
         } else if cancel || !open {
             self.confirm_close = false;
         }
-    }
-
-    /// How much of the title-bar row is kept back from the tabs: whatever the
-    /// theme puts to their right, plus the strip that is always draggable.
-    ///
-    /// Measured rather than guessed, because a theme can hide any of the three
-    /// controls and the row height decides how wide one is. The tabs are given
-    /// what is left, so a long strip of them scrolls instead of running under
-    /// the close button. See [`TITLE_FREE_STRIP`] for the rest of it.
-    pub(super) fn title_bar_reserve(&self) -> f32 {
-        // Only what the theme puts to the right of the tabs: whatever is to
-        // their left was drawn before them and has already taken its room.
-        let style = self.theme().window_buttons;
-        let own = self.settings.show_window_buttons;
-        let buttons = style
-            .trailing()
-            .iter()
-            .filter(|b| style.shows(**b))
-            .filter(|b| {
-                use crate::config::theme::TitleButton::*;
-                own || !matches!(b, Close | Minimize | Maximize)
-            })
-            .count();
-        let side = TITLE_CONTROL_SIDE;
-        buttons as f32 * side + TITLE_FREE_STRIP
     }
 
     /// The size a session for `profile` should open at.

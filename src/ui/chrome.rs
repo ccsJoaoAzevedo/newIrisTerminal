@@ -7,7 +7,7 @@
 
 use egui::viewport::ResizeDirection;
 use egui::{
-    Align, Color32, Context, CursorIcon, Id, Layout, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2,
+    Color32, Context, CursorIcon, Id, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2,
     ViewportCommand,
 };
 
@@ -67,18 +67,21 @@ impl Icon {
             // painted in it would claim to be one. It has a slot of its own
             // instead, and falls back to the glyph colour when the theme is
             // silent about it - which is where it was before the slot existed.
-            Icon::Settings | Icon::Pin { .. } => style.settings,
+            Icon::Settings => style.settings,
+            // The gear's colour when the theme names none for the pin, which
+            // is all it had before it had a slot of its own.
+            Icon::Pin { .. } => style.on_top.or(style.settings),
             Icon::NewTab => style.new_tab,
             // The stroked style draws it in the tab's own ink, as it always
             // has; a red cross in every tab would shout. The other two have no
             // un-coloured button to offer, and a close light is what they are
             // already drawing at the corner of the window.
-            Icon::CloseTab => match style.style {
+            Icon::CloseTab => style.close_tab.or(match style.style {
                 WindowButtonStyle::Stroke => None,
                 WindowButtonStyle::Aqua | WindowButtonStyle::Luna | WindowButtonStyle::Materia => {
                     style.close
                 }
-            },
+            }),
         }
     }
 
@@ -481,33 +484,39 @@ pub enum WindowAction {
     ToggleOnTop,
 }
 
-/// Draws one end of the title bar with nothing behind it, for a theme preview.
+/// Draws a title bar with nothing behind it, for a theme preview.
 ///
-/// The clicks are dropped: this is a picture of the buttons, not the buttons.
-/// Under the stroked style the glyph colour still comes from the surrounding
-/// widget colours - that is what the style means - so what a preview shows of
-/// it is whatever the *active* theme says, not the one being edited.
-pub fn sample_buttons(ui: &mut Ui, style: &WindowButtons, side: Side) {
+/// Laid out by the very code the windows use, so what the preview shows of the
+/// spaces - what packs left, what is centred, what packs right - is what the
+/// bar will do. Nothing in it drags a window, and its clicks are dropped: this
+/// is a picture of the buttons, not the buttons. Under the stroked style the
+/// glyph colour still comes from the surrounding widget colours - that is what
+/// the style means - so what a preview shows of it is whatever the *active*
+/// theme says, not the one being edited.
+pub fn sample_bar(ui: &mut Ui, style: &WindowButtons, middle: &str) {
     let mut open = false;
     let mut plus = |ui: &mut Ui| {
         let _ = new_tab_button(ui, style);
     };
-    let _ = controls(
-        ui,
-        style,
-        true,
-        Some(&mut open),
-        Some(false),
-        side,
-        Some(&mut plus),
-    );
-}
-
-/// Which end of the title bar: before the tabs in the theme's order, or after.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    Leading,
-    Trailing,
+    let mut tabs = |ui: &mut Ui, _room: f32| {
+        ui.add(egui::Label::new(egui::RichText::new(middle).weak()).selectable(false));
+        None
+    };
+    ui.horizontal(|ui| {
+        let _ = title_bar(
+            ui,
+            TitleBar {
+                style,
+                window_controls: true,
+                window: "nit-theme-preview",
+                draggable: false,
+                settings: Some(&mut open),
+                on_top: Some(false),
+                new_tab: Some(&mut plus),
+                tabs: &mut tabs,
+            },
+        );
+    });
 }
 
 /// The maximize control's icon and tooltip, which depend on where the window is
@@ -520,88 +529,206 @@ fn maximize_icon(ui: &Ui) -> (Icon, &'static str) {
     }
 }
 
-/// Draws what the theme puts before the tabs, at the left-hand end of the row.
+/// A strip of the title bar kept free of tabs.
 ///
-/// Called before anything else in the title bar; the drag area is still
-/// claimed at the end by [`title_bar_controls`]. See [`title_bar_controls`]
-/// for the arguments.
-pub fn leading_window_buttons(
-    ui: &mut Ui,
-    style: &WindowButtons,
-    window_controls: bool,
-    settings: Option<&mut bool>,
-    on_top: Option<bool>,
-    new_tab: Option<&mut dyn FnMut(&mut Ui)>,
-) -> Option<WindowAction> {
-    controls(
-        ui,
-        style,
-        window_controls,
-        settings,
-        on_top,
-        Side::Leading,
-        new_tab,
-    )
+/// The handle that is always there. A row of tabs long enough to fill the bar
+/// would otherwise leave nothing to drag the window by, and with the system's
+/// frame turned off there is then no way to move it at all.
+const FREE_STRIP: f32 = 28.0;
+
+/// Everything a window's title bar holds besides the theme's order.
+pub struct TitleBar<'a> {
+    pub style: &'a WindowButtons,
+    /// False leaves out close, minimize and maximize - the setting that hides
+    /// them - but not the gear or the pin, which are the app's own.
+    pub window_controls: bool,
+    /// Which window the bar belongs to, which keys its drag handles: several
+    /// windows draw one, and a shared id would make them one widget.
+    pub window: &'static str,
+    /// False while the system is drawing the frame, when the real title bar
+    /// does the moving and the gaps here are only gaps.
+    pub draggable: bool,
+    /// The gear's open flag, and whether the window is pinned on top. `None`
+    /// for a window without them.
+    pub settings: Option<&'a mut bool>,
+    pub on_top: Option<bool>,
+    /// Draws the `+`, which only the caller knows how to.
+    pub new_tab: Option<&'a mut dyn FnMut(&mut Ui)>,
+    /// Draws whatever stands where the order puts `Tabs` - the tabs, the
+    /// session's line, a dialog's name - in at most the width it is given.
+    pub tabs: &'a mut dyn FnMut(&mut Ui, f32) -> Option<WindowAction>,
 }
 
-/// One end of the bar, in the theme's order.
+/// One item of the order, laid out: its kind, and the width it advances the
+/// row by.
+fn item_width(bar: &TitleBar, button: TitleButton, side: f32, tabs: f32, gap: f32) -> f32 {
+    match button {
+        TitleButton::LeftSpace | TitleButton::RightSpace => 0.0,
+        TitleButton::Tabs => tabs + gap,
+        b if drawn(bar, b) => side + gap,
+        _ => 0.0,
+    }
+}
+
+/// Whether `button` takes room on this bar.
+fn drawn(bar: &TitleBar, button: TitleButton) -> bool {
+    match button {
+        TitleButton::Close | TitleButton::Minimize | TitleButton::Maximize => {
+            bar.window_controls && bar.style.shows(button)
+        }
+        TitleButton::OnTop => bar.on_top.is_some() && bar.style.shows(button),
+        TitleButton::Settings => bar.settings.is_some(),
+        TitleButton::NewTab => bar.new_tab.is_some(),
+        TitleButton::Tabs => true,
+        TitleButton::LeftSpace | TitleButton::RightSpace => false,
+    }
+}
+
+/// Where the centred group starts, given where the left group ended, where the
+/// right group starts, and how wide the centred group is.
 ///
-/// `window_controls` false leaves out close, minimize and maximize - the
-/// setting that hides them - but not the gear or the pin, which are the app's
-/// own. `settings`, `on_top` and `new_tab` are `None` for a window without
-/// them; `new_tab` draws the `+`, which only its caller knows how to.
-fn controls(
-    ui: &mut Ui,
-    style: &WindowButtons,
-    window_controls: bool,
-    mut settings: Option<&mut bool>,
-    on_top: Option<bool>,
-    side: Side,
-    mut new_tab: Option<&mut dyn FnMut(&mut Ui)>,
-) -> Option<WindowAction> {
+/// Centred on the whole bar rather than on what is left of it, the way a title
+/// is centred on a window - but never into either end, which wins when there
+/// is not room for both.
+pub fn centred_start(
+    bar: std::ops::Range<f32>,
+    lead_end: f32,
+    trail_start: f32,
+    width: f32,
+) -> f32 {
+    let centre = (bar.start + bar.end) * 0.5 - width * 0.5;
+    centre.min(trail_start - width).max(lead_end)
+}
+
+/// Draws the whole bar in the theme's order: the left group against the left
+/// end, the right group against the right, what is between the spaces in the
+/// middle, and makes every gap between them a handle for the window.
+///
+/// Laid out left to right in one pass. The right-hand and middle groups have
+/// to be measured before they are drawn, and the one thing in them whose width
+/// is not known up front - the tabs - is measured by the frame before: a
+/// strip of tabs only changes width when a tab opens, closes or is renamed,
+/// and the frame asked for when it does puts things right.
+pub fn title_bar(ui: &mut Ui, mut bar: TitleBar) -> Option<WindowAction> {
     let mut action = None;
-    let group = match side {
-        Side::Leading => style.leading().to_vec(),
-        // A right-to-left row places the last one first.
-        Side::Trailing => style.trailing().iter().rev().copied().collect(),
+    let style = *bar.style;
+    let side = ui.spacing().interact_size.y;
+    let gap = ui.spacing().item_spacing.x;
+    let full = ui.available_rect_before_wrap().x_range();
+    let full = full.min..full.max;
+    let tabs_id = Id::new(("nit-titlebar-tabs-width", bar.window));
+    let remembered: f32 = ui.data(|d| d.get_temp(tabs_id)).unwrap_or(0.0);
+
+    // What the tabs may take: the bar less every button on it and the strip
+    // that is always left free.
+    let fixed: f32 = style
+        .order
+        .iter()
+        .filter(|b| **b != TitleButton::Tabs)
+        .map(|b| item_width(&bar, *b, side, 0.0, gap))
+        .sum();
+    let tabs_room = (full.end - full.start - fixed - gap - FREE_STRIP).max(60.0);
+    let tabs_guess = remembered.min(tabs_room);
+    let width_of = |bar: &TitleBar, group: &[TitleButton]| -> f32 {
+        group
+            .iter()
+            .map(|b| item_width(bar, *b, side, tabs_guess, gap))
+            .sum()
     };
-    for button in group {
-        match button {
-            TitleButton::Close if window_controls => {
-                if clicked(optional_button(ui, Icon::Close, tr("Close"), style)) {
-                    action = Some(WindowAction::Close);
-                }
+    let middle_width = width_of(&bar, style.middle());
+    let trailing_width = width_of(&bar, style.trailing());
+
+    let mut measured = None;
+    let groups = [style.leading(), style.middle(), style.trailing()];
+    for (at, group) in groups.into_iter().enumerate() {
+        let group_start = ui.cursor().min.x;
+        let (target, tag) = match at {
+            0 => (group_start, ""),
+            // Two spaces with nothing between them are one stretch, which the
+            // right-hand group's gap below covers.
+            1 if group.is_empty() => continue,
+            1 => (
+                centred_start(
+                    full.clone(),
+                    group_start,
+                    full.end - trailing_width,
+                    middle_width,
+                ),
+                "left-space",
+            ),
+            _ => (full.end - trailing_width, "right-space"),
+        };
+        if target > group_start {
+            if let Some(asked) = drag_span(ui, group_start..target, bar.draggable, bar.window, tag)
+            {
+                action = Some(asked);
             }
-            TitleButton::Minimize if window_controls => {
-                if clicked(optional_button(ui, Icon::Minimize, tr("Minimize"), style)) {
-                    action = Some(WindowAction::Minimize);
-                }
+            ui.add_space(target - group_start);
+        }
+        for button in group {
+            if let Some(asked) = draw_item(ui, &mut bar, *button, tabs_room, &mut measured) {
+                action = Some(asked);
             }
-            TitleButton::Maximize if window_controls => {
-                let (icon, hint) = maximize_icon(ui);
-                if clicked(optional_button(ui, icon, hint, style)) {
-                    action = Some(WindowAction::ToggleMaximize);
-                }
-            }
-            TitleButton::OnTop => {
-                if on_top_toggle(ui, style, on_top) {
-                    action = Some(WindowAction::ToggleOnTop);
-                }
-            }
-            TitleButton::Settings => {
-                if let Some(open) = settings.as_deref_mut() {
-                    settings_toggle(ui, style, open);
-                }
-            }
-            TitleButton::NewTab => {
-                if let Some(draw) = new_tab.as_deref_mut() {
-                    draw(ui);
-                }
-            }
-            _ => {}
+        }
+    }
+
+    if let Some(width) = measured {
+        if (width - remembered).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(tabs_id, width));
+            // Only the groups after the tabs were placed by the old width.
+            ui.ctx().request_repaint();
         }
     }
     action
+}
+
+/// Draws one item of the order, reporting what it asked for. `measured` is
+/// where the tabs' width is left for the next frame to lay out by.
+fn draw_item(
+    ui: &mut Ui,
+    bar: &mut TitleBar,
+    button: TitleButton,
+    tabs_room: f32,
+    measured: &mut Option<f32>,
+) -> Option<WindowAction> {
+    let style = bar.style;
+    let window_controls = bar.window_controls;
+    match button {
+        TitleButton::Close if window_controls => {
+            clicked(optional_button(ui, Icon::Close, tr("Close"), style))
+                .then_some(WindowAction::Close)
+        }
+        TitleButton::Minimize if window_controls => {
+            clicked(optional_button(ui, Icon::Minimize, tr("Minimize"), style))
+                .then_some(WindowAction::Minimize)
+        }
+        TitleButton::Maximize if window_controls => {
+            let (icon, hint) = maximize_icon(ui);
+            clicked(optional_button(ui, icon, hint, style)).then_some(WindowAction::ToggleMaximize)
+        }
+        TitleButton::OnTop => {
+            on_top_toggle(ui, style, bar.on_top).then_some(WindowAction::ToggleOnTop)
+        }
+        TitleButton::Settings => {
+            if let Some(open) = bar.settings.as_deref_mut() {
+                settings_toggle(ui, style, open);
+            }
+            None
+        }
+        TitleButton::NewTab => {
+            if let Some(draw) = bar.new_tab.as_deref_mut() {
+                draw(ui);
+            }
+            None
+        }
+        TitleButton::Tabs => {
+            let from = ui.cursor().min.x;
+            let asked = (bar.tabs)(ui, tabs_room);
+            *measured = Some(ui.cursor().min.x - from - ui.spacing().item_spacing.x);
+            asked
+        }
+        _ => None,
+    }
 }
 
 /// The gear on its own, for a window whose frame the system is drawing: there
@@ -741,62 +868,6 @@ pub fn drag_text(
     drag_area(ui, handle, Id::new(("nit-titlebar-text", window, tag)))
 }
 
-/// Draws what the theme puts after the tabs, at the right-hand end of the row,
-/// then makes whatever space is left draggable.
-///
-/// Buttons first, dragging second: the drag area is the leftover rectangle, so
-/// it cannot swallow the buttons however narrow the window gets. It is claimed
-/// even when nothing at all is drawn here: without it the window could not be
-/// moved.
-///
-/// `buttons` is false when the setting has the window controls hidden.
-/// `settings` is the gear and `on_top` whether the window is kept above the
-/// others; `new_tab` draws the `+`. Each is `None` for a window without it, and
-/// each is drawn only if the theme puts it at this end.
-pub fn title_bar_controls(
-    ui: &mut Ui,
-    style: &WindowButtons,
-    buttons: bool,
-    window: &'static str,
-    settings: Option<&mut bool>,
-    on_top: Option<bool>,
-    new_tab: Option<&mut dyn FnMut(&mut Ui)>,
-) -> Option<WindowAction> {
-    let mut action = None;
-
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        action = controls(
-            ui,
-            style,
-            buttons,
-            settings,
-            on_top,
-            Side::Trailing,
-            new_tab,
-        );
-
-        // Everything between the buttons and whatever the caller has already
-        // put on the left, all of it: a title bar you can only take hold of by
-        // hitting its name is not one. What the caller placed - the tabs, when
-        // the setting puts them up here - has already advanced the row's
-        // cursor, so this is exactly the space they left.
-        let rest = ui.available_rect_before_wrap();
-        if rest.width() > 0.0 {
-            // Keyed by the window that asked for the bar. Three of them draw
-            // one now - the main window and the two dialogs that live in
-            // windows of their own - and a shared id makes them one widget as
-            // far as egui is concerned, so only whichever was drawn last would
-            // answer to the mouse.
-            let id = Id::new(("nit-titlebar-drag", window));
-            if let Some(asked) = drag_area(ui, rest, id) {
-                action = Some(asked);
-            }
-        }
-    });
-
-    action
-}
-
 /// Makes an existing stretch of the row a handle for the window, without
 /// taking any space for it.
 ///
@@ -930,5 +1001,26 @@ fn edge_at(screen: Rect, pos: Pos2) -> Option<(ResizeDirection, CursorIcon)> {
         Some((ResizeDirection::South, CursorIcon::ResizeSouth))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_middle_group_is_centred_on_the_whole_bar() {
+        assert_eq!(centred_start(0.0..1000.0, 100.0, 900.0, 200.0), 400.0);
+    }
+
+    #[test]
+    fn the_middle_group_gives_way_to_either_end_rather_than_overlap_it() {
+        // A long left-hand group pushes it right of centre.
+        assert_eq!(centred_start(0.0..1000.0, 500.0, 900.0, 200.0), 500.0);
+        // A long right-hand group pushes it left of centre.
+        assert_eq!(centred_start(0.0..1000.0, 100.0, 550.0, 200.0), 350.0);
+        // No room for both: the left-hand end wins, so nothing is drawn
+        // before the bar starts.
+        assert_eq!(centred_start(0.0..1000.0, 500.0, 600.0, 200.0), 500.0);
     }
 }

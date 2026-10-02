@@ -46,6 +46,8 @@ pub enum ContextAction {
     /// Reset the terminal and drop the scrollback. The same thing Ctrl+Delete
     /// does, put where it can be found.
     ClearTerminal,
+    /// Enter the IRIS SQL shell, or leave it. Ctrl+Shift+Q does the same.
+    ToggleSqlMode,
 }
 
 /// The scope entries of the "Analyze with Claude" menu, all reporting the same

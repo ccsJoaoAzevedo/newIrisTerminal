@@ -195,14 +195,11 @@ pub fn current(grid: &Grid) -> Option<LineEdit> {
 /// one.
 pub fn namespace(grid: &Grid) -> Option<String> {
     let row = grid.screen.get(grid.cursor.row)?;
-    let end = syntax::prompt_end_of(&row.cells)?;
-    // `end` is just past the `>`, which is not part of the name.
-    let text: String = row
-        .cells
-        .get(..end.saturating_sub(1))?
-        .iter()
-        .map(|c| c.ch)
-        .collect();
+    // The head leaves out the `>`s and the SQL shell's `[SQL]` tag, and is
+    // missing altogether on a continuation line of a multi-line statement,
+    // whose `1>>` names a line rather than a namespace.
+    let (from, to) = syntax::prompt_of(&row.cells)?.head?;
+    let text: String = row.cells.get(from..to)?.iter().map(|c| c.ch).collect();
     let name = text
         .rsplit(':')
         .next()
@@ -211,6 +208,14 @@ pub fn namespace(grid: &Grid) -> Option<String> {
         .next()
         .unwrap_or_default();
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The prompt on the row the cursor is on, if there is one - which is how the
+/// SQL shell is told apart from an ObjectScript prompt, off the screen rather
+/// than off anything the app remembers sending.
+pub fn prompt(grid: &Grid) -> Option<syntax::Prompt> {
+    let row = grid.screen.get(grid.cursor.row)?;
+    syntax::prompt_of(&row.cells)
 }
 
 /// Text typed at the prompt the cursor is on, trailing blanks trimmed.
@@ -522,6 +527,38 @@ mod tests {
         );
         // Not a prompt row, so nothing to read.
         assert_eq!(namespace(&grid_with("Global ^CSW1 selected", 8)), None);
+    }
+
+    /// Inside the SQL shell the line starts after both `>`s, so recall, Home,
+    /// End and recording the command all measure from where the user started
+    /// typing.
+    #[test]
+    fn the_sql_shells_line_starts_after_both_angle_brackets() {
+        let grid = grid_with("USER>>select 1", 14);
+        let line = current(&grid).expect("a command line");
+        assert_eq!(line.start, 6);
+        assert_eq!(line.len(), 8);
+        assert_eq!(typed_text(&grid).as_deref(), Some("select 1"));
+        assert_eq!(
+            typed_text(&grid_with("[SQL]USER>>select 1", 19)).as_deref(),
+            Some("select 1")
+        );
+        assert!(prompt(&grid).is_some_and(|p| p.sql));
+        assert!(prompt(&grid_with("USER>w 1", 8)).is_some_and(|p| !p.sql));
+    }
+
+    /// The namespace survives a trip into the SQL shell, tagged or not, and a
+    /// numbered continuation line does not rename the tab.
+    #[test]
+    fn the_namespace_is_read_through_the_sql_shells_prompt() {
+        assert_eq!(namespace(&grid_with("USER>>", 6)).as_deref(), Some("USER"));
+        assert_eq!(
+            namespace(&grid_with("[SQL]RDB76-TR>>", 15)).as_deref(),
+            Some("RDB76-TR")
+        );
+        assert_eq!(namespace(&grid_with("2>>from t", 9)), None);
+        // But a continuation line is still a line being typed.
+        assert!(current(&grid_with("2>>from t", 9)).is_some());
     }
 
     #[test]

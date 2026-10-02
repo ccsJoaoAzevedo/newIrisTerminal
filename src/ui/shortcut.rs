@@ -140,9 +140,13 @@ pub fn is_reserved(modifiers: Modifiers, key: Key) -> Option<&'static str> {
         return Some("switching tabs");
     }
     if modifiers.shift {
-        // The one shifted chord the app keeps: a macro on it would hide
-        // reopening a closed tab behind itself.
-        return (key == Key::T).then_some("reopening a closed tab");
+        // The shifted chords the app keeps: a macro on one would hide what it
+        // does behind itself.
+        return match key {
+            Key::T => Some("reopening a closed tab"),
+            Key::Q => Some("entering and leaving SQL mode"),
+            _ => None,
+        };
     }
     RESERVED
         .iter()
@@ -375,6 +379,9 @@ mod tests {
 
         let (m, k) = parse("Ctrl+Shift+T").expect("parse");
         assert_eq!(is_reserved(m, k), Some("reopening a closed tab"));
+
+        let (m, k) = parse("Ctrl+Shift+Q").expect("parse");
+        assert_eq!(is_reserved(m, k), Some("entering and leaving SQL mode"));
 
         // Otherwise adding Shift is enough to get out of the app's way.
         let (m, k) = parse("Ctrl+Shift+R").expect("parse");

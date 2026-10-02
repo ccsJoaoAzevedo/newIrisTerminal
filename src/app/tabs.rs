@@ -187,6 +187,7 @@ impl App {
         let can_reopen = !self.closed_tabs.is_empty();
         let with_namespace = self.settings.show_namespace_in_tab;
         let buttons = self.theme().window_buttons;
+        let selected_colours = (self.theme().tab_selected, self.theme().tab_selected_text);
         // Shrunk to the tabs rather than filling the row: in the title bar the
         // space left over is what the window is dragged by, and a scroll area
         // that claimed the whole width would take all of it.
@@ -260,8 +261,12 @@ impl App {
                     let mut label = self.tabs[index].strip_label(with_namespace);
                     if self.tabs[index].focused().ended {
                         label.push_str(" (ended)");
+                    } else if self.tabs[index].focused().sql {
+                        // On the label rather than in the name, so renaming
+                        // the tab neither loses it nor bakes it in.
+                        label.push_str(" · SQL");
                     }
-                    let response = tab_label(ui, self.tabs[index].uid, selected, label)
+                    let response = tab_label(ui, self.tabs[index].uid, selected, label, selected_colours)
                         .on_hover_text(tr("Double-click to rename, drag to reorder."));
                     if response.clicked() {
                         to_activate = Some(index);
@@ -670,7 +675,15 @@ impl App {
 /// Click and drag both: egui only calls it a drag once the pointer has moved
 /// past the click threshold, so a click still selects and a double-click still
 /// renames.
-fn tab_label(ui: &mut egui::Ui, uid: u64, selected: bool, text: String) -> egui::Response {
+/// One tab's label. `colours` is the theme's fill and text for the selected
+/// tab, either of which may be left to the widget colours.
+fn tab_label(
+    ui: &mut egui::Ui,
+    uid: u64,
+    selected: bool,
+    text: String,
+    colours: (Option<egui::Color32>, Option<egui::Color32>),
+) -> egui::Response {
     let padding = ui.spacing().button_padding;
     let galley = egui::WidgetText::from(text).into_galley(
         ui,
@@ -690,10 +703,14 @@ fn tab_label(ui: &mut egui::Ui, uid: u64, selected: bool, text: String) -> egui:
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact_selectable(&response, selected);
         if selected || response.hovered() || response.highlighted() || response.has_focus() {
+            let fill = match colours.0 {
+                Some(fill) if selected => fill,
+                _ => visuals.weak_bg_fill,
+            };
             ui.painter().rect(
                 rect.expand(visuals.expansion),
                 visuals.rounding,
-                visuals.weak_bg_fill,
+                fill,
                 visuals.bg_stroke,
             );
         }
@@ -701,7 +718,11 @@ fn tab_label(ui: &mut egui::Ui, uid: u64, selected: bool, text: String) -> egui:
             .layout()
             .align_size_within_rect(galley.size(), rect.shrink2(padding))
             .min;
-        ui.painter().galley(at, galley, visuals.text_color());
+        let ink = match colours.1 {
+            Some(ink) if selected => ink,
+            _ => visuals.text_color(),
+        };
+        ui.painter().galley(at, galley, ink);
     }
     response
 }

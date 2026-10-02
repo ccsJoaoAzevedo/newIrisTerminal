@@ -1,22 +1,50 @@
 //! Draws the screen saver, over the whole window or inside the little monitor
 //! in its settings dialog, and keeps the clock it starts by.
 //!
-//! The motion is [`crate::features::screensaver`]'s; this only turns a scene
-//! into shapes, and every size here is a fraction of the rect it is given, so
-//! the preview is the real thing shrunk rather than a picture of it.
+//! The motion is [`crate::features::screensaver`]'s and the logos are
+//! [`crate::ui::screensaver_logos`]'; this turns a scene into shapes, and
+//! every size here is a fraction of the rect it is given, so the preview is
+//! the real thing shrunk rather than a picture of it.
 
 use std::time::{Duration, Instant};
 
-use egui::text::{LayoutJob, TextFormat};
-use egui::{Align2, Color32, Context, FontId, Id, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2};
+use egui::{Align2, Color32, Context, FontId, Id, Painter, Pos2, Rect, Vec2};
 
-use crate::features::screensaver::{Kind, Saver, Scene};
+use crate::features::screensaver::{Config, DvdContent, Kind, LogoContent, Saver, Scene};
+use crate::ui::screensaver_image::{self, Picture};
+use crate::ui::screensaver_logos as logos;
+use crate::ui::shading::darken;
+
+/// How often a scene that is moving asks to be drawn.
+const MOVING: Duration = Duration::from_millis(33);
 
 /// A saver and the time it was last stepped, which is what its `dt` comes
 /// from.
 pub struct SaverView {
     pub saver: Saver,
     last: Option<Instant>,
+    /// When it started, which is the clock a GIF's frames are counted by.
+    born: Instant,
+    /// Why the custom image is not what is showing, if it is not.
+    image_problem: Option<String>,
+}
+
+/// What the floating logo is drawing this frame, the image resolved.
+enum Floating {
+    Xp,
+    Pirated,
+    Text(String, Color32),
+    Image(std::sync::Arc<Picture>),
+}
+
+/// What the floating logo draws, given the settings and, for an image, how
+/// loading it went: anything that cannot be shown is the XP logo.
+fn floating_content(config: &Config, image: Option<Result<(), &str>>) -> LogoContent {
+    match (config.logo_shown(), image) {
+        (LogoContent::CustomImage, Some(Ok(()))) => LogoContent::CustomImage,
+        (LogoContent::CustomImage, _) => LogoContent::WindowsXp,
+        (other, _) => other,
+    }
 }
 
 impl SaverView {
@@ -30,6 +58,8 @@ impl SaverView {
         SaverView {
             saver: Saver::new(kind, seed),
             last: None,
+            born: Instant::now(),
+            image_problem: None,
         }
     }
 
@@ -37,27 +67,34 @@ impl SaverView {
         self.saver.kind
     }
 
-    /// Steps the scene to now and paints it filling `rect`.
-    pub fn paint(&mut self, painter: &Painter, rect: Rect, speed: f32) {
+    /// Why the custom image chosen is not being shown, as of the last paint.
+    pub fn image_problem(&self) -> Option<&str> {
+        self.image_problem.as_deref()
+    }
+
+    /// Steps the scene to now and paints it filling `rect`; returns how soon
+    /// it wants painting again.
+    ///
+    /// Not always "next frame": the floating logo sits still between its
+    /// fades, and a GIF has its own pace, so an idle saver costs what it
+    /// shows rather than a steady thirty frames a second.
+    pub fn paint(&mut self, painter: &Painter, rect: Rect, config: &Config) -> Duration {
         let now = Instant::now();
         let dt = self
             .last
             .map_or(0.0, |last| now.duration_since(last).as_secs_f32());
         self.last = Some(now);
+        let speed = config.speed;
 
-        painter.rect_filled(rect, 0.0, Color32::BLACK);
+        let background = match self.saver.kind {
+            Kind::Matrix => srgb(config.matrix_background),
+            _ => Color32::BLACK,
+        };
+        painter.rect_filled(rect, 0.0, background);
         let painter = painter.with_clip_rect(rect);
         match self.saver.kind {
-            Kind::None => {}
-            Kind::XpLogo => {
-                let logo = xp_size(rect);
-                self.saver.step(dt, speed, room(rect, logo), (0, 0));
-                if let Some(Scene::XpLogo(scene)) = &self.saver.scene {
-                    let space = room(rect, logo);
-                    let at = rect.min + Vec2::new(scene.at.0 * space.0, scene.at.1 * space.1);
-                    paint_xp(&painter, Rect::from_min_size(at, logo), scene.alpha());
-                }
-            }
+            Kind::None => Duration::MAX,
+            Kind::FloatingLogo => self.paint_floating(&painter, rect, config, dt),
             Kind::Matrix => {
                 let cell = matrix_cell(rect);
                 let grid = (
@@ -66,23 +103,131 @@ impl SaverView {
                 );
                 self.saver.step(dt, speed, (0.0, 0.0), grid);
                 if let Some(Scene::Matrix(rain)) = &self.saver.scene {
-                    paint_matrix(&painter, rect, cell, rain);
+                    let colours = (srgb(config.matrix_rain), srgb(config.matrix_head));
+                    paint_matrix(&painter, rect, cell, rain, colours);
                 }
+                MOVING
             }
             Kind::Dvd => {
-                let logo = dvd_size(rect);
+                let width = (rect.width() * 0.17).clamp(36.0, 240.0);
+                let text = match config.dvd_shown() {
+                    DvdContent::DvdVideo => None,
+                    DvdContent::CustomText => {
+                        Some(logos::custom_text(&painter, &config.dvd_text, width * 0.30))
+                    }
+                };
+                let logo = match &text {
+                    None => logos::dvd_size(width),
+                    Some((galley, _)) => galley.size(),
+                };
                 self.saver.step(dt, speed, room(rect, logo), (0, 0));
                 if let Some(Scene::Dvd(dvd)) = &self.saver.scene {
                     let at = rect.min + Vec2::new(dvd.pos.0, dvd.pos.1);
-                    paint_dvd(
-                        &painter,
-                        Rect::from_min_size(at, logo),
-                        DVD_HUES[dvd.hue % DVD_HUES.len()],
-                    );
+                    let colour = DVD_HUES[dvd.hue % DVD_HUES.len()];
+                    match text {
+                        None => logos::paint_dvd(&painter, Rect::from_min_size(at, logo), colour),
+                        Some((galley, heavy)) => {
+                            logos::paint_custom_text(&painter, at, galley, heavy, colour)
+                        }
+                    }
                 }
+                MOVING
             }
         }
     }
+
+    fn paint_floating(
+        &mut self,
+        painter: &Painter,
+        rect: Rect,
+        config: &Config,
+        dt: f32,
+    ) -> Duration {
+        let scale = config.logo_scale.clamp(0.25, 4.0);
+        let h = (rect.height() * 0.16).clamp(18.0, 120.0) * scale;
+
+        let picture = (config.logo_shown() == LogoContent::CustomImage)
+            .then(|| screensaver_image::picture(painter.ctx(), &config.logo_image));
+        self.image_problem = match &picture {
+            Some(Err(why)) => Some(why.clone()),
+            _ => None,
+        };
+        let loaded = picture
+            .as_ref()
+            .map(|p| p.as_ref().map(|_| ()).map_err(String::as_str));
+        let content = match floating_content(config, loaded) {
+            LogoContent::WindowsXp => Floating::Xp,
+            LogoContent::WindowsXpPirated => Floating::Pirated,
+            LogoContent::CustomText => {
+                let [r, g, b] = config.logo_colour;
+                Floating::Text(config.logo_text.clone(), Color32::from_rgb(r, g, b))
+            }
+            LogoContent::CustomImage => match picture {
+                Some(Ok(picture)) => Floating::Image(picture),
+                _ => Floating::Xp,
+            },
+        };
+
+        let text = match &content {
+            Floating::Text(text, _) => Some(logos::custom_text(painter, text, h * 0.6)),
+            _ => None,
+        };
+        let logo = match &content {
+            Floating::Xp => logos::windows_xp_size(painter, h),
+            Floating::Pirated => logos::pirated_size(painter, h * 1.4),
+            Floating::Text(..) => text.as_ref().map_or(Vec2::ZERO, |(g, _)| g.size()),
+            Floating::Image(picture) => {
+                // As tall as the XP logo would be, or less if it is a wide
+                // one that would not otherwise fit the window.
+                let tall = h * 1.6;
+                let size = picture.size * (tall / picture.size.y.max(1.0));
+                size * (rect.width() * 0.8 / size.x.max(1.0)).min(1.0)
+            }
+        };
+        let space = room(rect, logo);
+        self.saver.step(dt, config.speed, space, (0, 0));
+        let Some(Scene::FloatingLogo(scene)) = &self.saver.scene else {
+            return Duration::MAX;
+        };
+        let at = rect.min + Vec2::new(scene.at.0 * space.0, scene.at.1 * space.1);
+        let alpha = scene.alpha();
+        let place = Rect::from_min_size(at, logo);
+        let mut next = scene.held_for().map_or(MOVING, |secs| {
+            Duration::from_secs_f32(secs / config.speed.clamp(0.1, 5.0))
+        });
+        match content {
+            Floating::Xp => logos::paint_windows_xp(painter, place, alpha),
+            Floating::Pirated => logos::paint_pirated(painter, place, alpha),
+            Floating::Text(_, colour) => {
+                if let Some((galley, heavy)) = text {
+                    logos::paint_custom_text(
+                        painter,
+                        at,
+                        galley,
+                        heavy,
+                        colour.gamma_multiply(alpha),
+                    );
+                }
+            }
+            Floating::Image(picture) => {
+                let (texture, change) = picture.frame_at(self.born.elapsed());
+                painter.image(
+                    texture.id(),
+                    place,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE.gamma_multiply(alpha),
+                );
+                if let Some(change) = change {
+                    next = next.min(change);
+                }
+            }
+        }
+        next
+    }
+}
+
+fn srgb([r, g, b]: [u8; 3]) -> Color32 {
+    Color32::from_rgb(r, g, b)
 }
 
 /// How far a logo of `logo` can travel inside `rect`.
@@ -91,92 +236,6 @@ fn room(rect: Rect, logo: Vec2) -> (f32, f32) {
         (rect.width() - logo.x).max(1.0),
         (rect.height() - logo.y).max(1.0),
     )
-}
-
-fn faded(color: Color32, alpha: f32) -> Color32 {
-    color.gamma_multiply(alpha.clamp(0.0, 1.0))
-}
-
-fn xp_size(rect: Rect) -> Vec2 {
-    let h = (rect.height() * 0.16).clamp(18.0, 120.0);
-    Vec2::new(h * 2.9, h)
-}
-
-/// The four-pane flag, waving, and the wordmark beside it.
-fn paint_xp(painter: &Painter, rect: Rect, alpha: f32) {
-    let h = rect.height();
-    let flag = Rect::from_min_size(rect.min, Vec2::new(h * 1.05, h));
-    let gap = h * 0.05;
-    let half = Vec2::new((flag.width() - gap) / 2.0, (flag.height() - gap) / 2.0);
-    let panes = [
-        (Vec2::ZERO, Color32::from_rgb(246, 83, 20)),
-        (Vec2::new(half.x + gap, 0.0), Color32::from_rgb(124, 187, 0)),
-        (Vec2::new(0.0, half.y + gap), Color32::from_rgb(0, 161, 241)),
-        (
-            Vec2::new(half.x + gap, half.y + gap),
-            Color32::from_rgb(255, 187, 0),
-        ),
-    ];
-    for (offset, colour) in panes {
-        waved_pane(
-            painter,
-            Rect::from_min_size(flag.min + offset, half),
-            flag.left(),
-            flag.width(),
-            h * 0.07,
-            faded(colour, alpha),
-        );
-    }
-
-    let text = Pos2::new(flag.right() + h * 0.18, rect.top() + h * 0.30);
-    painter.text(
-        text,
-        Align2::LEFT_BOTTOM,
-        "Microsoft\u{00ae}",
-        FontId::proportional(h * 0.17),
-        faded(Color32::WHITE, alpha),
-    );
-    let word = painter.text(
-        text,
-        Align2::LEFT_TOP,
-        "Windows",
-        FontId::proportional(h * 0.48),
-        faded(Color32::WHITE, alpha),
-    );
-    painter.text(
-        Pos2::new(word.right() + h * 0.04, word.top() - h * 0.06),
-        Align2::LEFT_TOP,
-        "xp",
-        FontId::proportional(h * 0.36),
-        faded(Color32::from_rgb(255, 120, 30), alpha),
-    );
-}
-
-/// One pane of the flag, bent by the same wave across the whole flag so the
-/// four read as one cloth rather than four tiles.
-fn waved_pane(
-    painter: &Painter,
-    rect: Rect,
-    flag_left: f32,
-    flag_width: f32,
-    amp: f32,
-    colour: Color32,
-) {
-    const STRIPS: usize = 10;
-    let wave = |x: f32| ((x - flag_left) / flag_width * std::f32::consts::PI * 1.4).sin() * amp;
-    let mut mesh = Mesh::default();
-    for i in 0..=STRIPS {
-        let x = rect.left() + rect.width() * i as f32 / STRIPS as f32;
-        let dy = wave(x);
-        mesh.colored_vertex(Pos2::new(x, rect.top() + dy), colour);
-        mesh.colored_vertex(Pos2::new(x, rect.bottom() + dy), colour);
-    }
-    for i in 0..STRIPS as u32 {
-        let a = i * 2;
-        mesh.add_triangle(a, a + 1, a + 2);
-        mesh.add_triangle(a + 2, a + 1, a + 3);
-    }
-    painter.add(Shape::mesh(mesh));
 }
 
 fn matrix_cell(rect: Rect) -> Vec2 {
@@ -189,7 +248,11 @@ fn paint_matrix(
     rect: Rect,
     cell: Vec2,
     rain: &crate::features::screensaver::Matrix,
+    (trail, head_colour): (Color32, Color32),
 ) {
+    // A trail fades from the chosen colour at the head to a little over a
+    // third of it at the tail, then out: the film's green, for any colour.
+    let dim = darken(trail, 90.0 / 255.0);
     let font = FontId::monospace(cell.y / 1.1);
     for (x, column) in rain.columns.iter().enumerate() {
         let head = column.head.floor() as i64;
@@ -199,11 +262,10 @@ fn paint_matrix(
                 continue;
             };
             let colour = if row == head {
-                Color32::from_rgb(210, 255, 210)
+                head_colour
             } else {
                 let fade = 1.0 - (head - row) as f32 / column.trail as f32;
-                Color32::from_rgb(0, (90.0 + 165.0 * fade) as u8, (40.0 * fade) as u8)
-                    .gamma_multiply(fade.max(0.15))
+                lerp_colour(dim, trail, fade).gamma_multiply(fade.max(0.15))
             };
             painter.text(
                 rect.min + Vec2::new(x as f32 * cell.x, row as f32 * cell.y),
@@ -216,9 +278,9 @@ fn paint_matrix(
     }
 }
 
-fn dvd_size(rect: Rect) -> Vec2 {
-    let w = (rect.width() * 0.17).clamp(36.0, 240.0);
-    Vec2::new(w, w * 0.52)
+fn lerp_colour(a: Color32, b: Color32, t: f32) -> Color32 {
+    let m = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
 
 /// The colours the logo changes through, one per bounce.
@@ -231,47 +293,6 @@ const DVD_HUES: [Color32; 7] = [
     Color32::from_rgb(230, 90, 230),
     Color32::from_rgb(255, 140, 30),
 ];
-
-fn paint_dvd(painter: &Painter, rect: Rect, colour: Color32) {
-    let w = rect.width();
-    let mut job = LayoutJob::default();
-    job.append(
-        "DVD",
-        0.0,
-        TextFormat {
-            font_id: FontId::proportional(w * 0.42),
-            color: colour,
-            italics: true,
-            ..Default::default()
-        },
-    );
-    let galley = painter.layout_job(job);
-    let at = Pos2::new(rect.center().x - galley.size().x / 2.0, rect.top());
-    // Twice, a hair apart: the bundled font has no bold, and the logo is
-    // nothing if not heavy.
-    painter.galley(at, galley.clone(), colour);
-    painter.galley(at + Vec2::new(w * 0.012, 0.0), galley, colour);
-
-    // The disc under the letters, with VIDEO knocked out of it.
-    let disc = Rect::from_center_size(
-        Pos2::new(rect.center().x, rect.bottom() - rect.height() * 0.17),
-        Vec2::new(w * 0.92, rect.height() * 0.30),
-    );
-    let points: Vec<Pos2> = (0..40)
-        .map(|i| {
-            let a = i as f32 / 40.0 * std::f32::consts::TAU;
-            disc.center() + Vec2::new(a.cos() * disc.width() / 2.0, a.sin() * disc.height() / 2.0)
-        })
-        .collect();
-    painter.add(Shape::convex_polygon(points, colour, Stroke::NONE));
-    painter.text(
-        disc.center(),
-        Align2::CENTER_CENTER,
-        "VIDEO",
-        FontId::proportional(disc.height() * 0.62),
-        Color32::BLACK,
-    );
-}
 
 fn activity_id() -> Id {
     Id::new("nit-screensaver-activity")
@@ -321,7 +342,9 @@ pub fn last_activity(ctx: &Context) -> Instant {
 pub struct Running {
     pub view: SaverView,
     pub started: Instant,
-    pub speed: f32,
+    /// The settings it was started with: a preview runs a draft that is not
+    /// the setting yet.
+    pub config: Config,
 }
 
 /// Input inside this long after the saver starts does not stop it. The click
@@ -330,11 +353,11 @@ pub struct Running {
 const GRACE: Duration = Duration::from_millis(600);
 
 impl Running {
-    pub fn new(kind: Kind, speed: f32) -> Self {
+    pub fn new(config: Config) -> Self {
         Running {
-            view: SaverView::new(kind),
+            view: SaverView::new(config.kind),
             started: Instant::now(),
-            speed,
+            config,
         }
     }
 
@@ -343,13 +366,15 @@ impl Running {
         last_activity(ctx) > self.started + GRACE
     }
 
-    /// Paints it over everything in the window.
+    /// Paints it over everything in the window, and returns how soon it
+    /// wants painting again.
     ///
     /// In an area of its own above every other layer, and one that senses
     /// clicks: the click that wakes it has to land on the saver, not on
     /// whatever in the terminal happened to be under the pointer.
-    pub fn show(&mut self, ctx: &Context) {
+    pub fn show(&mut self, ctx: &Context) -> Duration {
         let screen = ctx.screen_rect();
+        let mut next = MOVING;
         egui::Area::new(Id::new("nit-screensaver"))
             .order(egui::Order::Debug)
             .fixed_pos(screen.min)
@@ -357,8 +382,63 @@ impl Running {
             .show(ctx, |ui| {
                 let (rect, _) =
                     ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
-                self.view.paint(ui.painter(), rect, self.speed);
+                next = self.view.paint(ui.painter(), rect, &self.config);
             });
         ctx.set_cursor_icon(egui::CursorIcon::None);
+        next
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wanting(logo: LogoContent) -> Config {
+        Config {
+            kind: Kind::FloatingLogo,
+            logo,
+            logo_text: "IRIS".into(),
+            logo_image: "picture.gif".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn an_image_that_will_not_load_floats_the_xp_logo_instead() {
+        let config = wanting(LogoContent::CustomImage);
+        assert_eq!(
+            floating_content(&config, Some(Err("not a GIF"))),
+            LogoContent::WindowsXp
+        );
+        assert_eq!(floating_content(&config, None), LogoContent::WindowsXp);
+        assert_eq!(
+            floating_content(&config, Some(Ok(()))),
+            LogoContent::CustomImage
+        );
+        // What loads has no say over content that is not an image.
+        assert_eq!(
+            floating_content(&wanting(LogoContent::WindowsXpPirated), None),
+            LogoContent::WindowsXpPirated
+        );
+    }
+
+    /// End to end, through the cache: a file that does not exist leaves the
+    /// view saying why, and painting the saver over it does not fail.
+    #[test]
+    fn a_missing_image_file_is_reported_and_the_saver_still_draws() {
+        let ctx = Context::default();
+        let gone = std::env::temp_dir().join("nit-screensaver-test-missing.gif");
+        let config = Config {
+            logo_image: gone.display().to_string(),
+            ..wanting(LogoContent::CustomImage)
+        };
+        let mut view = SaverView::new(Kind::FloatingLogo);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 200.0));
+                view.paint(ui.painter(), rect, &config);
+            });
+        });
+        assert!(view.image_problem().is_some());
     }
 }

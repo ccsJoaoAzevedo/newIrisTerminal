@@ -26,10 +26,15 @@ enum Highlight {
 ///
 /// Computed per row rather than per cell because the scan has to see a whole
 /// line to know whether a `^` is inside quotes.
-pub(super) fn syntax_overrides(cells: &[Cell], theme: &Theme, out: &mut Vec<Option<Color32>>) {
+pub(super) fn syntax_overrides(
+    cells: &[Cell],
+    sql: bool,
+    theme: &Theme,
+    out: &mut Vec<Option<Color32>>,
+) {
     out.clear();
     out.resize(cells.len(), None);
-    for span in syntax::scan(cells) {
+    for span in syntax::scan_row(cells, sql) {
         let colour = theme.syntax_color(span.kind);
         out[span.start..span.end.min(cells.len())].fill(Some(colour));
     }

@@ -7,8 +7,8 @@
 //! routed through a confirmation step without the panel knowing anything about
 //! sessions.
 //!
-//! Three things used to live here and no longer do. Macros are managed in
-//! [`crate::ui::macro_manager`], a window of its own reached from Settings, and
+//! Three things used to live here and no longer do. Macros are managed on
+//! the Macros page of Settings ([`crate::ui::settings_view::macros`]), and
 //! run from the terminal's right-click menu; exporting and the IRIS utilities
 //! are on that menu too, beside the output they act on. What is left of the
 //! macros here is the confirmation step, which is the part that has to
@@ -16,20 +16,13 @@
 
 use egui::{Context, Ui};
 
-use crate::config::profile::Remote;
-use crate::config::servers::{Server, ServerList, Target};
-use crate::config::{profile::LogMode, CursorStyle, IntellisenseMode, Profile, Settings, Theme};
 use crate::features::macros::Macro;
 use crate::features::natives::Native;
 use crate::i18n::{tr, tr1, tr2};
-use crate::term::Encoding;
 
 /// Colour for "this is set, but it will not do what you expect". Not from the
 /// theme: it has to stay legible as a warning in every one of them.
 pub const WARNING: egui::Color32 = egui::Color32::from_rgb(220, 120, 60);
-
-/// Shown in the font picker for "whatever egui ships with".
-const BUILT_IN_FONT: &str = "Built-in monospace";
 
 /// Something the user asked for. `app.rs` decides whether and how to honour it.
 #[derive(Clone, Debug)]
@@ -54,18 +47,36 @@ pub enum UiRequest {
     CheckForUpdates,
     /// Store (or, when empty, forget) the password for the HTTP proxy.
     SetProxyPassword(String),
+    /// Something the Themes pages asked for: using, writing or deleting a
+    /// theme, or drawing the window again in one edited in place.
+    Theme(crate::ui::settings_view::themes::ThemeAction),
+    /// Run this screen saver over the whole window now, until the next key or
+    /// movement.
+    PreviewScreensaver(crate::features::screensaver::Config),
+    /// Open Settings on this page - the way into what used to be a manager's
+    /// window of its own.
+    OpenSettings(crate::ui::settings_view::Route),
 }
 
 /// State the panels own between frames.
 #[derive(Default)]
 pub struct PanelState {
     pub show_settings: bool,
-    /// The theme manager, which keeps its own selection and rename draft.
-    pub themes: crate::ui::theme_manager::ThemeManagerState,
-    /// The macro manager, which keeps its own selection and editing draft.
-    pub macros: crate::ui::macro_manager::MacroManagerState,
-    /// The screen saver dialog, which keeps its draft until OK or Apply.
-    pub screensaver: crate::ui::screensaver_manager::ScreensaverManagerState,
+    /// The page the settings window is on, kept while it is closed so it
+    /// reopens there.
+    pub settings_route: crate::ui::settings_view::Route,
+    /// What is typed in the settings window's search field.
+    pub settings_search: String,
+    /// The row a search result led to, and when, so it can be lit briefly.
+    pub settings_highlight: Option<(&'static str, f64)>,
+    /// The row to scroll into view on the next frame the page is drawn.
+    pub settings_scroll_to: Option<&'static str>,
+    /// The Themes pages, which keep their own selection and rename draft.
+    pub themes: crate::ui::settings_view::themes::ThemePageState,
+    /// The Macros pages, which keep their own selection and editing draft.
+    pub macros: crate::ui::settings_view::macros::MacroPageState,
+    /// The Screen saver page's little monitor and file dialog.
+    pub screensaver: crate::ui::settings_view::screensaver::SaverPageState,
     /// A macro waiting on parameter values and/or confirmation.
     pub pending: Option<PendingMacro>,
     /// An IRIS helper waiting on its fields.
@@ -73,20 +84,19 @@ pub struct PanelState {
     /// The proxy password as it is being typed. Handed to the credential store
     /// when the field loses focus and cleared immediately, so the secret is not
     /// left sitting in the app's state for the rest of the session.
-    proxy_password: String,
-    /// The settings window is listening for the manager's chord.
+    pub(crate) proxy_password: String,
+    /// The Macros page is listening for the chord that opens it.
     ///
-    /// Its own flag rather than the manager's: both pickers consume the key
-    /// presses of the frame they are listening in, and sharing one would have
-    /// the manager's editor - drawn later in the frame - record the chord meant
-    /// for the setting into whichever macro happened to be open. Public for the
-    /// same reason the manager's is: the app has to stop claiming shortcuts for
-    /// itself while it is set.
+    /// Its own flag rather than the macro editor's: both pickers consume the
+    /// key presses of the frame they are listening in, and sharing one would
+    /// have the editor record the chord meant for the setting into whichever
+    /// macro happened to be open. Public for the same reason the editor's is:
+    /// the app has to stop claiming shortcuts for itself while it is set.
     pub capture_manager_shortcut: bool,
     /// Installed monospace families, listed once. Enumerating system fonts is
     /// slow enough that doing it per frame would be felt while the Settings
     /// window is open.
-    font_families: Option<Vec<String>>,
+    pub(crate) font_families: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -257,8 +267,10 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
             ui.separator();
         }
 
-        let mut fields = Vec::with_capacity(pending.source.params.len());
-        for (index, param) in pending.source.params.iter().enumerate() {
+        // Only the parameters that reach the command, the same ones `values`
+        // was built from - so the two line up index for index.
+        let mut fields = Vec::with_capacity(pending.values.len());
+        for (index, param) in pending.source.usable_params().enumerate() {
             ui.horizontal(|ui| {
                 let prompt = if param.prompt.is_empty() {
                     &param.name
@@ -542,911 +554,7 @@ fn megabytes(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_048_576.0)
 }
 
-/// A heading with room around it, so the sections of the settings window read
-/// as sections rather than as one list with bold lines in it.
-fn section(ui: &mut Ui, title: &str) {
-    ui.add_space(6.0);
-    ui.separator();
-    ui.heading(title);
-    ui.add_space(2.0);
-}
-
-/// Settings: theme, font, scrollback, logging, and profiles.
-#[allow(clippy::too_many_arguments)]
-pub fn settings_dialog(
-    ctx: &Context,
-    settings: &mut Settings,
-    themes: &[Theme],
-    state: &mut PanelState,
-    instances: &[String],
-    servers: &ServerList,
-    placement: &mut crate::ui::detach::Placement,
-    buttons: &crate::config::theme::WindowButtons,
-) -> Option<UiRequest> {
-    if !state.show_settings {
-        return None;
-    }
-    let mut changed = false;
-    let mut open = true;
-    // Kept apart from `changed`: opening a folder is an action, not an edit,
-    // and it must not make the app rewrite settings.toml.
-    let mut action: Option<UiRequest> = None;
-
-    crate::ui::detach::shell(
-        ctx,
-        "nit-settings",
-        tr("Settings"),
-        &mut open,
-        [560.0, 680.0],
-        buttons,
-        // A window of its own, so it reopens where and how it was left for
-        // whichever of the two switches below is on.
-        Some(placement),
-        |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // Roomier than egui's default. A settings window is read down
-                // the page one item at a time, and at the default 3pt the
-                // checkboxes and their hints ran together into a wall.
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.heading(tr("Appearance"));
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.label(tr("Language"));
-                    egui::ComboBox::from_id_source("language-picker")
-                        .selected_text(settings.language.label())
-                        .show_ui(ui, |ui| {
-                            for lang in crate::i18n::Lang::ALL {
-                                if ui
-                                    .selectable_label(settings.language == lang, lang.label())
-                                    .clicked()
-                                {
-                                    settings.language = lang;
-                                    // Applied at once rather than at the next
-                                    // start: the rest of this window is what
-                                    // anyone changing the language wants to
-                                    // read in it.
-                                    crate::i18n::set_language(lang);
-                                    changed = true;
-                                }
-                            }
-                        });
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tr("Theme"));
-                    egui::ComboBox::from_id_source("theme-picker")
-                        .selected_text(settings.theme.clone())
-                        .show_ui(ui, |ui| {
-                            for theme in themes {
-                                if ui
-                                    .selectable_label(theme.name == settings.theme, &theme.name)
-                                    .clicked()
-                                {
-                                    settings.theme = theme.name.clone();
-                                    changed = true;
-                                }
-                            }
-                        });
-                    // Editing a theme by hand is still possible, but it is no
-                    // longer the only way: the manager is what the button next
-                    // to the picker offers first.
-                    if ui
-                        .button(tr("Manage themes..."))
-                        .on_hover_text(tr("Duplicate a built-in theme and change any of its colours, including the ObjectScript ones."))
-                        .clicked()
-                    {
-                        state.themes.open = true;
-                    }
-                    if ui
-                        .button(tr("Open folder"))
-                        .on_hover_text(crate::config::themes_dir().display().to_string())
-                        .clicked()
-                    {
-                        action = Some(UiRequest::OpenFolder(crate::config::themes_dir()));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tr("Screen saver"));
-                    ui.weak(tr(settings.screensaver.kind.label()));
-                    if ui
-                        .button(tr("Screen saver..."))
-                        .on_hover_text(tr("What covers the window after a while without a key or a mouse movement."))
-                        .clicked()
-                    {
-                        state.screensaver.open = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tr("Font"));
-                    let families = state
-                        .font_families
-                        .get_or_insert_with(crate::ui::fonts::monospace_families);
-                    let selected = if settings.font_family.is_empty() {
-                        tr(BUILT_IN_FONT)
-                    } else {
-                        settings.font_family.as_str()
-                    };
-                    egui::ComboBox::from_id_source("font-picker")
-                        .selected_text(selected)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(
-                                    settings.font_family.is_empty(),
-                                    tr(BUILT_IN_FONT),
-                                )
-                                .clicked()
-                            {
-                                settings.font_family.clear();
-                                changed = true;
-                            }
-                            for family in families.iter() {
-                                if ui
-                                    .selectable_label(&settings.font_family == family, family)
-                                    .clicked()
-                                {
-                                    settings.font_family = family.clone();
-                                    changed = true;
-                                }
-                            }
-                        });
-                });
-                ui.small(tr("Monospace families only: the terminal is a character grid, so a proportional font would not line up."));
-
-                ui.horizontal(|ui| {
-                    ui.label(tr("Font size"));
-                    if ui
-                        .add(egui::Slider::new(&mut settings.font_size, 8.0..=28.0))
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label(tr("Cursor"));
-                    for style in CursorStyle::ALL {
-                        if ui
-                            .selectable_label(settings.cursor_style == style, tr(style.label()))
-                            .clicked()
-                        {
-                            settings.cursor_style = style;
-                            changed = true;
-                        }
-                    }
-                    if ui.checkbox(&mut settings.cursor_blink, tr("Blink")).changed() {
-                        changed = true;
-                    }
-                });
-
-                if ui
-                    .checkbox(
-                        &mut settings.terminal_syntax_highlight,
-                        tr("Syntax highlighting"),
-                    )
-                    .on_hover_text(
-                        tr("Colours globals, strings, numbers, commands, macros and class references. A guess about the text on screen; a colour IRIS sets itself always wins."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(&mut settings.show_scrollbars, tr("Show scrollbars"))
-                    .on_hover_text(
-                        tr("Solid scrollbars instead of the thin ones that only appear on hover."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.small(
-                    tr("The built-in themes are read-only; duplicating one in the theme manager gives you a copy to edit. A theme file dropped into the themes folder by hand is picked up at the next start."),
-                );
-
-                section(ui, tr("Session"));
-                ui.horizontal(|ui| {
-                    ui.label(tr("Hide status messages after"));
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut settings.status_timeout_secs)
-                                .range(0..=600)
-                                .suffix(" s"),
-                        )
-                        .on_hover_text(tr(
-                            "Seconds before a message in the footer goes away on its own. 0 leaves it until it is dismissed.",
-                        ))
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tr("Scrollback lines"));
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut settings.scrollback_limit).range(0..=200_000),
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                });
-                if ui
-                    .checkbox(&mut settings.wrap_lines, tr("Wrap long lines"))
-                    .on_hover_text(
-                        tr("On: a long line continues on the next row, breaking at the window edge. Off: it runs off to the right, reached by scrolling sideways or widening the window."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.small(
-                    tr("Either way the whole line is kept: the terminal is reported wider than the window, because IRIS cuts a line at the terminal width instead of wrapping it."),
-                );
-
-                if ui
-                    .checkbox(&mut settings.copy_on_select, tr("Copy on select"))
-                    .on_hover_text(
-                        tr("Put a selection on the clipboard as soon as the mouse is released, without waiting for Ctrl+C."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.horizontal(|ui| {
-                    ui.label(tr("Global tooltip"));
-                    for mode in IntellisenseMode::ALL {
-                        if ui
-                            .selectable_label(settings.intellisense == mode, tr(mode.label()))
-                            .clicked()
-                        {
-                            settings.intellisense = mode;
-                            changed = true;
-                        }
-                    }
-                })
-                .response
-                .on_hover_text(tr(
-                    "What a piece or a subscript of a zwrite'n global means, read out of the class that maps it. On selection: only over text you have selected, which is what a double-click on a piece already gives. On hover: over whatever the pointer is on, with nothing selected. Off: never asked, and no second session is opened to ask with.",
-                ));
-
-                if ui
-                    .checkbox(
-                        &mut settings.surround_selection,
-                        tr("Quotes and brackets wrap the selection"),
-                    )
-                    .on_hover_text(tr(
-                        "On: typing \" ' ( [ or { over selected text on the command line puts the pair around it instead of replacing it, the way an editor does - so selecting a global name and pressing \" quotes it, and the text stays selected to be wrapped again. Off: the character replaces the selection. Only applies to a selection inside the line being typed; one in the scrollback is highlighted text and is never edited.",
-                    ))
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(
-                        &mut settings.recall_mid_line,
-                        tr("Up and Down recall from anywhere on the line"),
-                    )
-                    .on_hover_text(tr(
-                        "On: Up replaces the line with an earlier command wherever the cursor is, the way the native IRIS terminal does. Off: only at the end of the line, so a cursor left in the middle means the line is being edited and the arrows leave it alone.",
-                    ))
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(
-                        &mut settings.save_command_history,
-                        tr("Remember commands from earlier sessions"),
-                    )
-                    .on_hover_text(
-                        tr("Keeps the commands typed at an IRIS prompt in history.txt, so Up reaches back past the sessions open now. Off keeps recall working inside each session and writes nothing to disk. Either way a tab offers back its own commands first and the inherited ones after them, and lines sent by a macro or an IRIS helper are never offered back at all."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-
-                if ui
-                    .checkbox(
-                        &mut settings.show_namespace_in_tab,
-                        tr("Show the namespace in the tab name"),
-                    )
-                    .on_hover_text(tr(
-                        "Adds the namespace the session is in to the tab's name - CONSISTEM | RDB76-TR. Read off the prompt, so it follows a ZN as it happens; a tab renamed by hand keeps the name it was given.",
-                    ))
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(&mut settings.show_pid, tr("Show the process id"))
-                    .on_hover_text(tr(
-                        "Puts the session's process id next to the instance name and the window size in the menu bar. A local session only: a remote one runs its process on the far side.",
-                    ))
-                    .changed()
-                {
-                    changed = true;
-                }
-
-                if ui
-                    .checkbox(
-                        &mut settings.open_on_start,
-                        tr("Open the default profile at startup"),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(
-                        &mut settings.remember_open_tabs,
-                        tr("Remember open tabs and namespaces"),
-                    )
-                    .on_hover_text(tr("Reopens the tabs and splits that were open when the terminal was closed, instead of the default profile, and takes each IRIS session back to the namespace it was left in. The sessions themselves are new: what was on screen is shown above them, but variables, locks and routines in progress are not. Closing every tab before closing the window leaves nothing to reopen."))
-                    .changed()
-                {
-                    changed = true;
-                }
-                section(ui, tr("Window management"));
-                if ui
-                    .checkbox(
-                        &mut settings.show_window_buttons,
-                        tr("Show the window buttons"),
-                    )
-                    .on_hover_text(
-                        tr("Minimize, maximize and close in the app's own title bar. Off leaves the row to the tabs: the window still drags, double-click still maximizes, and Ctrl+W still closes. The active theme decides how the buttons look and which end they sit at."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(
-                        &mut settings.tabs_in_title_bar,
-                        tr("Tabs on window title bar"),
-                    )
-                    .on_hover_text(tr(
-                        "Puts the tabs on the same row as the window buttons, from the new-session button across to the gear. One row instead of two; the session line - instance, PID and size - goes, since the tabs already say which session it is.",
-                    ))
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.horizontal(|ui| {
-                    ui.label(tr("Terminal size"));
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut settings.default_cols)
-                                .range(20..=500)
-                                .prefix(format!("{} ", tr("Columns"))),
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    for cols in crate::config::COMMON_COLS {
-                        if ui
-                            .selectable_label(settings.default_cols == cols, cols.to_string())
-                            .clicked()
-                        {
-                            settings.default_cols = cols;
-                            changed = true;
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("     ");
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut settings.default_rows)
-                                .range(5..=200)
-                                .prefix(format!("{} ", tr("Rows"))),
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    for rows in crate::config::COMMON_ROWS {
-                        if ui
-                            .selectable_label(settings.default_rows == rows, rows.to_string())
-                            .clicked()
-                        {
-                            settings.default_rows = rows;
-                            changed = true;
-                        }
-                    }
-                });
-                ui.small(tr(
-                    "The size a window opens at when it is not reopening at the last one. In characters, so it holds the same amount of output at any font size.",
-                ));
-
-                if ui
-                    .checkbox(&mut settings.save_terminal_size, tr("Save terminal size"))
-                    .on_hover_text(
-                        tr("Reopens the window at the size it was last closed at. Off opens it at 100x30 characters, whatever the font size."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(&mut settings.save_window_position, tr("Save window position"))
-                    .on_hover_text(
-                        tr("Reopens the window where it was last closed. Off centres it on the screen."),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.small(tr(
-                    "Takes effect the next time the app starts, and covers this window as well as the main one.",
-                ));
-                if ui
-                    .checkbox(&mut settings.pin_to_desktop, tr("Pin to desktop"))
-                    .on_hover_text(tr(
-                        "Keeps the window on screen when the desktop is shown (Win+D). Otherwise it is an ordinary window: others cover it, and clicking it brings it to the front.",
-                    ))
-                    .changed()
-                {
-                    changed = true;
-                }
-
-                if ui
-                    .checkbox(
-                        &mut settings.confirm_close_with_live_session,
-                        tr("Ask before closing with a session still connected"),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(&mut settings.close_to_tray, tr("Close to the tray"))
-                    .on_hover_text(tr("Closing the window hides it behind an icon in the notification area, and the sessions stay connected. Click the icon to bring it back; its menu's Exit quits."))
-                    .changed()
-                {
-                    changed = true;
-                }
-
-                section(ui, tr("Updates"));
-                if ui
-                    .checkbox(
-                        &mut settings.check_for_updates,
-                        tr("Check for a new version at startup"),
-                    )
-                    .on_hover_text(tr(
-                        "One request to GitHub through the machine's own proxy. Nothing is downloaded or replaced without being asked.",
-                    ))
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.horizontal(|ui| {
-                    ui.label(tr1(
-                        "This build is version {}.",
-                        crate::features::update::CURRENT,
-                    ));
-                    if ui.button(tr("Check now")).clicked() {
-                        action = Some(UiRequest::CheckForUpdates);
-                    }
-                });
-                if let Some(proxy) = crate::features::update::system_proxy() {
-                    ui.small(tr1("Going through the system proxy at {}.", &proxy));
-                    // Only shown when there is a proxy to authenticate to. A
-                    // proxy that lets the check through and then demands
-                    // credentials for the host GitHub serves the release from
-                    // is what left this updater checking successfully and
-                    // never downloading, so the fields are here rather than
-                    // the failure being something only the log knows about.
-                    ui.horizontal(|ui| {
-                        ui.label(tr("Proxy user"));
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut settings.proxy_user)
-                                    .desired_width(140.0),
-                            )
-                            .on_hover_text(tr(
-                                "Only if the proxy asks for credentials. Leave empty otherwise.",
-                            ))
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                        ui.label(tr("Password"));
-                        // Not read back out of the credential store to fill
-                        // this in: a password manager is not a place to show
-                        // passwords from. Typing here replaces what is stored,
-                        // and emptying the field forgets it.
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut state.proxy_password)
-                                    .password(true)
-                                    .hint_text(if crate::features::update::has_proxy_password() {
-                                        tr("stored")
-                                    } else {
-                                        tr("none")
-                                    })
-                                    .desired_width(140.0),
-                            )
-                            .on_hover_text(tr(
-                                "Kept in the operating system's credential store, never in settings.toml.",
-                            ))
-                            .lost_focus()
-                        {
-                            action = Some(UiRequest::SetProxyPassword(state.proxy_password.clone()));
-                            state.proxy_password.clear();
-                        }
-                    });
-                    ui.small(tr(
-                        "Basic authentication only. A proxy that insists on NTLM cannot be reached this way; download the release from the browser instead.",
-                    ));
-                } else {
-                    ui.small(tr("No system proxy configured; connecting directly."));
-                }
-
-                section(ui, tr("Macros"));
-                ui.horizontal(|ui| {
-                    // The manager first: it is what anyone opening this section
-                    // came for, and the shared file below it is a path most
-                    // installs set once and never look at again.
-                    if ui
-                        .button(tr("Manage macros..."))
-                        .on_hover_text(tr("Make, edit and delete your own macros, and read the organization's. Running them is on the terminal's right-click menu."))
-                        .clicked()
-                    {
-                        state.macros.open = true;
-                    }
-                    if ui
-                        .button(tr("Open folder"))
-                        .on_hover_text(crate::config::personal_macros_path().display().to_string())
-                        .clicked()
-                    {
-                        if let Some(folder) = crate::config::personal_macros_path().parent() {
-                            action = Some(UiRequest::OpenFolder(folder.to_path_buf()));
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tr("Shortcut for the manager"));
-                    // The same field a macro's own binding is set in, so the
-                    // two behave the same way - including the warning when the
-                    // chord is one the app has already taken.
-                    if crate::ui::shortcut::picker(
-                        ui,
-                        &mut settings.macro_manager_shortcut,
-                        &mut state.capture_manager_shortcut,
-                    ) {
-                        changed = true;
-                    }
-                });
-                ui.label(tr("Organization macro file (shared, read-only)"));
-                let mut org = settings.org_macros_path.display().to_string();
-                if ui.text_edit_singleline(&mut org).changed() {
-                    settings.org_macros_path = std::path::PathBuf::from(org.trim());
-                    changed = true;
-                }
-                ui.small(tr(
-                    "A UNC share, mapped drive, or local copy. Leave empty for none.",
-                ));
-                if let Some(path) = settings.org_macros() {
-                    if path.exists() {
-                        ui.small(tr("Found."));
-                    } else {
-                        ui.colored_label(
-                            WARNING,
-                            tr("Not reachable right now - personal macros will still load."),
-                        );
-                    }
-                }
-
-                section(ui, tr("Shells"));
-                ui.small(tr(
-                    "Other command interpreters, offered under Shells in the new-session menu. Every one of them is a .toml file in the folder below - the ones found installed on this machine were written there for you, and can be renamed, re-armed or deleted like any other.",
-                ));
-                let shells = crate::plugins::shells::available();
-                if shells.is_empty() {
-                    ui.weak(tr("None found."));
-                }
-                for shell in &shells {
-                    ui.horizontal(|ui| {
-                        ui.label(&shell.name);
-                        ui.weak(tr(shell.source_label()));
-                    });
-                    ui.small(shell.command_line());
-                }
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(tr("Open folder"))
-                        .on_hover_text(crate::plugins::shells::shells_dir().display().to_string())
-                        .clicked()
-                    {
-                        action = Some(UiRequest::OpenFolder(
-                            crate::plugins::shells::shells_dir(),
-                        ));
-                    }
-                    if ui
-                        .button(tr("Reload"))
-                        .on_hover_text(tr("Probe again and re-read the folder."))
-                        .clicked()
-                    {
-                        // The list is cached for the process, because the
-                        // new-session menu asks for it on every frame it is
-                        // open. This is the way to say a file has just changed.
-                        crate::plugins::shells::refresh();
-                    }
-                });
-
-                section(ui, tr("Logging"));
-                ui.horizontal(|ui| {
-                    ui.label(tr("Default mode"));
-                    for (mode, label) in [
-                        (LogMode::Off, "Off"),
-                        (LogMode::Clean, "Clean text"),
-                        (LogMode::Raw, "Raw bytes"),
-                    ] {
-                        if ui
-                            .selectable_label(settings.default_log_mode == mode, tr(label))
-                            .clicked()
-                        {
-                            settings.default_log_mode = mode;
-                            changed = true;
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tr("Keep logs for (days, 0 = forever)"));
-                    if ui
-                        .add(egui::DragValue::new(&mut settings.log_retention_days).range(0..=3650))
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                });
-                ui.small(tr1("Logs: {}", &settings.log_dir.display().to_string()));
-
-                section(ui, tr("Profiles"));
-                if profiles_editor(ui, settings, instances, servers) {
-                    changed = true;
-                }
-            });
-        },
-    );
-
-    if !open {
-        state.show_settings = false;
-    }
-    action.or_else(|| changed.then_some(UiRequest::SettingsChanged))
-}
-
-/// Returns true when anything changed.
-fn profiles_editor(
-    ui: &mut Ui,
-    settings: &mut Settings,
-    instances: &[String],
-    servers: &ServerList,
-) -> bool {
-    let mut changed = false;
-    let mut remove = None;
-
-    for (index, profile) in settings.profiles.iter_mut().enumerate() {
-        egui::CollapsingHeader::new(if profile.name.is_empty() {
-            tr1("Profile {}", &(index + 1).to_string())
-        } else {
-            profile.name.clone()
-        })
-        .id_source(("profile", index))
-        .show(ui, |ui| {
-            changed |= labelled_edit(ui, "Name", &mut profile.name);
-
-            ui.horizontal(|ui| {
-                ui.label(tr("Instance"));
-                if servers.is_empty() && instances.is_empty() {
-                    // Nothing was discovered - no launcher, or a machine this
-                    // app cannot read the list on - so the name is typed.
-                    changed |= ui.text_edit_singleline(&mut profile.instance).changed();
-                } else {
-                    egui::ComboBox::from_id_source(("instance", index))
-                        .selected_text(instance_label(profile))
-                        .show_ui(ui, |ui| {
-                            changed |= instance_menu(ui, profile, instances, servers);
-                        });
-                }
-            });
-            // Where the session actually goes, since a server entry can be a
-            // Telnet login rather than an instance on this machine.
-            if let Some(remote) = profile.remote.as_ref() {
-                ui.small(tr1(
-                    "Telnet login to {}",
-                    &format!("{}:{}", remote.address, remote.port),
-                ));
-            }
-
-            // Only a Telnet session has a charset to choose. A local one runs
-            // inside a pseudo-console, which hands the terminal UTF-8 whatever
-            // codepage it is on, so there is nothing here that could change it -
-            // offering the choice only invited a setting that costs a column
-            // per accent. See `Profile::wire_encoding`.
-            if profile.remote.is_some() {
-                ui.horizontal(|ui| {
-                    ui.label(tr("Encoding"));
-                    egui::ComboBox::from_id_source(("encoding", index))
-                        .selected_text(tr(profile.encoding.label()))
-                        .show_ui(ui, |ui| {
-                            for enc in Encoding::ALL {
-                                if ui
-                                    .selectable_label(profile.encoding == enc, tr(enc.label()))
-                                    .clicked()
-                                {
-                                    profile.encoding = enc;
-                                    changed = true;
-                                }
-                            }
-                        });
-                });
-                ui.small(tr(
-                    "Leave as UTF-8 unless accented characters come out wrong.",
-                ));
-            } else {
-                ui.small(tr("A local session speaks UTF-8."));
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(tr("Logging"));
-                for (mode, label) in [
-                    (LogMode::Off, "Use default"),
-                    (LogMode::Clean, "Clean"),
-                    (LogMode::Raw, "Raw"),
-                ] {
-                    if ui
-                        .selectable_label(profile.logging == mode, tr(label))
-                        .clicked()
-                    {
-                        profile.logging = mode;
-                        changed = true;
-                    }
-                }
-            });
-
-            if ui.button(tr("Delete this profile")).clicked() {
-                remove = Some(index);
-            }
-        });
-    }
-
-    if let Some(index) = remove {
-        // Forget the stored secret too, or it outlives the profile that
-        // explained what it was for.
-        settings.profiles[index].clear_password();
-        settings.profiles.remove(index);
-        changed = true;
-    }
-
-    ui.horizontal(|ui| {
-        if ui.button(tr("Add profile")).clicked() {
-            settings.profiles.push(Profile {
-                name: format!("Profile {}", settings.profiles.len() + 1),
-                instance: instances.first().cloned().unwrap_or_default(),
-                ..Profile::default()
-            });
-            changed = true;
-        }
-        if !settings.profiles.is_empty() {
-            ui.label(tr("Default"));
-            egui::ComboBox::from_id_source("default-profile")
-                .selected_text(settings.default_profile.clone())
-                .show_ui(ui, |ui| {
-                    for profile in &settings.profiles {
-                        if ui
-                            .selectable_label(
-                                profile.name == settings.default_profile,
-                                &profile.name,
-                            )
-                            .clicked()
-                        {
-                            settings.default_profile = profile.name.clone();
-                            changed = true;
-                        }
-                    }
-                });
-        }
-    });
-
-    changed
-}
-
-/// What the instance picker shows when it is closed.
-///
-/// The endpoint rather than the bare name when the two differ: a profile
-/// pointing at a remote server names the server in `instance`, and the address
-/// is the part that says it is not the local instance of the same name.
-fn instance_label(profile: &Profile) -> String {
-    match profile.remote.as_ref() {
-        Some(remote) => format!("{}  ({})", profile.instance, remote.address),
-        None if profile.instance.is_empty() => tr("Choose...").to_string(),
-        None => profile.instance.clone(),
-    }
-}
-
-/// The instance picker's contents: the same list the `+` button's right-click
-/// menu offers, because it is the same question - which server or instance does
-/// this profile connect to.
-///
-/// Returns true when a choice was made.
-fn instance_menu(
-    ui: &mut Ui,
-    profile: &mut Profile,
-    instances: &[String],
-    servers: &ServerList,
-) -> bool {
-    let mut changed = false;
-
-    if !servers.is_empty() {
-        ui.weak(tr("IRIS servers"));
-        for server in &servers.servers {
-            let selected = profile.instance.eq_ignore_ascii_case(&server.name);
-            let entry = ui.selectable_label(selected, server.menu_label());
-            // What the entry does, since a local server opens an instance and
-            // a remote one is a Telnet login.
-            let hint = match server.target(instances) {
-                Target::Local { instance } => tr1("Local session on instance {}", &instance),
-                Target::Telnet { address, port } => {
-                    tr1("Telnet login to {}", &format!("{address}:{port}"))
-                }
-            };
-            if entry.on_hover_text(hint).clicked() {
-                point_at(profile, server, instances);
-                changed = true;
-            }
-        }
-        let loose = instances
-            .iter()
-            .any(|name| !servers.covers_instance(instances, name));
-        if loose {
-            ui.separator();
-        }
-    }
-
-    for name in instances {
-        // Skipped when a server entry already opens it: the same session under
-        // two names is not a choice.
-        if servers.covers_instance(instances, name) {
-            continue;
-        }
-        let selected = profile.remote.is_none() && &profile.instance == name;
-        if ui.selectable_label(selected, name).clicked() {
-            point_at(profile, &Server::for_instance(name), instances);
-            changed = true;
-        }
-    }
-
-    changed
-}
-
-/// Points a profile at one of the launcher's servers, exactly as the `+` menu
-/// does: the name is what the tab will say, and the target decides whether the
-/// session starts locally or logs in over Telnet.
-fn point_at(profile: &mut Profile, server: &Server, instances: &[String]) {
-    match server.target(instances) {
-        Target::Local { instance } => {
-            profile.instance = instance;
-            profile.remote = None;
-        }
-        Target::Telnet { address, port } => {
-            profile.instance = server.name.clone();
-            profile.remote = Some(Remote { address, port });
-        }
-    }
-}
-
-fn labelled_edit(ui: &mut Ui, label: &'static str, value: &mut String) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(tr(label));
-        changed = ui.text_edit_singleline(value).changed();
-    });
-    changed
-}
+pub use crate::ui::settings_view::settings_dialog;
 
 #[cfg(test)]
 mod tests {
@@ -1500,5 +608,34 @@ mod tests {
         });
         assert!(!pending.confirming);
         assert!(!pending.source.confirm);
+    }
+
+    /// A parameter that cannot reach the command must not turn a confirming
+    /// macro back into a fill-in form with a field that goes nowhere.
+    #[test]
+    fn a_confirming_macro_with_only_unusable_params_goes_straight_to_confirmation() {
+        let pending = PendingMacro::new(Macro {
+            confirm: true,
+            params: vec![
+                Param::default(),
+                Param {
+                    name: "unused".into(),
+                    ..Param::default()
+                },
+            ],
+            body: vec!["KILL ^DATA".into()],
+            ..Macro::default()
+        });
+        assert!(pending.confirming);
+        assert!(pending.values.is_empty());
+    }
+
+    #[test]
+    fn the_dialog_holds_values_only_for_the_params_it_will_ask_for() {
+        let mut m = macro_with_params();
+        m.params.insert(0, Param::default());
+        let pending = PendingMacro::new(m);
+        assert_eq!(pending.values, vec![("g".to_string(), "CSW1".to_string())]);
+        assert_eq!(pending.preview(), vec!["ZWRITE ^CSW1".to_string()]);
     }
 }

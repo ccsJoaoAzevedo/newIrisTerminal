@@ -1,9 +1,9 @@
-//! The two dialogs that live in windows of their own.
+//! The dialog that lives in a window of its own.
 //!
-//! Settings and the theme manager are the ones you keep open *while* watching
-//! the terminal — turning a switch on, or dragging a colour, and looking at
-//! what it did. An `egui::Window` inside the app covers exactly what you are
-//! trying to see, so these two are operating-system windows instead. Nothing
+//! Settings - with the theme editor among its pages - is the one you keep open
+//! *while* watching the terminal: turning a switch on, or dragging a colour,
+//! and looking at what it did. An `egui::Window` inside the app covers exactly
+//! what you are trying to see, so it is an operating-system window instead. Nothing
 //! else here is: the rest are either momentary (export, a confirmation) or
 //! already beside the terminal rather than over it.
 //!
@@ -264,28 +264,33 @@ fn title_bar(
     buttons: &WindowButtons,
 ) -> Option<WindowAction> {
     let mut action = None;
-    ui.horizontal(|ui| {
-        // No gear and no `+`: a dialog does not open the settings window - it
-        // may well *be* the settings window - and opens no sessions.
-        if let Some(asked) = chrome::leading_window_buttons(ui, buttons, true, None, None, None) {
-            action = Some(asked);
-        }
-        // Visual only, and a handle for the window: see `chrome::drag_text`.
-        if let Some(asked) = chrome::drag_text(
+    // Visual only, and a handle for the window: see `chrome::drag_text`. It
+    // stands where the theme puts the tabs, which is the main window's middle.
+    let mut name = |ui: &mut Ui, _room: f32| {
+        chrome::drag_text(
             ui,
             egui::RichText::new(title).strong(),
             true,
             window,
             "title",
-        ) {
-            action = Some(asked);
-        }
-        // Claims the rest of the row for dragging either way; without it the
-        // window could not be moved at all.
-        if let Some(asked) = chrome::title_bar_controls(ui, buttons, true, window, None, None, None)
-        {
-            action = Some(asked);
-        }
+        )
+    };
+    ui.horizontal(|ui| {
+        // No gear and no `+`: a dialog does not open the settings window - it
+        // may well *be* the settings window - and opens no sessions.
+        action = chrome::title_bar(
+            ui,
+            chrome::TitleBar {
+                style: buttons,
+                window_controls: true,
+                window,
+                draggable: true,
+                settings: None,
+                on_top: None,
+                new_tab: None,
+                tabs: &mut name,
+            },
+        );
     });
     action
 }
