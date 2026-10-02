@@ -22,8 +22,9 @@ mod imp {
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetCursorPos,
-        LoadIconW, PostMessageW, RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
+        AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+        DestroyMenu, FindWindowExW, GetCursorPos, IsIconic, LoadIconW, PostMessageW,
+        RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu, ASFW_ANY,
         HICON, HWND_MESSAGE, IDI_APPLICATION, MF_STRING, SW_HIDE, SW_RESTORE, SW_SHOW,
         TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
     };
@@ -38,6 +39,9 @@ mod imp {
     static QUITTING: AtomicBool = AtomicBool::new(false);
 
     const CALLBACK: u32 = WM_APP + 1;
+    /// Sent by a second launch to the copy already running: show yourself.
+    const WAKE: u32 = WM_APP + 2;
+    const CLASS: &str = "newIrisTerminalTray";
     const ICON_ID: u32 = 1;
     const CMD_OPEN: usize = 1;
     const CMD_EXIT: usize = 2;
@@ -55,7 +59,7 @@ mod imp {
         if hwnd == 0 || WINDOW.swap(hwnd, Ordering::Relaxed) != 0 {
             return;
         }
-        let class = wide("newIrisTerminalTray");
+        let class = wide(CLASS);
         // SAFETY: the class name outlives the calls that read it, and the
         // window procedure has the signature WNDPROC asks for.
         unsafe {
@@ -139,9 +143,41 @@ mod imp {
             // SAFETY: plain calls on the main window's handle.
             unsafe {
                 ShowWindow(window, SW_SHOW);
-                ShowWindow(window, SW_RESTORE);
+                // Only a minimized window is restored. `SW_RESTORE` on one
+                // that was maximized when it went to the tray puts it back at
+                // its restored size, and that is what was saved on exit.
+                if IsIconic(window) != 0 {
+                    ShowWindow(window, SW_RESTORE);
+                }
                 SetForegroundWindow(window);
             }
+        }
+    }
+
+    /// Finds another running copy by its message-only window and asks it to
+    /// come forward. True when one answered, and this launch should go.
+    ///
+    /// `SendMessageW` rather than a post, so a copy that is hung or exiting
+    /// and never answers is not mistaken for one that took over.
+    pub fn wake_existing() -> bool {
+        let class = wide(CLASS);
+        // SAFETY: the class name outlives the call; the window found, if any,
+        // is another process's sink, which only ever answers `WAKE` with 1.
+        unsafe {
+            let other = FindWindowExW(
+                HWND_MESSAGE,
+                std::ptr::null_mut(),
+                class.as_ptr(),
+                std::ptr::null(),
+            );
+            if other.is_null() {
+                return false;
+            }
+            // This launch is what the user just clicked, so it holds the
+            // right to take the foreground; without passing it on, the copy
+            // being woken would only flash in the taskbar.
+            AllowSetForegroundWindow(ASFW_ANY);
+            SendMessageW(other, WAKE, 0, 0) == 1
         }
     }
 
@@ -202,6 +238,10 @@ mod imp {
             }
             return 0;
         }
+        if msg == WAKE {
+            restore();
+            return 1;
+        }
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 }
@@ -213,6 +253,9 @@ mod imp {
         false
     }
     pub fn quitting() -> bool {
+        false
+    }
+    pub fn wake_existing() -> bool {
         false
     }
 }
@@ -231,6 +274,12 @@ pub fn install(cc: &eframe::CreationContext<'_>) {
 /// could not be done, in which case the caller should close as it would have.
 pub fn hide(tip: &str) -> bool {
     imp::hide(tip)
+}
+
+/// Brings an already running copy forward, for a launch that should then
+/// not start another. False when there is none to bring.
+pub fn wake_existing() -> bool {
+    imp::wake_existing()
 }
 
 /// Whether the tray menu's Exit asked for the close now under way, which must

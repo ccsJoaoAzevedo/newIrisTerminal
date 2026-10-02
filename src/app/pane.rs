@@ -263,7 +263,13 @@ impl App {
                 selected_span: line.and_then(|line| selection_in_line(tab, line)),
                 insert_down,
                 delete_down,
-                completion: tab.completion.popup().map(|popup| popup.navigated),
+                // A popup that is only a hint has nothing to move through or
+                // accept, and must not take Up and Down from the history.
+                completion: tab
+                    .completion
+                    .popup()
+                    .filter(|popup| !popup.items.is_empty())
+                    .map(|popup| popup.navigated),
             };
             (input_ctx, tab.profile.wire_encoding())
         };
@@ -447,7 +453,23 @@ impl App {
         else {
             return;
         };
-        tab.completion.refresh(&tab.grid, &mut self.vocabulary);
+        // The side session costs a licence slot, so it is asked only where the
+        // global tooltip - which is what the user turned on to pay for it - is
+        // on too.
+        let namespace = tab.namespace.clone();
+        let server = namespace
+            .as_deref()
+            .filter(|_| self.settings.intellisense != crate::config::IntellisenseMode::Off)
+            .filter(|_| !tab.profile.is_shell())
+            .map(|namespace| crate::features::autocomplete::Server {
+                lookup: &mut tab.doc_lookup,
+                namespace,
+            });
+        tab.completion
+            .refresh_with(&tab.grid, &mut self.vocabulary, server);
+        if tab.completion.waiting() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
         let (Some(popup), Some(caret)) = (tab.completion.popup(), caret) else {
             return;
         };

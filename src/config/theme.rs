@@ -750,6 +750,15 @@ pub struct ThemeFile {
     pub background_gradient_from: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub background_gradient_to: String,
+    /// How much of `background_gradient` shows over the flat background: 0
+    /// is the flat colour, 1 the gradient as its two colours say. Absent is 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_gradient_strength: Option<f32>,
+    /// How much of `ui_gradient` the cards and the sidebar of Settings and
+    /// the managers let through: 0 is clear glass, 1 solid. Absent falls back
+    /// to the app-wide setting this replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_glass: Option<f32>,
     #[serde(default = "default_font_family")]
     pub font_family: String,
     #[serde(default = "default_font_size")]
@@ -832,6 +841,8 @@ impl Default for ThemeFile {
             scrollbar_handle_to: String::new(),
             scrollbar_track_to: String::new(),
             background_gradient: String::new(),
+            background_gradient_strength: None,
+            ui_glass: None,
             background_gradient_from: String::new(),
             background_gradient_to: String::new(),
             font_family: default_font_family(),
@@ -883,12 +894,28 @@ fn window_buttons(file: &ThemeFile) -> WindowButtons {
 
 /// A gradient read from a direction and two ends, either of which falls back
 /// to `flat`. `None` when the direction is empty or unrecognised.
+/// A gradient's two colours as the file has them, whether or not a direction
+/// switches it on: turning a gradient off keeps them, so turning it back on
+/// finds them again.
+fn read_ends(from: &str, to: &str) -> Option<(Color32, Color32)> {
+    Some((parse_hex(from)?, parse_hex(to)?))
+}
+
 fn read_gradient(direction: &str, from: &str, to: &str, flat: Color32) -> Option<UiGradient> {
     GradientDirection::from_name(direction).map(|direction| UiGradient {
         direction,
         from: parse_hex(from).unwrap_or(flat),
         to: parse_hex(to).unwrap_or(flat),
     })
+}
+
+/// The colours to write for a gradient: its own while it is on, the kept ones
+/// while it is off.
+fn ends(
+    gradient: Option<UiGradient>,
+    kept: Option<(Color32, Color32)>,
+) -> Option<(Color32, Color32)> {
+    gradient.map(|g| (g.from, g.to)).or(kept)
 }
 
 #[derive(Clone, Debug)]
@@ -902,6 +929,8 @@ pub struct Theme {
     pub ui_foreground: Color32,
     pub ui_background: Color32,
     pub ui_gradient: Option<UiGradient>,
+    /// The chrome gradient's colours, kept while it is switched off.
+    pub ui_gradient_ends: Option<(Color32, Color32)>,
     pub ui_border: Option<Color32>,
     pub syntax_global: Color32,
     pub syntax_string: Color32,
@@ -937,6 +966,12 @@ pub struct Theme {
     pub tab_selected_text: Option<Color32>,
     /// Behind the terminal's text in place of the flat `background`.
     pub background_gradient: Option<UiGradient>,
+    /// The terminal gradient's colours, kept while it is switched off.
+    pub background_gradient_ends: Option<(Color32, Color32)>,
+    /// See [`ThemeFile::background_gradient_strength`].
+    pub background_gradient_strength: Option<f32>,
+    /// See [`ThemeFile::ui_glass`].
+    pub ui_glass: Option<f32>,
     pub font_family: String,
     pub font_size: f32,
     pub dark: bool,
@@ -956,6 +991,17 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// The terminal's gradient as it is painted: its two colours drawn back
+    /// towards the flat background by however far the strength says.
+    pub fn terminal_gradient(&self) -> Option<UiGradient> {
+        let strength = self.background_gradient_strength.unwrap_or(1.0);
+        self.background_gradient.map(|g| UiGradient {
+            from: crate::term::palette::blend(self.background, g.from, strength),
+            to: crate::term::palette::blend(self.background, g.to, strength),
+            ..g
+        })
+    }
+
     pub fn from_file(file: &ThemeFile) -> Self {
         let mut ansi = DEFAULT_ANSI.map(c);
         for (slot, hex) in ansi.iter_mut().zip(file.ansi.iter()) {
@@ -977,6 +1023,11 @@ impl Theme {
             selection: parse_hex(&file.selection).unwrap_or(Color32::DARK_BLUE),
             ui_foreground: parse_hex(&file.ui_foreground).unwrap_or(foreground),
             ui_background: parse_hex(&file.ui_background).unwrap_or(background),
+            ui_gradient_ends: read_ends(&file.ui_gradient_from, &file.ui_gradient_to),
+            background_gradient_ends: read_ends(
+                &file.background_gradient_from,
+                &file.background_gradient_to,
+            ),
             ui_gradient: read_gradient(
                 &file.ui_gradient,
                 &file.ui_gradient_from,
@@ -989,6 +1040,14 @@ impl Theme {
                 &file.background_gradient_to,
                 background,
             ),
+            background_gradient_strength: file
+                .background_gradient_strength
+                .filter(|s| s.is_finite())
+                .map(|s| s.clamp(0.0, 1.0)),
+            ui_glass: file
+                .ui_glass
+                .filter(|s| s.is_finite())
+                .map(|s| s.clamp(0.0, 1.0)),
             scrollbar_track: parse_hex(&file.scrollbar_track),
             scrollbar_gradient: GradientDirection::from_name(&file.scrollbar_gradient),
             scrollbar_handle_to: parse_hex(&file.scrollbar_handle_to),
@@ -1066,8 +1125,14 @@ impl Theme {
                 .ui_gradient
                 .map(|g| g.direction.name().to_string())
                 .unwrap_or_default(),
-            ui_gradient_from: self.ui_gradient.map(|g| to_hex(g.from)).unwrap_or_default(),
-            ui_gradient_to: self.ui_gradient.map(|g| to_hex(g.to)).unwrap_or_default(),
+            // Written whether or not the gradient is on, so switching it off
+            // and back on - even across a restart - keeps the colours.
+            ui_gradient_from: ends(self.ui_gradient, self.ui_gradient_ends)
+                .map(|(from, _)| to_hex(from))
+                .unwrap_or_default(),
+            ui_gradient_to: ends(self.ui_gradient, self.ui_gradient_ends)
+                .map(|(_, to)| to_hex(to))
+                .unwrap_or_default(),
             ui_border: hex_or_empty(self.ui_border),
             syntax_global: to_hex(self.syntax_global),
             syntax_string: to_hex(self.syntax_string),
@@ -1123,14 +1188,14 @@ impl Theme {
                 .background_gradient
                 .map(|g| g.direction.name().to_string())
                 .unwrap_or_default(),
-            background_gradient_from: self
-                .background_gradient
-                .map(|g| to_hex(g.from))
+            background_gradient_from: ends(self.background_gradient, self.background_gradient_ends)
+                .map(|(from, _)| to_hex(from))
                 .unwrap_or_default(),
-            background_gradient_to: self
-                .background_gradient
-                .map(|g| to_hex(g.to))
+            background_gradient_to: ends(self.background_gradient, self.background_gradient_ends)
+                .map(|(_, to)| to_hex(to))
                 .unwrap_or_default(),
+            background_gradient_strength: self.background_gradient_strength,
+            ui_glass: self.ui_glass,
             font_family: self.font_family.clone(),
             font_size: self.font_size,
             // Written as the background says, which is what `visuals` goes by:
@@ -1399,29 +1464,6 @@ pub fn builtin_files() -> Vec<ThemeFile> {
             dark: true,
             builtin: true,
             ..with_syntax(DEFAULT_SYNTAX)
-        },
-        // KDE 3's Plastik: grey-blue widgets around a white Konsole, with the
-        // palette Konsole shipped as "Linux colors".
-        ThemeFile {
-            name: "KDE Plastik".into(),
-            background: "#ffffff".into(),
-            foreground: "#1a1a1a".into(),
-            cursor: "#678db2".into(),
-            selection: "#b5cde4".into(),
-            ansi: ansi([
-                "#000000", "#b21818", "#18b218", "#b26818", "#1818b2", "#b218b2", "#18b2b2",
-                "#b2b2b2", "#686868", "#ff5454", "#54ff54", "#ffff54", "#5454ff", "#ff54ff",
-                "#54ffff", "#ffffff",
-            ]),
-            ui_foreground: "#202020".into(),
-            ui_background: "#efefef".into(),
-            window_button_icon: "#303030".into(),
-            window_button_hover_close: "#b04040".into(),
-            font_family: default_font_family(),
-            font_size: 14.0,
-            dark: false,
-            builtin: true,
-            ..with_syntax(LIGHT_SYNTAX)
         },
         // Mac OS X 10.4. Aqua traffic lights on the left, the brushed-metal
         // grey the windows of the era were framed in, and the colours Terminal
@@ -1986,5 +2028,20 @@ mod tests {
             let theme = Theme::from_file(&file);
             assert_eq!(theme.ansi.len(), 16, "{}", file.name);
         }
+    }
+
+    /// Turning a gradient off is not forgetting it: the file keeps its two
+    /// colours, and they come back with the direction.
+    #[test]
+    fn a_gradient_switched_off_keeps_its_colours_through_the_file() {
+        let mut theme = Theme::default();
+        let (from, to) = (Color32::from_rgb(1, 2, 3), Color32::from_rgb(4, 5, 6));
+        theme.background_gradient = None;
+        theme.background_gradient_ends = Some((from, to));
+        let file = theme.to_file();
+        assert!(file.background_gradient.is_empty(), "switched off");
+        let back = Theme::from_file(&file);
+        assert_eq!(back.background_gradient, None);
+        assert_eq!(back.background_gradient_ends, Some((from, to)));
     }
 }

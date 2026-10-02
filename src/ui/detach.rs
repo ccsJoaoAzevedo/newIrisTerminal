@@ -71,10 +71,27 @@ pub fn shell(
     }
     let mut closed = false;
     let restore = placement.as_ref().map(|p| p.restore).unwrap_or_default();
+    // The size it was last left at in this run, then the one saved from the
+    // last, then the caller's default. Without the first, a window resized
+    // and reopened came back at its new position but its startup size.
+    //
+    // Chosen on the frame it opens and held after that: the builder is
+    // compared frame to frame and any change sent as a resize, so following
+    // the live size would answer every step of a drag with a resize of its own.
+    let opening = ctx
+        .data(|d| d.get_temp::<u64>(drawn_id(id)))
+        .is_none_or(|last| last + 1 < ctx.frame_nr());
+    let held = egui::Id::new((id, "detached-size"));
+    let size = match ctx.data(|d| d.get_temp::<[f32; 2]>(held)) {
+        Some(held) if !opening => held,
+        _ => {
+            let seen = placement.as_ref().and_then(|p| p.seen.size);
+            let chosen = seen.or(restore.size).unwrap_or(size);
+            ctx.data_mut(|d| d.insert_temp(held, chosen));
+            chosen
+        }
+    };
     let position = opening_position(ctx, id, size, restore.position);
-    // A saved size is exact, so it is used as it stands; the caller's `size` is
-    // the default for a window that has never been closed anywhere.
-    let size = restore.size.unwrap_or(size);
 
     let mut builder = egui::ViewportBuilder::default()
         .with_title(title)
@@ -289,6 +306,7 @@ fn title_bar(
                 on_top: None,
                 new_tab: None,
                 tabs: &mut name,
+                tabs_fill: false,
             },
         );
     });

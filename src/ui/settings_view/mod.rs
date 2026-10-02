@@ -67,7 +67,6 @@ pub enum Category {
     Appearance,
     Themes,
     ScreenSaver,
-    TitleBar,
     Windows,
     Terminal,
     Keyboard,
@@ -77,12 +76,11 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 11] = [
+    pub const ALL: [Category; 10] = [
         Category::General,
         Category::Appearance,
         Category::Themes,
         Category::ScreenSaver,
-        Category::TitleBar,
         Category::Windows,
         Category::Terminal,
         Category::Keyboard,
@@ -98,8 +96,7 @@ impl Category {
             Category::Appearance => "Appearance",
             Category::Themes => "Themes",
             Category::ScreenSaver => "Screen saver",
-            Category::TitleBar => "Title bar and tabs",
-            Category::Windows => "Windows",
+            Category::Windows => "Window and tabs",
             Category::Terminal => "Terminal",
             Category::Keyboard => "Keyboard and editing",
             Category::Macros => "Macros",
@@ -114,7 +111,6 @@ impl Category {
             Category::Appearance => Symbol::Contrast,
             Category::Themes => Symbol::Swatch,
             Category::ScreenSaver => Symbol::Display,
-            Category::TitleBar => Symbol::Window,
             Category::Windows => Symbol::Windows,
             Category::Terminal => Symbol::Prompt,
             Category::Keyboard => Symbol::Pencil,
@@ -134,7 +130,6 @@ impl Category {
             Category::Appearance => rgb(0x00, 0x7a, 0xff),
             Category::Themes => rgb(0xaf, 0x52, 0xde),
             Category::ScreenSaver => rgb(0x30, 0xb0, 0xc7),
-            Category::TitleBar => rgb(0x58, 0x56, 0xd6),
             Category::Windows => rgb(0x00, 0x7a, 0xff).lerp_to_gamma(rgb(0x30, 0xb0, 0xc7), 0.5),
             Category::Terminal => rgb(0x3a, 0x3a, 0x3c),
             Category::Keyboard => rgb(0xff, 0x95, 0x00),
@@ -148,7 +143,7 @@ impl Category {
     fn starts_group(self) -> bool {
         matches!(
             self,
-            Category::TitleBar | Category::Terminal | Category::Sessions | Category::About
+            Category::Windows | Category::Terminal | Category::Sessions | Category::About
         )
     }
 
@@ -934,7 +929,6 @@ fn build_pages() -> Vec<Page> {
     pages.extend(themes::pages());
     pages.push(screensaver::page());
     pages.extend(vec![
-        page(Category::TitleBar, title_bar()),
         page(Category::Windows, windows()),
         subpage(
             Category::Windows,
@@ -1067,9 +1061,9 @@ fn appearance() -> Vec<Section> {
                 Item::control("ui_scale", "Interface scale", ui_scale)
                     .sub("Enlarges the tabs, the title bar, the dialogs and the managers. The terminal keeps the font size above.")
                     .keys(&["zoom", "dpi", "size", "tamanho", "escala"]),
-                Item::control("sheet_opacity", "Window glass", window_glass)
-                    .sub("How much of the theme's gradient shows through Settings and the managers: 0 is clear, 1 is solid. Themes without a gradient are always solid.")
-                    .keys(&["opacity", "transparency", "translucent", "gradient", "opacidade", "transparencia", "degrade"]),
+                Item::control("title_bar_scale", "Title bar scale", title_bar_scale)
+                    .sub("Enlarges the title bar and the tabs again, on top of the interface scale, leaving the dialogs and the managers as they are.")
+                    .keys(&["zoom", "tabs", "abas", "size", "tamanho", "escala", "title bar"]),
                 Item::toggle("show_scrollbars", "Show scrollbars", |s| &mut s.show_scrollbars)
                     .sub("Solid scrollbars instead of the thin ones that only appear on hover.")
                     .keys(&["scrollbar", "barra de rolagem"]),
@@ -1147,7 +1141,16 @@ const UI_SCALE_STEPS: [u32; 5] = [100, 125, 150, 175, 200];
 /// it is done. The field does not drag either, for the same reason; it only
 /// takes what is typed into it.
 fn ui_scale(ui: &mut Ui, c: &mut Ctx<'_>) {
-    let mut percent = (c.settings.ui_scale * 100.0).round() as u32;
+    scale_picker(ui, c, |s| &mut s.ui_scale);
+}
+
+fn title_bar_scale(ui: &mut Ui, c: &mut Ctx<'_>) {
+    scale_picker(ui, c, |s| &mut s.title_bar_scale);
+}
+
+/// The steps, and a field to type any percentage between them.
+fn scale_picker(ui: &mut Ui, c: &mut Ctx<'_>, field: fn(&mut Settings) -> &mut f32) {
+    let mut percent = (*field(c.settings) * 100.0).round() as u32;
     // Laid out right to left: the field ends up at the right edge.
     let typed = ui
         .add(
@@ -1156,6 +1159,10 @@ fn ui_scale(ui: &mut Ui, c: &mut Ctx<'_>) {
                 .range(100..=200)
                 .suffix(" %"),
         )
+        // A field to type in, not to drag: the speed is zero, so the
+        // sideways arrows a drag value shows on hover promised a gesture
+        // that did nothing.
+        .on_hover_cursor(egui::CursorIcon::Text)
         .on_hover_text(tr("Type a percentage from 100 to 200."))
         .changed();
     let mut picked = None;
@@ -1169,28 +1176,20 @@ fn ui_scale(ui: &mut Ui, c: &mut Ctx<'_>) {
     }
     if let Some(step) = picked.or(typed.then_some(percent)) {
         let scale = step.clamp(100, 200) as f32 / 100.0;
-        if scale != c.settings.ui_scale {
-            c.settings.ui_scale = scale;
+        let value = field(c.settings);
+        if scale != *value {
+            *value = scale;
             c.changed = true;
         }
     }
 }
 
-fn window_glass(ui: &mut Ui, c: &mut Ctx<'_>) {
-    c.changed |= prefs::slider(
-        ui,
-        &mut c.settings.sheet_opacity,
-        0.0..=1.0,
-        Some((tr("Clear"), tr("Solid"))),
-        |s| s.step_by(0.05),
-    )
-    .changed();
-}
-
 // ---------------------------------------------------------------------------
-// Title bar and tabs
+// Window and tabs
 // ---------------------------------------------------------------------------
 
+/// The title bar and the tabs, ahead of the window's size and behaviour: one
+/// page for the whole window, rather than two that split it at the frame.
 fn title_bar() -> Vec<Section> {
     vec![
         section(
@@ -1211,7 +1210,10 @@ fn title_bar() -> Vec<Section> {
                 })
                 .hint("Adds the namespace the session is in to the tab's name - CONSISTEM | RDB76-TR. Read off the prompt, so it follows a ZN as it happens; a tab renamed by hand keeps the name it was given.")
                 .keys(&["namespace", "tab", "aba"]),
+                // Shown on the session line, which a title bar holding the
+                // tabs does not have: the switch would do nothing there.
                 Item::toggle("show_pid", "Show the process id", |s| &mut s.show_pid)
+                    .when(|c| !c.settings.tabs_in_title_bar)
                     .hint("Puts the session's process id next to the instance name and the window size in the menu bar. A local session only: a remote one runs its process on the far side.")
                     .keys(&["pid", "process", "processo"]),
             ],
@@ -1224,7 +1226,8 @@ fn title_bar() -> Vec<Section> {
 // ---------------------------------------------------------------------------
 
 fn windows() -> Vec<Section> {
-    vec![
+    let mut sections = title_bar();
+    sections.extend(vec![
         section(
             "Terminal size",
             vec![
@@ -1256,7 +1259,7 @@ fn windows() -> Vec<Section> {
                 .keys(&["remember", "lembrar", "salvar", "posicao"]),
             ],
         )
-        .footer("Takes effect the next time the app starts, and covers this window as well as the main one."),
+        .footer("Takes effect the next time the app starts. The Settings window always reopens where it was left."),
         section(
             "Desktop",
             vec![Item::toggle("pin_to_desktop", "Pin to desktop", |s| &mut s.pin_to_desktop)
@@ -1277,7 +1280,8 @@ fn windows() -> Vec<Section> {
                     .keys(&["tray", "notification", "bandeja", "notificacao", "minimize"]),
             ],
         ),
-    ]
+    ]);
+    sections
 }
 
 fn size_presets() -> Vec<Section> {
@@ -2110,7 +2114,7 @@ mod tests {
     fn a_hidden_keyword_finds_a_row_its_words_do_not_name() {
         assert!(found("bandeja", english).contains(&"close_to_tray"));
         assert!(found("senha", english).contains(&"proxy_password"));
-        assert!(found("transparency", english).contains(&"sheet_opacity"));
+        assert!(found("transparency", english).contains(&"th_ui_glass"));
     }
 
     #[test]

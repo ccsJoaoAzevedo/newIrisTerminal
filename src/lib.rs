@@ -63,6 +63,14 @@ pub fn run() -> eframe::Result<()> {
     // callback.
     let settings = config::Settings::load();
 
+    // With closing to the tray on, a launch that finds another copy running
+    // brings that one forward instead of starting a second, the way
+    // Notepad++ does. Otherwise every launch after a close-to-tray left one
+    // more hidden copy behind, each holding its sessions open.
+    if settings.close_to_tray && ui::tray::wake_existing() {
+        return Ok(());
+    }
+
     // Restoring the last size is exact; opening at the default geometry is not,
     // because it is expressed in characters. Either way `App` has the last word
     // once it can measure one.

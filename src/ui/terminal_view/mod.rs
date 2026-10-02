@@ -43,6 +43,12 @@ pub use scroll::{gradient_end, handle_colour, track_colour};
 /// can carry, and these all arrive together from `Settings` anyway.
 #[derive(Clone, Debug)]
 pub struct RenderOpts {
+    /// The area a background gradient is laid across, when it is wider than
+    /// this pane: the whole terminal area, margin included. The pane paints
+    /// only its own part of it, so the gradient runs on unbroken into the
+    /// margin around the grid instead of starting again inside it. `None`
+    /// lays it across the pane alone.
+    pub backdrop: Option<egui::Rect>,
     pub font_size: f32,
     /// Font family, already known to be registered with egui. Empty means the
     /// bundled monospace.
@@ -93,6 +99,7 @@ impl Default for RenderOpts {
             wrap: true,
             copy_on_select: false,
             intellisense: IntellisenseMode::default(),
+            backdrop: None,
             wide_grid: true,
             sql_syntax: true,
             sql_mode: None,
@@ -484,8 +491,10 @@ pub fn show(
     // Cells left at the default background are not filled by `paint_row`, so
     // a gradient laid here shows through every one of them, and a cell IRIS
     // coloured on purpose still covers it.
-    match theme.background_gradient.as_ref() {
-        Some(gradient) => crate::ui::shading::ui_gradient(&painter, rect, gradient),
+    match theme.terminal_gradient().as_ref() {
+        Some(gradient) => {
+            crate::ui::shading::ui_gradient(&painter, opts.backdrop.unwrap_or(rect), gradient)
+        }
         None => {
             painter.rect_filled(rect, 0.0, theme.background);
         }

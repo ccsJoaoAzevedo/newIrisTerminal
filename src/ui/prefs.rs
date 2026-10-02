@@ -56,6 +56,25 @@ const PILL_RADIUS: f32 = 7.0;
 /// The coloured tile in front of a sidebar entry.
 const TILE: f32 = 20.0;
 
+/// Draws what follows in `ui` `factor` times larger: the text, and the room
+/// the widgets take, so a row of tabs and buttons grows as a whole rather than
+/// its labels outgrowing the controls they are on. A no-op at 1.
+pub fn scale_style(ui: &mut egui::Ui, factor: f32) {
+    if !factor.is_finite() || (factor - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    let style = ui.style_mut();
+    for font in style.text_styles.values_mut() {
+        font.size *= factor;
+    }
+    let spacing = &mut style.spacing;
+    spacing.interact_size *= factor;
+    spacing.button_padding *= factor;
+    spacing.item_spacing *= factor;
+    spacing.icon_width *= factor;
+    spacing.icon_width_inner *= factor;
+}
+
 /// How opaque the cards and the sidebar are over a theme's backdrop when
 /// nothing has said otherwise.
 pub const DEFAULT_OPACITY: f32 = 0.6;

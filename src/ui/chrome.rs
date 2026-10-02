@@ -117,9 +117,8 @@ impl Icon {
 
     /// Whether this is one of the app's own controls rather than a window
     /// control. Aqua had no mark for these, so they are the app's glyph on an
-    /// Aqua bubble - and, unlike the traffic lights, with the glyph always
-    /// showing: a grey bubble that only says it opens a tab once the pointer
-    /// is on it is not a button anyone can find.
+    /// Aqua bubble - shown on hover, like the traffic lights' marks, so the
+    /// row of bubbles reads as one row rather than two kinds of button.
     fn is_own(self) -> bool {
         matches!(self, Icon::Pin { .. } | Icon::NewTab | Icon::CloseTab)
     }
@@ -139,10 +138,21 @@ fn optional_button(ui: &mut Ui, icon: Icon, hint: &str, style: &WindowButtons) -
 /// the app to still say which one has the keyboard.
 const AQUA_INACTIVE: Color32 = Color32::from_rgb(203, 203, 203);
 
+/// A button held and dragged moves the window, as every button on a GNOME
+/// header bar does: with the tabs filling the bar, the buttons are much of
+/// what there is to take hold of. A press released where it began is still
+/// a click.
+fn drags_window(ui: &Ui, response: &Response) {
+    if response.drag_started() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+}
+
 /// A square control with a hand-drawn icon.
 fn window_button(ui: &mut Ui, icon: Icon, hint: &str, style: &WindowButtons) -> Response {
     let side = ui.spacing().interact_size.y;
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click_and_drag());
+    drags_window(ui, &response);
     paint(ui, rect, icon, response.hovered(), style);
     response.on_hover_text(hint)
 }
@@ -251,6 +261,12 @@ fn paint_aqua(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
         215,
     );
 
+    // Tiger showed the marks only under the pointer - x to close, - to
+    // minimize, + to zoom - and hid them the rest of the time. The app's own
+    // controls follow the same rule.
+    if !hovered {
+        return;
+    }
     if icon.is_own() {
         icons::draw(
             painter,
@@ -259,11 +275,6 @@ fn paint_aqua(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
             darken(base, 0.30),
             base,
         );
-        return;
-    }
-    // Tiger showed the marks only under the pointer - x to close, - to
-    // minimize, + to zoom - and hid them the rest of the time.
-    if !hovered {
         return;
     }
     let stroke = Stroke::new(1.4_f32, darken(base, 0.30));
@@ -357,11 +368,13 @@ fn paint_luna(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
         Pos2::new(inner.right(), inner.top() + inner.height() * 0.52),
     );
     let lower = Rect::from_min_max(upper.left_bottom(), inner.right_bottom());
-    gradient(painter, upper, lighten(base, 0.52), lighten(base, 0.06));
+    gradient(painter, upper, lighten(base, 0.30), lighten(base, 0.04));
     gradient(painter, lower, darken(base, 0.94), darken(base, 0.70));
 
     // The gloss over the top half, cut off square the way a Luna button's was.
-    gradient(painter, upper, white(105), white(12));
+    // Kept faint: brighter, it washed the white glyph out of the top half of
+    // the tile, and a light theme colour lost the glyph altogether.
+    gradient(painter, upper, white(55), white(6));
     // Bevel: bright inside the top and left edges, and a light rim along the
     // bottom where the tile catches the desktop behind it.
     painter.line_segment(
@@ -394,6 +407,16 @@ fn paint_luna(ui: &Ui, rect: Rect, icon: Icon, hovered: bool, style: &WindowButt
     match icon {
         // Luna never had one either, and its glyphs are always on.
         Icon::Settings | Icon::Pin { .. } | Icon::NewTab | Icon::CloseTab => {
+            // A dark copy a pixel down first, as Luna's own white marks had:
+            // the glyph then reads over the gloss as well as the fill.
+            let shadow = darken(base, 0.45);
+            icons::draw(
+                painter,
+                tile.translate(Vec2::new(0.0, 1.0)),
+                icon.glyph(),
+                shadow,
+                shadow,
+            );
             icons::draw(painter, tile, icon.glyph(), colour, darken(base, 0.80))
         }
         Icon::Minimize => {
@@ -513,6 +536,7 @@ pub fn sample_bar(ui: &mut Ui, style: &WindowButtons, middle: &str) {
                 settings: Some(&mut open),
                 on_top: Some(false),
                 new_tab: Some(&mut plus),
+                tabs_fill: false,
                 tabs: &mut tabs,
             },
         );
@@ -557,6 +581,9 @@ pub struct TitleBar<'a> {
     /// Draws whatever stands where the order puts `Tabs` - the tabs, the
     /// session's line, a dialog's name - in at most the width it is given.
     pub tabs: &'a mut dyn FnMut(&mut Ui, f32) -> Option<WindowAction>,
+    /// The tabs fill the bar and move the window themselves - dragged up or
+    /// down - so no strip is held back after them to drag it by.
+    pub tabs_fill: bool,
 }
 
 /// One item of the order, laid out: its kind, and the width it advances the
@@ -627,7 +654,8 @@ pub fn title_bar(ui: &mut Ui, mut bar: TitleBar) -> Option<WindowAction> {
         .filter(|b| **b != TitleButton::Tabs)
         .map(|b| item_width(&bar, *b, side, 0.0, gap))
         .sum();
-    let tabs_room = (full.end - full.start - fixed - gap - FREE_STRIP).max(60.0);
+    let free = if bar.tabs_fill { 0.0 } else { FREE_STRIP };
+    let tabs_room = (full.end - full.start - fixed - gap - free).max(60.0);
     let tabs_guess = remembered.min(tabs_room);
     let width_of = |bar: &TitleBar, group: &[TitleButton]| -> f32 {
         group
@@ -815,7 +843,8 @@ pub fn close_tab_button(ui: &mut Ui, style: &WindowButtons) -> Response {
 /// has no business knowing.
 fn bare_button(ui: &mut Ui, icon: Icon, style: &WindowButtons) -> Response {
     let side = ui.spacing().interact_size.y;
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click_and_drag());
+    drags_window(ui, &response);
     paint(ui, rect, icon, response.hovered(), style);
     response
 }

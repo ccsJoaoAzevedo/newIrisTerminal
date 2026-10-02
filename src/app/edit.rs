@@ -187,6 +187,11 @@ impl App {
             return;
         };
         let edit = tab.completion.popup().and_then(autocomplete::Popup::edit);
+        let narrows = tab
+            .completion
+            .popup()
+            .and_then(autocomplete::Popup::chosen)
+            .is_some_and(|c| c.narrows);
         let at_end = lineedit::current(&tab.grid).is_some_and(|line| line.at_end());
         let encoding = tab.profile.wire_encoding();
         let wire = match edit {
@@ -199,6 +204,11 @@ impl App {
         };
         if let Some(tab) = self.pane_mut(at) {
             tab.completion.close();
+            // A folded `^TG…` line typed one character of a name, not the
+            // name: the popup opens again on what that leaves.
+            if narrows && wire.is_some() {
+                tab.completion.arm();
+            }
             if let Some(wire) = wire {
                 tab.recall_step = None;
                 tab.view.scroll_to_bottom();

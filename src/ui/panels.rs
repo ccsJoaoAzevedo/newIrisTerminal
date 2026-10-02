@@ -14,6 +14,7 @@
 //! macros here is the confirmation step, which is the part that has to
 //! interrupt.
 
+use crate::ui::dialog::{self, Role};
 use egui::{Context, Ui};
 
 use crate::features::macros::Macro;
@@ -140,61 +141,6 @@ impl PendingMacro {
     }
 }
 
-/// Dims everything behind a dialog, and swallows the clicks aimed at it.
-///
-/// egui 0.28 has no modal of its own, and these two dialogs have to be modal:
-/// both of them are the last look at a line of ObjectScript before it reaches a
-/// shared `RDB*` database, and a dialog you can click straight past while it is
-/// open is one you can answer by accident. The veil is drawn in the same layer
-/// order as a window and before the window, so it covers the terminal and the
-/// window covers it.
-fn veil(ctx: &Context, id: &str) {
-    let screen = ctx.screen_rect();
-    egui::Area::new(egui::Id::new((id, "veil")))
-        .order(egui::Order::Middle)
-        .fixed_pos(screen.min)
-        .interactable(true)
-        .show(ctx, |ui| {
-            // Allocated before it is painted, because an area's painter is
-            // clipped to what the area has claimed - and the click-and-drag
-            // sense is the half that makes it modal rather than decorative.
-            ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
-            ui.painter()
-                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
-        });
-}
-
-/// The frame both dialogs are drawn in: veiled, centred, and not resizable.
-///
-/// Centred by anchor rather than by opening position, so it cannot be dragged
-/// off to a corner and then be somewhere else the next time. A dialog answering
-/// one question does not need to be moved.
-fn modal<R>(
-    ctx: &Context,
-    id: &str,
-    title: String,
-    open: &mut bool,
-    contents: impl FnOnce(&mut Ui) -> R,
-) {
-    veil(ctx, id);
-    let shown = egui::Window::new(title)
-        .id(egui::Id::new(id))
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .open(open)
-        .show(ctx, contents);
-    // The veil and the window are both areas in the same layer order, and a
-    // click on an area brings it to the front of that order. Clicking the veil
-    // therefore buried the dialog underneath it: still painted, but no longer
-    // reachable by the pointer, so neither Send nor Cancel nor the title bar's
-    // close would answer and the dialog could not be dismissed at all. Lifting
-    // the window every frame keeps it above its own veil whatever was clicked.
-    if let Some(shown) = shown {
-        ctx.move_to_top(shown.response.layer_id);
-    }
-}
-
 /// Moves the keyboard on when Enter is pressed in a dialog field.
 ///
 /// Enter in the last field runs the dialog instead, which is the whole point:
@@ -260,11 +206,10 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
         pending.source.name.clone()
     };
 
-    modal(ctx, "nit-macro-run", title, &mut open, |ui| {
+    dialog::show(ctx, "nit-macro-run", &title, &mut open, |ui| {
         ui.set_min_width(360.0);
         if !pending.source.description.is_empty() {
-            ui.label(&pending.source.description);
-            ui.separator();
+            ui.vertical_centered(|ui| ui.weak(&pending.source.description));
         }
 
         // Only the parameters that reach the command, the same ones `values`
@@ -293,8 +238,8 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
         }
         let submitted = advance_on_enter(ui, &fields);
 
-        ui.separator();
-        ui.label(tr("Will send:"));
+        ui.add_space(4.0);
+        ui.weak(tr("Will send:"));
         let preview = pending.source.expand(&pending.values);
         // Hidden bodies stay hidden even here: the flag exists because the
         // body carries a credential, and this dialog is on screen.
@@ -307,21 +252,21 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
         }
 
         if pending.source.confirm {
-            ui.separator();
             ui.colored_label(
                 WARNING,
                 tr("This macro is marked as modifying data. RDB* databases are shared with the team."),
             );
         }
 
-        ui.separator();
-        ui.horizontal(|ui| {
-            let send_label = if pending.source.confirm {
-                tr("Yes, send it")
+        dialog::actions(ui, |ui| {
+            // A macro marked as modifying data is answered with the red
+            // button, as a deletion is on either desktop.
+            let (send_label, role) = if pending.source.confirm {
+                (tr("Yes, send it"), Role::Destructive)
             } else {
-                tr("Send")
+                (tr("Send"), Role::Suggested)
             };
-            let send = ui.button(send_label);
+            let send = dialog::button(ui, send_label, role);
             // Enter in the last field sends - except on a macro marked as
             // modifying data, where it only moves the keyboard onto the button.
             // The yes/no is there to be answered deliberately, and a second
@@ -332,7 +277,7 @@ pub fn pending_macro_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiR
             } else if submitted {
                 send.request_focus();
             }
-            if ui.button(tr("Cancel")).clicked() {
+            if dialog::button(ui, tr("Cancel"), Role::Plain).clicked() {
                 close = true;
             }
         });
@@ -381,55 +326,50 @@ pub fn pending_native_dialog(ctx: &Context, state: &mut PanelState) -> Option<Ui
     // helper now asks for.
     pending.values.resize(native.params().len(), String::new());
 
-    modal(
-        ctx,
-        "nit-native-run",
-        tr(native.label()).to_string(),
-        &mut open,
-        |ui| {
-            ui.set_min_width(360.0);
-            let mut fields = Vec::with_capacity(native.params().len());
-            for (index, param) in native.params().iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(tr(param.label));
-                    if let Some(value) = pending.values.get_mut(index) {
-                        let field =
-                            ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
-                        if index == 0 {
-                            focus_first(&field, &mut pending.focus_first);
-                        }
-                        fields.push(field);
-                    }
-                });
-            }
-            let submitted = advance_on_enter(ui, &fields);
-
-            let invocation = native.build(&pending.values);
-            ui.separator();
-            ui.label(tr("Will send:"));
-            for line in &invocation.lines {
-                ui.code(line);
-            }
-
-            ui.separator();
+    dialog::show(ctx, "nit-native-run", tr(native.label()), &mut open, |ui| {
+        ui.set_min_width(360.0);
+        let mut fields = Vec::with_capacity(native.params().len());
+        for (index, param) in native.params().iter().enumerate() {
             ui.horizontal(|ui| {
-                if ui.button(tr("Send")).clicked() || submitted {
-                    request = Some(UiRequest::RunNative(native, pending.values.clone()));
-                    close = true;
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    close = true;
-                }
-                if ui
-                    .button(tr("Reset"))
-                    .on_hover_text(tr("Back to the fields this helper starts with."))
-                    .clicked()
-                {
-                    pending.values = native.default_values();
+                ui.label(tr(param.label));
+                if let Some(value) = pending.values.get_mut(index) {
+                    let field =
+                        ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+                    if index == 0 {
+                        focus_first(&field, &mut pending.focus_first);
+                    }
+                    fields.push(field);
                 }
             });
-        },
-    );
+        }
+        let submitted = advance_on_enter(ui, &fields);
+
+        let invocation = native.build(&pending.values);
+        ui.add_space(4.0);
+        ui.weak(tr("Will send:"));
+        for line in &invocation.lines {
+            ui.code(line);
+        }
+
+        dialog::actions(ui, |ui| {
+            if dialog::button(ui, tr("Send"), Role::Suggested).clicked() || submitted {
+                request = Some(UiRequest::RunNative(native, pending.values.clone()));
+                close = true;
+            }
+            if dialog::button(ui, tr("Cancel"), Role::Plain).clicked() {
+                close = true;
+            }
+            // Furthest left, away from the answer, as a secondary action
+            // sits on either desktop.
+            ui.add_space(12.0);
+            if dialog::button(ui, tr("Reset"), Role::Plain)
+                .on_hover_text(tr("Back to the fields this helper starts with."))
+                .clicked()
+            {
+                pending.values = native.default_values();
+            }
+        });
+    });
 
     if close || !open {
         state.pending_native = None;
@@ -453,12 +393,8 @@ pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool
     let mut apply = false;
     let mut open = true;
 
-    egui::Window::new(tr("Update available"))
-        .id(egui::Id::new("nit-update"))
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
+    dialog::show(ctx, "nit-update", tr("Update available"), &mut open, |ui| {
+        {
             ui.label(tr2(
                 "Version {} is available. This one is {}.",
                 &release.version,
@@ -491,7 +427,6 @@ pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool
                 ));
             }
             ui.add_space(6.0);
-            ui.separator();
 
             if state.downloading {
                 // How far, not just that it is trying. A twelve-megabyte
@@ -520,10 +455,9 @@ pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool
                 }
                 return;
             }
-            ui.horizontal(|ui| {
+            dialog::actions(ui, |ui| {
                 if state.staged.is_some() {
-                    if ui
-                        .button(tr("Restart and update"))
+                    if dialog::button(ui, tr("Restart and update"), Role::Suggested)
                         .on_hover_text(tr(
                             "Puts the new version in place and starts it. Closes straight away, without asking about connected sessions - this is the close you just asked for. Each of them is sent HALT on the way out.",
                         ))
@@ -531,16 +465,17 @@ pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool
                     {
                         apply = true;
                     }
-                } else if ui.button(tr("Download")).clicked() {
+                } else if dialog::button(ui, tr("Download"), Role::Suggested).clicked() {
                     state.start_download();
                 }
-                if ui.button(tr("Later")).clicked() {
+                if dialog::button(ui, tr("Later"), Role::Plain).clicked() {
                     // Dismissed for this run. The next start asks again, which
                     // is the whole of the nagging this does.
                     state.asked = false;
                 }
             });
-        });
+        }
+    });
 
     if !open {
         state.asked = false;

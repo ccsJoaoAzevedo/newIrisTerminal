@@ -40,8 +40,13 @@ A terminal emulator for InterSystems IRIS — Windows, Linux and macOS.
   into the IRIS SQL shell; the same gesture leaves it. While the prompt reads
   `NAMESPACE>>`, the line is coloured as SQL.
 * **Autocomplete at the prompt:** commands, `$` functions, `^` globals,
-  routines, `##class(` names and, in SQL mode, keywords and tables — from your
-  history and what has been on screen. Up/Down choose, Tab accepts, Esc closes.
+  routines, `##class(` names and, in SQL mode, keywords and tables. Globals
+  come from the namespace itself — mapped ones and `^mtemp…` in IRISTEMP
+  included — and a prefix with too many is folded into one line per next
+  letter (`^TG…`) that narrows as you type. Inside `^GLOBAL(` it names the
+  subscript from the global's documentation and offers its constants, its
+  listed values and the subscripts that exist there now. Up/Down choose, Tab
+  accepts, Esc closes.
 * **Macros from XML:** `{{param}}` substitution, `confirm="true"` for anything
   that writes, a keyboard shortcut per macro, and `hide_command="true"` for a
   command line carrying a password. The macro editor checks every parameter
@@ -56,9 +61,9 @@ A terminal emulator for InterSystems IRIS — Windows, Linux and macOS.
 * **A clear-screen that keeps the transcript:** `W #` files the old screen into
   scrollback instead of destroying it, the way the native IrisTerm does.
   Ctrl+Delete is the deliberate gesture that really throws it away.
-* **Themes you can edit in the app:** eleven built-in and immutable — IRIS
+* **Themes you can edit in the app:** ten built-in and immutable — IRIS
   Dark, IRIS Classic Green, Tokyo, Light, Tiger Aqua, Tiger Graphite, Windows
-  XP, KDE Plastik, Hello Kitty, Hello Kitty Dark and Final Fantasy VII.
+  XP, Hello Kitty, Hello Kitty Dark and Final Fantasy VII.
   Duplicate one and every colour is yours: the terminal, its scrollbar and the
   chrome (each with an optional gradient), the window buttons, the selected
   tab, the sixteen ANSI slots and the sixteen ObjectScript ones. Point at a
@@ -68,7 +73,12 @@ A terminal emulator for InterSystems IRIS — Windows, Linux and macOS.
 * **Settings with search:** one window, macOS/GNOME style — a sidebar of
   pages, the themes, macros and screen savers among them, and a search field
   that finds any setting by name or description, in English or Portuguese.
-  An interface scale from 100% to 200% enlarges everything but the terminal.
+  An interface scale from 100% to 200% enlarges everything but the terminal,
+  and a title bar scale enlarges the tabs and the title bar on top of it.
+* **Tabs and the title bar:** the tabs share the whole bar, and any of them,
+  or any button, moves the window when dragged up or down. With *Close to the
+  tray* on, launching the app again brings the running copy back instead of
+  starting a second one.
 * **Screen savers:** Matrix (in any colours), a bouncing DVD logo or your own
   text, and a floating logo — Windows XP, Windows XP Pirated Edition, your text
   or your own PNG/GIF.

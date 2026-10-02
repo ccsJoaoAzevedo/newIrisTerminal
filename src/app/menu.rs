@@ -442,6 +442,7 @@ impl App {
                     on_top: pin,
                     new_tab: Some(&mut new_tab),
                     tabs: &mut middle,
+                    tabs_fill: inline_tabs,
                 },
             );
         });

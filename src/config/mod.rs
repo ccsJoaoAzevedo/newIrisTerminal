@@ -264,6 +264,10 @@ pub struct Settings {
     /// `font_size`: it is a character grid sized to the window, and scaling it
     /// as well would only be a second font-size setting.
     pub ui_scale: f32,
+    /// How much larger again the title bar and the tab strip are drawn, on
+    /// top of `ui_scale`, from 1 to 2: bigger tabs without the dialogs and
+    /// the managers growing with them.
+    pub title_bar_scale: f32,
     /// How opaque the pages of Settings and the managers are over a theme
     /// that paints a gradient behind the chrome, from 0 (clear glass) to 1.
     pub sheet_opacity: f32,
@@ -407,6 +411,7 @@ impl Default for Settings {
             autocomplete: true,
             sql_highlight: true,
             ui_scale: 1.0,
+            title_bar_scale: 1.0,
             sheet_opacity: crate::ui::prefs::DEFAULT_OPACITY,
             save_command_history: true,
             show_pid: true,
@@ -523,19 +528,13 @@ impl Settings {
         self.save_terminal_size && self.window_maximized
     }
 
-    /// Where the Settings window should reopen, for whichever of the two
-    /// switches is on. The same rule as the main window: its size follows
-    /// `save_terminal_size` and its position `save_window_position`.
+    /// Where the Settings window should reopen: always where it was left,
+    /// whatever the main window's two switches say.
     pub fn restored_settings_placement(&self) -> crate::ui::detach::Geometry {
         crate::ui::detach::Geometry {
-            size: self
-                .save_terminal_size
-                .then_some(self.settings_window_size)
-                .flatten(),
+            size: self.settings_window_size,
             position: self
-                .save_window_position
-                .then_some(self.settings_window_position)
-                .flatten()
+                .settings_window_position
                 .filter(|[x, y]| x.is_finite() && y.is_finite()),
         }
     }

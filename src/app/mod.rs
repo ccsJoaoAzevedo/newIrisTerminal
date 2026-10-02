@@ -186,6 +186,10 @@ pub struct App {
     /// frame by frame because a window that is closing no longer has a rect to
     /// ask for.
     window_size: Option<[f32; 2]>,
+    /// The terminal area, margin included, when the theme lays a gradient
+    /// across it - see `RenderOpts::backdrop`. Set each frame before any pane
+    /// is drawn.
+    terminal_backdrop: Option<egui::Rect>,
     window_position: Option<[f32; 2]>,
     window_maximized: bool,
     /// A split, unsplit or close asked for from a pane's right-click menu,
@@ -355,6 +359,7 @@ impl App {
             on_top_applied: None,
             fit,
             window_size: None,
+            terminal_backdrop: None,
             window_position: None,
             window_maximized: false,
         };

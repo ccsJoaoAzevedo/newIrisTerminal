@@ -328,7 +328,7 @@ fn paint_thumbnail(painter: &egui::Painter, rect: Rect, theme: &Theme, outline: 
     }
 
     painter.rect_filled(body, 0.0, theme.background);
-    if let Some(gradient) = theme.background_gradient.as_ref() {
+    if let Some(gradient) = theme.terminal_gradient().as_ref() {
         crate::ui::shading::ui_gradient(&painter, body, gradient);
     }
     let mut y = body.top() + 4.0;
@@ -638,7 +638,12 @@ fn terminal_colours() -> Vec<Section> {
             "Gradient",
             vec![
                 Item::control("th_gradient", "Gradient", |ui, c| {
-                    gradient_control(ui, c, |t| &mut t.background_gradient, |t| t.background)
+                    gradient_control(
+                ui,
+                c,
+                |t| (&mut t.background_gradient, &mut t.background_gradient_ends),
+                |t| t.background,
+            )
                 })
                 .contextual()
                 .keys(&["degrade", "terminal"]),
@@ -652,6 +657,11 @@ fn terminal_colours() -> Vec<Section> {
                 })
                 .when(|c| editing_has(c, |t| t.background_gradient.is_some()))
                 .keys(&["gradient", "degrade"]),
+                Item::control("th_gradient_strength", "Strength", |ui, c| {
+                    strength_slider(ui, c, |t| &mut t.background_gradient_strength, 1.0, ("Flat", "Full"))
+                })
+                .when(|c| editing_has(c, |t| t.background_gradient.is_some()))
+                .keys(&["gradient", "degrade", "opacity", "intensidade"]),
             ],
         )
         .footer("Painted behind the terminal's text in place of the flat background. Text IRIS gave a background colour of its own keeps it."),
@@ -735,7 +745,12 @@ fn chrome_colours() -> Vec<Section> {
             "Gradient",
             vec![
                 Item::control("th_ui_gradient", "Gradient", |ui, c| {
-                    gradient_control(ui, c, |t| &mut t.ui_gradient, |t| t.ui_background)
+                    gradient_control(
+                        ui,
+                        c,
+                        |t| (&mut t.ui_gradient, &mut t.ui_gradient_ends),
+                        |t| t.ui_background,
+                    )
                 })
                 .contextual()
                 .keys(&["chrome", "degrade"]),
@@ -745,10 +760,47 @@ fn chrome_colours() -> Vec<Section> {
                 Item::colour("th_ui_to", "To", |t| t.ui_gradient.as_mut().map(|g| &mut g.to))
                     .when(|c| editing_has(c, |t| t.ui_gradient.is_some()))
                     .keys(&["chrome", "gradient", "degrade"]),
+                // What used to be the app-wide "Window glass": it only ever
+                // meant anything over this gradient, so it belongs to the
+                // theme that has one.
+                Item::control("th_ui_glass", "Window glass", |ui, c| {
+                    let fallback = c.settings.sheet_opacity;
+                    strength_slider(ui, c, |t| &mut t.ui_glass, fallback, ("Clear", "Solid"))
+                })
+                .when(|c| editing_has(c, |t| t.ui_gradient.is_some()))
+                .keys(&["glass", "vidro", "transparency", "transparencia", "opacity"]),
             ],
         )
         .footer("Painted behind the title bar, the tab strip and the dialogs in place of the flat background. Menus keep the flat one, so they stay readable over the terminal."),
     ]
+}
+
+/// A 0-1 slider over one of the theme's optional amounts, showing `fallback`
+/// while the theme has not set it.
+fn strength_slider(
+    ui: &mut Ui,
+    c: &mut Ctx<'_>,
+    field: fn(&mut Theme) -> &mut Option<f32>,
+    fallback: f32,
+    ends: (&'static str, &'static str),
+) {
+    let Some(index) = editing(c) else {
+        return;
+    };
+    let theme = &mut c.themes[index];
+    let mut value = field(theme).unwrap_or(fallback);
+    let changed = prefs::slider(
+        ui,
+        &mut value,
+        0.0..=1.0,
+        Some((tr(ends.0), tr(ends.1))),
+        |s| s.step_by(0.05),
+    )
+    .changed();
+    if changed {
+        *field(theme) = Some(value);
+        c.changed = true;
+    }
 }
 
 /// What a window button's colour falls back to when the theme does not set
@@ -1112,10 +1164,14 @@ fn direction_picker(ui: &mut Ui, direction: &mut Option<GradientDirection>) -> b
 
 /// A gradient in place of a flat fill: none, or which way it runs. `flat` is
 /// the fill it replaces; the two ends are rows of their own.
+/// Where a gradient lives in a theme: the gradient, and the colours it keeps
+/// while switched off.
+type GradientFields = fn(&mut Theme) -> (&mut Option<UiGradient>, &mut Option<(Color32, Color32)>);
+
 fn gradient_control(
     ui: &mut Ui,
     c: &mut Ctx<'_>,
-    get: fn(&mut Theme) -> &mut Option<UiGradient>,
+    get: GradientFields,
     flat: fn(&Theme) -> Color32,
 ) {
     let Some(index) = editing(c) else {
@@ -1124,25 +1180,42 @@ fn gradient_control(
     let editable = !c.themes[index].builtin;
     let theme = &mut c.themes[index];
     let flat = flat(theme);
-    let gradient = get(theme);
+    // A gradient switched on starts from the flat fill lifted and lowered a
+    // little, so the first click already shows one rather than two equal ends.
+    let made = (
+        crate::ui::shading::lighten(flat, 0.25),
+        crate::ui::shading::darken(flat, 0.55),
+    );
+    let (gradient, kept) = get(theme);
     let mut direction = gradient.map(|g| g.direction);
+    let current = gradient.map(|g| (g.from, g.to)).or(*kept);
+    let mut reset = false;
     let changed = ui
-        .add_enabled_ui(editable, |ui| direction_picker(ui, &mut direction))
-        .inner;
-    if changed {
-        *gradient = direction.map(|direction| {
-            // Switching it on starts from the flat fill lifted and lowered a
-            // little, so the first click already shows a gradient rather than
-            // two equal ends.
-            let (from, to) = gradient.map(|g| (g.from, g.to)).unwrap_or((
-                crate::ui::shading::lighten(flat, 0.25),
-                crate::ui::shading::darken(flat, 0.55),
-            ));
-            UiGradient {
-                direction,
-                from,
-                to,
+        .add_enabled_ui(editable, |ui| {
+            // Only offered when there is something to go back from, as the
+            // colour rows' own reset is.
+            if current.is_some_and(|ends| ends != made)
+                && ui
+                    .small_button("\u{21ba}")
+                    .on_hover_text(tr(
+                        "Back to the colours made from the background: a little lighter at one end, darker at the other.",
+                    ))
+                    .clicked()
+            {
+                reset = true;
             }
+            direction_picker(ui, &mut direction)
+        })
+        .inner;
+    if changed || reset {
+        let (from, to) = if reset { made } else { current.unwrap_or(made) };
+        // Switched off, the colours are kept rather than dropped, so
+        // switching back on finds them where they were left.
+        *kept = Some((from, to));
+        *gradient = direction.map(|direction| UiGradient {
+            direction,
+            from,
+            to,
         });
         c.theme_edited = true;
     }
@@ -1437,7 +1510,7 @@ fn preview(ui: &mut Ui, theme: &Theme) {
         .inner_margin(egui::Margin::same(6.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            if let Some(gradient) = theme.background_gradient.as_ref() {
+            if let Some(gradient) = theme.terminal_gradient().as_ref() {
                 crate::ui::shading::ui_gradient(ui.painter(), ui.max_rect().expand(6.0), gradient);
             }
             ui.horizontal_top(|ui| {

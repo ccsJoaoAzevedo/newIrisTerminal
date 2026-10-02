@@ -78,6 +78,7 @@ impl App {
             wrap: self.settings.wrap_lines,
             copy_on_select: self.settings.copy_on_select,
             intellisense: self.settings.intellisense,
+            backdrop: self.terminal_backdrop,
             wide_grid: true,
             sql_syntax: self.settings.sql_highlight,
             // Per pane, from the pane's own prompt - see `App::terminal_pane`.
@@ -141,29 +142,27 @@ impl App {
                 self.settings.window_maximized = self.window_maximized;
                 changed = true;
             }
-            // The Settings window follows the same two switches rather than
-            // having a pair of its own: it is a window of the app's, and one
-            // answer to "remember where my windows were" is enough.
-            if settings_seen.size.is_some()
-                && self.settings.settings_window_size != settings_seen.size
-            {
-                self.settings.settings_window_size = settings_seen.size;
-                changed = true;
-            }
         }
-        if self.settings.save_window_position {
-            if self.window_position.is_some()
-                && self.settings.window_position != self.window_position
-            {
-                self.settings.window_position = self.window_position;
-                changed = true;
-            }
-            if settings_seen.position.is_some()
-                && self.settings.settings_window_position != settings_seen.position
-            {
-                self.settings.settings_window_position = settings_seen.position;
-                changed = true;
-            }
+        // The Settings window always reopens where it was left, whatever the
+        // two switches say: they are about the terminal, and a dialog that
+        // forgot its size every run is only a nuisance.
+        if settings_seen.size.is_some() && self.settings.settings_window_size != settings_seen.size
+        {
+            self.settings.settings_window_size = settings_seen.size;
+            changed = true;
+        }
+        if settings_seen.position.is_some()
+            && self.settings.settings_window_position != settings_seen.position
+        {
+            self.settings.settings_window_position = settings_seen.position;
+            changed = true;
+        }
+        if self.settings.save_window_position
+            && self.window_position.is_some()
+            && self.settings.window_position != self.window_position
+        {
+            self.settings.window_position = self.window_position;
+            changed = true;
         }
         if changed {
             if let Err(e) = self.settings.save() {
@@ -257,6 +256,24 @@ impl App {
     /// Not for a close already decided on - the confirmation's "Close anyway",
     /// the update's restart, the tray menu's own Exit - or there would be no
     /// way left to quit.
+    /// Hides the main window behind the tray icon, closing Settings first.
+    ///
+    /// Settings is a window of its own but is drawn from the main window's
+    /// frame, and eframe runs no frames for a window that is hidden: left
+    /// open, it froze where it was until the main window came back. Closed
+    /// on this frame, it is gone before the last frame runs, and its size and
+    /// position are saved as any other close of it saves them.
+    pub(super) fn hide_to_tray(&mut self) -> bool {
+        if !crate::ui::tray::hide("newIrisTerminal") {
+            return false;
+        }
+        if self.panels.show_settings {
+            self.panels.show_settings = false;
+            self.persist_window_geometry();
+        }
+        true
+    }
+
     pub(super) fn should_close_to_tray(&self) -> bool {
         self.settings.close_to_tray && !self.close_confirmed && !crate::ui::tray::quitting()
     }
@@ -284,27 +301,25 @@ impl App {
         let mut cancel = false;
         let mut open = true;
 
-        egui::Window::new(tr("Close newIrisTerminal?"))
-            .id(egui::Id::new("nit-close-confirm"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
+        let title = tr("Close newIrisTerminal?");
+        crate::ui::dialog::show(ctx, "nit-close-confirm", title, &mut open, |ui| {
+            use crate::ui::dialog::{actions, button, Role};
+            ui.vertical_centered(|ui| {
                 ui.label(match live {
                     1 => tr("1 session is still connected.").to_string(),
                     n => tr1("{} sessions are still connected.", &n.to_string()),
                 });
-                ui.small(tr("Closing sends HALT to each of them."));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button(tr("Close anyway")).clicked() {
-                        close_anyway = true;
-                    }
-                    if ui.button(tr("Keep working")).clicked() {
-                        cancel = true;
-                    }
-                });
+                ui.weak(tr("Closing sends HALT to each of them."));
             });
+            actions(ui, |ui| {
+                if button(ui, tr("Close anyway"), Role::Destructive).clicked() {
+                    close_anyway = true;
+                }
+                if button(ui, tr("Keep working"), Role::Plain).clicked() {
+                    cancel = true;
+                }
+            });
+        });
 
         if close_anyway {
             self.confirm_close = false;

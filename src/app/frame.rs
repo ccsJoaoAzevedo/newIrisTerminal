@@ -22,7 +22,10 @@ impl eframe::App for App {
         if (ctx.zoom_factor() - scale).abs() > f32::EPSILON {
             ctx.set_zoom_factor(scale);
         }
-        crate::ui::prefs::set_opacity(ctx, self.settings.sheet_opacity);
+        // The theme's own glass, or the app-wide value it replaced for a theme
+        // written before it had one.
+        let glass = theme.ui_glass.unwrap_or(self.settings.sheet_opacity);
+        crate::ui::prefs::set_opacity(ctx, glass);
         self.track_window_geometry(ctx);
         crate::ui::shading::paint_backdrop(ctx);
         // Refilled as the panes draw, below, and read by the resize grips at
@@ -62,7 +65,7 @@ impl eframe::App for App {
         // arrives as a flag rather than an event, and has to be caught before
         // anything else gets a chance to draw over the question.
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.should_close_to_tray() && crate::ui::tray::hide("newIrisTerminal") {
+            if self.should_close_to_tray() && self.hide_to_tray() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             } else if self.should_confirm_close() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -71,22 +74,44 @@ impl eframe::App for App {
         }
 
         let mut window_action = None;
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            window_action = self.menu_bar(ui, &theme.window_buttons);
+        // Tabs in the bar run its whole height, as elementary's do: the
+        // panel's own margin and the line under it would leave a band above
+        // and below them that is neither tab nor terminal.
+        let tabs_inline = self.settings.tabs_in_title_bar && !self.tabs.is_empty();
+        let bar_frame = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+            top: if tabs_inline { 0.0 } else { 2.0 },
+            bottom: if tabs_inline { 0.0 } else { 2.0 },
+            left: 8.0,
+            right: 8.0,
         });
+        egui::TopBottomPanel::top("menu")
+            .frame(bar_frame)
+            .show_separator_line(!tabs_inline)
+            .show(ctx, |ui| {
+                crate::ui::prefs::scale_style(ui, self.settings.title_bar_scale.clamp(1.0, 2.0));
+                window_action = self.menu_bar(ui, &theme.window_buttons);
+            });
         // Not when the setting has moved them into the title bar, where
         // `menu_bar` has already drawn them - that is what was putting the same
         // tabs on screen twice.
         if !self.settings.tabs_in_title_bar || self.tabs.is_empty() {
-            egui::TopBottomPanel::top("tabs").show(ctx, |ui| self.tab_strip(ui));
+            egui::TopBottomPanel::top("tabs")
+                .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::ZERO))
+                .show_separator_line(false)
+                .show(ctx, |ui| {
+                    crate::ui::prefs::scale_style(
+                        ui,
+                        self.settings.title_bar_scale.clamp(1.0, 2.0),
+                    );
+                    self.tab_strip(ui)
+                });
         }
 
         if let Some(action) = window_action {
             // Close is the one action that may be refused; the rest are
             // immediate.
-            let hidden = action == WindowAction::Close
-                && self.should_close_to_tray()
-                && crate::ui::tray::hide("newIrisTerminal");
+            let hidden =
+                action == WindowAction::Close && self.should_close_to_tray() && self.hide_to_tray();
             if hidden {
                 // The sessions stay; the tray icon brings the window back.
             } else if action == WindowAction::Close && self.should_confirm_close() {
@@ -124,6 +149,19 @@ impl eframe::App for App {
             )
             .show(ctx, |ui| {
                 terminal_rect = ui.max_rect();
+                // A gradient goes under the margin as well as the grid. Laid
+                // over the grid alone, the margin round it - the resize
+                // grips' gutter, and the part of a cell the window is short
+                // of - stayed the flat colour, and showed as a border.
+                self.terminal_backdrop = theme.terminal_gradient().map(|gradient| {
+                    let whole = terminal_rect + self.terminal_inset();
+                    crate::ui::shading::ui_gradient(
+                        &ui.ctx().layer_painter(ui.layer_id()),
+                        whole,
+                        &gradient,
+                    );
+                    whole
+                });
                 if self.tabs.is_empty() {
                     let mut open = false;
                     ui.centered_and_justified(|ui| {
@@ -320,6 +358,7 @@ impl eframe::App for App {
         // behind the window repaints in the colour being dragged; the requests
         // are carried out below, so a colour changed this frame is on screen
         // in the next one.
+        let settings_was_open = self.panels.show_settings;
         requests.extend(panels::settings_dialog(
             ctx,
             &mut self.settings,
@@ -331,6 +370,12 @@ impl eframe::App for App {
             &mut self.settings_placement,
             &theme.window_buttons,
         ));
+        // Written as the Settings window closes, not only as the app exits: an
+        // app closed to the tray never exits, and the size the window was
+        // left at was lost with it.
+        if settings_was_open && !self.panels.show_settings {
+            self.persist_window_geometry();
+        }
 
         for request in requests {
             self.handle_request(ctx, request);

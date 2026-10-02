@@ -33,6 +33,29 @@ const MARK_MAP: &str = "##CSWMAP##";
 const MARK_KEY: &str = "##CSWKEY##";
 const MARK: &str = "##CSWTIP##";
 const MARK_END: &str = "##CSWTIPEND##";
+/// One global name, in the answer to a [`DocLookup::globals`] question; the
+/// line that says the list was cut short; and one next-character prefix of
+/// the names past the cut.
+const MARK_NAME: &str = "##CSWGLO##";
+const MARK_MORE: &str = "##CSWMORE##";
+const MARK_NEXT: &str = "##CSWNXT##";
+/// One subscript that exists under a node, in the answer to a
+/// [`DocLookup::subscripts`] question.
+const MARK_SUB: &str = "##CSWSUB##";
+
+/// How many existing subscripts one question lists. A list for picking from,
+/// not a dump: `^mtemp` can hold one per process on a busy server.
+const SUBSCRIPTS_LIMIT: usize = 50;
+
+/// How long a list of existing subscripts is trusted. Unlike a global's
+/// structure it is live data - another process makes and kills them as it
+/// runs - so it is asked again rather than kept for the life of the tab.
+const SUBSCRIPTS_FRESH: Duration = Duration::from_secs(15);
+
+/// How many names one question lists before it gives up on listing and says
+/// only which characters can come next. Enough for any prefix worth reading
+/// as a list; `^T` in an ERP namespace is thousands.
+const NAMES_LIMIT: usize = 500;
 
 /// What a class's dictionary says about one property.
 ///
@@ -114,6 +137,9 @@ impl PieceInfo {
 /// first version of this did - describes the wrong row every time but one.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct MapInfo {
+    /// The class whose storage this map is, which is what names a constant
+    /// subscript that tells this map from its siblings.
+    pub class: String,
     /// How many subscripts a row under this map has.
     pub keys: usize,
     /// The subscripts that are constants, 1-based position and value. These
@@ -496,10 +522,53 @@ enum Step {
     /// or still printing its banner.
     Waking,
     /// Asked, watching its own screen for the end marker.
-    Asking {
-        key: (String, String),
-        since: Instant,
-    },
+    Asking { question: Question, since: Instant },
+}
+
+/// What the sidecar can be asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Question {
+    /// A global's maps, for the tooltip and the subscript hint: namespace,
+    /// global.
+    Structure(String, String),
+    /// The globals whose names start with a prefix, for autocomplete:
+    /// namespace, prefix.
+    Globals(String, String),
+    /// The subscripts that exist one level under a node, for autocomplete:
+    /// namespace, global, and the subscripts above that level, as values.
+    Subscripts(String, String, Vec<String>),
+}
+
+/// The subscripts found under one node.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Subscripts {
+    /// In collating order, as values: a string without its quotes.
+    pub values: Vec<String>,
+    /// There were more than `SUBSCRIPTS_LIMIT`.
+    pub more: bool,
+}
+
+/// The globals a namespace has under one prefix.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GlobalNames {
+    /// Without the caret, in collating order.
+    pub names: Vec<String>,
+    /// More than `NAMES_LIMIT` matched, so `names` is only the first of
+    /// them - and `next` is what is complete instead.
+    pub truncated: bool,
+    /// Every distinct prefix one character longer than the one asked about,
+    /// filled only when the list is truncated: what the user can type next.
+    pub next: Vec<String>,
+}
+
+/// Whether the globals under a prefix are known.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Names {
+    Ready(GlobalNames),
+    /// Asked, and still coming in: the names that have arrived so far, which
+    /// on a prefix matching hundreds is enough to be going on with.
+    Pending(GlobalNames),
+    Unavailable,
 }
 
 /// A second session, opened on the same profile, that only this module ever
@@ -535,11 +604,19 @@ struct Sidecar {
 #[derive(Default)]
 pub struct DocLookup {
     cache: HashMap<(String, String), Result<Vec<MapInfo>, ()>>,
-    /// Asked for by a hover, not yet sent, and when the hover asked. The
-    /// clock is what keeps a sidecar that never reaches a prompt - one whose
-    /// autologon is sitting on a password prompt with no password to give -
-    /// from spinning the tooltip for ever.
-    want: Option<((String, String), Instant)>,
+    names: HashMap<(String, String), GlobalNames>,
+    subscripts: HashMap<(String, String, Vec<String>), (Instant, Subscripts)>,
+    /// What has arrived of the globals question being answered, read off the
+    /// sidecar's screen before the end marker - and which question it is.
+    so_far: Option<(Question, GlobalNames)>,
+    /// Asked for, not yet sent, and when it was asked - at most one question
+    /// of each kind. The clock is what keeps a sidecar that never reaches a
+    /// prompt - one whose autologon is sitting on a password prompt with no
+    /// password to give - from spinning the tooltip for ever.
+    want: Vec<(Question, Instant)>,
+    /// Counts the answers that have arrived, so a popup worked out while one
+    /// was pending knows to work itself out again.
+    answers: u64,
     sidecar: Option<Sidecar>,
     /// Opening one failed, or this profile has none to open. Not retried:
     /// a tooltip is not worth a reconnect attempt per frame.
@@ -585,16 +662,108 @@ impl DocLookup {
         // A query already in flight is left to finish. Overwriting `want`
         // would be harmless, but a hover that drifts across a `zw` dump would
         // then queue a different global every frame and never settle on one.
-        if self.want.is_none() && !self.asking() {
-            self.want = Some((key, Instant::now()));
+        let structure = |q: &Question| matches!(q, Question::Structure(..));
+        if !self.want.iter().any(|(q, _)| structure(q)) && !self.asking(structure) {
+            self.want
+                .push((Question::Structure(key.0, key.1), Instant::now()));
         }
         Lookup::Pending
     }
 
-    fn asking(&self) -> bool {
+    /// The globals in `namespace` whose names start with `prefix`, or a note
+    /// that they have been asked for.
+    ///
+    /// Each prefix is asked about on its own. A complete list for a shorter
+    /// one is not the answer for a longer one: `^mtemp...` is mapped to
+    /// IRISTEMP and `^m` is not, so the list for `^m` has none of them. It is
+    /// what is shown while the longer one is asked, though - it is right far
+    /// more often than not. The newest prefix replaces one still waiting to
+    /// be sent: the user has typed past it.
+    pub fn globals(&mut self, namespace: &str, prefix: &str) -> Names {
+        if let Some(known) = self.known_globals(namespace, prefix) {
+            return Names::Ready(known);
+        }
+        if self.unavailable {
+            return Names::Unavailable;
+        }
+        let question = Question::Globals(namespace.to_string(), prefix.to_string());
+        if !self.asking(|q| *q == question) {
+            self.want
+                .retain(|(q, _)| !matches!(q, Question::Globals(..)));
+            self.want.push((question.clone(), Instant::now()));
+        }
+        let so_far = self
+            .so_far
+            .as_ref()
+            .filter(|(q, _)| *q == question)
+            .map(|(_, names)| names.clone())
+            .filter(|names| !names.names.is_empty())
+            .or_else(|| self.wider_globals(namespace, prefix))
+            .unwrap_or_default();
+        Names::Pending(so_far)
+    }
+
+    fn known_globals(&self, namespace: &str, prefix: &str) -> Option<GlobalNames> {
+        self.names
+            .get(&(namespace.to_string(), prefix.to_string()))
+            .cloned()
+    }
+
+    /// The names a complete list for a shorter prefix has under this one.
+    fn wider_globals(&self, namespace: &str, prefix: &str) -> Option<GlobalNames> {
+        let (_, wider) = self.names.iter().find(|((ns, p), found)| {
+            ns == namespace && prefix.starts_with(p.as_str()) && !found.truncated
+        })?;
+        Some(GlobalNames {
+            names: wider
+                .names
+                .iter()
+                .filter(|n| n.starts_with(prefix))
+                .cloned()
+                .collect(),
+            ..GlobalNames::default()
+        })
+    }
+
+    /// The subscripts that exist under `^global(before...)` in `namespace`,
+    /// or `None` while they are being asked for.
+    ///
+    /// Fresh for `SUBSCRIPTS_FRESH`, then asked again: what is under a node
+    /// changes as other processes run.
+    pub fn subscripts(
+        &mut self,
+        namespace: &str,
+        global: &str,
+        before: &[String],
+    ) -> Option<Subscripts> {
+        let key = (namespace.to_string(), global.to_string(), before.to_vec());
+        if let Some((at, found)) = self.subscripts.get(&key) {
+            if at.elapsed() < SUBSCRIPTS_FRESH {
+                return Some(found.clone());
+            }
+        }
+        if self.unavailable {
+            return Some(Subscripts::default());
+        }
+        let question = Question::Subscripts(key.0, key.1, key.2);
+        if !self.asking(|q| *q == question) {
+            self.want
+                .retain(|(q, _)| !matches!(q, Question::Subscripts(..)));
+            self.want.push((question, Instant::now()));
+        }
+        None
+    }
+
+    /// How many answers have arrived, ever. A caller that saw a question
+    /// pending compares this to know when to look again.
+    pub fn answers(&self) -> u64 {
+        self.answers
+    }
+
+    fn asking(&self, which: impl Fn(&Question) -> bool) -> bool {
         matches!(
             self.sidecar.as_ref().map(|s| &s.step),
-            Some(Step::Asking { .. })
+            Some(Step::Asking { question, .. }) if which(question)
         )
     }
 
@@ -606,7 +775,7 @@ impl DocLookup {
     /// the sidecar's own reader thread wakes the loop when bytes arrive, but
     /// the steps between them have nothing else to schedule them.
     pub fn pump(&mut self, profile: &Profile) -> bool {
-        if self.want.is_some() && self.sidecar.is_none() {
+        if !self.want.is_empty() && self.sidecar.is_none() {
             self.open(profile);
         }
         let Some(sidecar) = self.sidecar.as_mut() else {
@@ -635,34 +804,57 @@ impl DocLookup {
             // its screen: a global with more pieces than the grid has rows
             // scrolls the start of its own answer away before the end of it
             // arrives.
-            Step::Asking { key, since } => {
-                if let Some(pieces) = parse_answer(&sidecar.grid.all_text()) {
-                    let key = key.clone();
-                    self.finish(key, Ok(pieces));
+            Step::Asking { question, since } => {
+                let lines = sidecar.grid.all_text();
+                let answer = match question {
+                    Question::Structure(..) => parse_answer(&lines).map(Answer::Structure),
+                    Question::Globals(..) => parse_names(&lines).map(Answer::Globals),
+                    Question::Subscripts(..) => parse_subscripts(&lines).map(Answer::Subscripts),
+                };
+                if answer.is_some() || since.elapsed() > ANSWER_TIMEOUT {
+                    let question = question.clone();
+                    self.so_far = None;
+                    self.finish(question, answer);
                     moved = true;
-                } else if since.elapsed() > ANSWER_TIMEOUT {
-                    let key = key.clone();
-                    self.finish(key, Err(()));
-                    moved = true;
+                } else if matches!(question, Question::Globals(..)) {
+                    // Counted as an answer when more has arrived, so a popup
+                    // showing the names so far works itself out again.
+                    let (names, _) = scan_names(&lines);
+                    let grown = self.so_far.as_ref().is_none_or(|(q, known)| {
+                        q != question || known.names.len() != names.names.len()
+                    });
+                    if grown {
+                        self.so_far = Some((question.clone(), names));
+                        self.answers += 1;
+                        moved = true;
+                    }
                 }
             }
+            Step::Waking if ready_to_ask(&sidecar.grid) && !self.want.is_empty() => {
+                let (question, _) = self.want.remove(0);
+                // Answered meanwhile by a wider prefix's list.
+                let answered = match &question {
+                    Question::Globals(ns, prefix) => self.known_globals(ns, prefix).is_some(),
+                    Question::Structure(..) | Question::Subscripts(..) => false,
+                };
+                if !answered {
+                    self.ask(question, profile);
+                }
+                moved = true;
+            }
             Step::Waking => {
-                let ready = ready_to_ask(&sidecar.grid);
-                match self.want.take() {
-                    Some((key, _)) if ready => {
-                        self.ask(key, profile);
-                        moved = true;
-                    }
-                    // Still starting up, or logging in. Given long enough
-                    // that it plainly never will, the global is written off
-                    // like any other unanswered one, and the tooltip falls
-                    // back to the piece number rather than saying "Looking
-                    // up…" until the tab is closed.
-                    Some((key, since)) if since.elapsed() > ANSWER_TIMEOUT => {
-                        self.cache.insert(key, Err(()));
-                        moved = true;
-                    }
-                    other => self.want = other,
+                // Still starting up, or logging in. Given long enough that it
+                // plainly never will, a question is written off like any
+                // other unanswered one, and the tooltip falls back to the
+                // piece number rather than saying "Looking up…" until the tab
+                // is closed.
+                let (expired, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.want)
+                    .into_iter()
+                    .partition(|(_, since)| since.elapsed() > ANSWER_TIMEOUT);
+                self.want = waiting;
+                for (question, _) in expired {
+                    self.record(question, None);
+                    moved = true;
                 }
             }
         }
@@ -670,15 +862,15 @@ impl DocLookup {
         if ended {
             // It died on us. Whatever it was asked stays unanswered rather
             // than hanging a tooltip forever.
-            if let Some(Step::Asking { key, .. }) = self.sidecar.as_ref().map(|s| &s.step) {
-                let key = key.clone();
-                self.finish(key, Err(()));
+            if let Some(Step::Asking { question, .. }) = self.sidecar.as_ref().map(|s| &s.step) {
+                let question = question.clone();
+                self.finish(question, None);
             }
             self.sidecar = None;
             return true;
         }
         if let Some(sidecar) = self.sidecar.as_ref() {
-            if self.want.is_none()
+            if self.want.is_empty()
                 && matches!(sidecar.step, Step::Waking)
                 && sidecar.idle_since.elapsed() > IDLE_TIMEOUT
             {
@@ -697,19 +889,51 @@ impl DocLookup {
     /// blank grid, nothing would make it print another prompt, and every
     /// later hover sat on "Looking up…" for ever. Clearing belongs at the
     /// moment of asking - see [`DocLookup::ask`].
-    fn finish(&mut self, key: (String, String), answer: Result<Vec<MapInfo>, ()>) {
-        self.cache.insert(key, answer);
+    fn finish(&mut self, question: Question, answer: Option<Answer>) {
+        self.record(question, answer);
         if let Some(sidecar) = self.sidecar.as_mut() {
             sidecar.step = Step::Waking;
             sidecar.idle_since = Instant::now();
         }
     }
 
-    fn ask(&mut self, key: (String, String), profile: &Profile) {
+    /// Files an answer - or the lack of one, which is cached too, so a
+    /// question nothing answers is not asked again every frame.
+    fn record(&mut self, question: Question, answer: Option<Answer>) {
+        self.answers += 1;
+        match (question, answer) {
+            (Question::Structure(ns, global), Some(Answer::Structure(maps))) => {
+                self.cache.insert((ns, global), Ok(maps));
+            }
+            (Question::Structure(ns, global), _) => {
+                self.cache.insert((ns, global), Err(()));
+            }
+            (Question::Globals(ns, prefix), Some(Answer::Globals(names))) => {
+                self.names.insert((ns, prefix), names);
+            }
+            (Question::Globals(ns, prefix), _) => {
+                self.names.insert((ns, prefix), GlobalNames::default());
+            }
+            (Question::Subscripts(ns, global, before), answer) => {
+                let found = match answer {
+                    Some(Answer::Subscripts(found)) => found,
+                    _ => Subscripts::default(),
+                };
+                self.subscripts
+                    .insert((ns, global, before), (Instant::now(), found));
+            }
+        }
+    }
+
+    fn ask(&mut self, question: Question, profile: &Profile) {
         let Some(sidecar) = self.sidecar.as_mut() else {
             return;
         };
-        let query = build_query(&key.0, &key.1);
+        let query = match &question {
+            Question::Structure(ns, global) => build_query(ns, global),
+            Question::Globals(ns, prefix) => build_names_query(ns, prefix),
+            Question::Subscripts(ns, global, before) => build_subscripts_query(ns, global, before),
+        };
         // Everything this session has ever said, gone, so the previous
         // answer's markers cannot be read as this one's. Both halves matter:
         // `reset` files the screen into the scrollback rather than dropping
@@ -723,12 +947,12 @@ impl DocLookup {
             .write(&profile.wire_encoding().encode(&query))
             .is_err()
         {
-            self.cache.insert(key, Err(()));
+            self.record(question, None);
             self.sidecar = None;
             return;
         }
         sidecar.step = Step::Asking {
-            key,
+            question,
             since: Instant::now(),
         };
         sidecar.idle_since = Instant::now();
@@ -741,7 +965,7 @@ impl DocLookup {
         let opened = match (profile.shell.as_ref(), profile.remote.as_ref()) {
             (Some(_), _) => {
                 self.unavailable = true;
-                self.want = None;
+                self.want.clear();
                 return;
             }
             (None, Some(remote)) => {
@@ -770,10 +994,17 @@ impl DocLookup {
             }
             Err(_) => {
                 self.unavailable = true;
-                self.want = None;
+                self.want.clear();
             }
         }
     }
+}
+
+/// What came back for a [`Question`].
+enum Answer {
+    Structure(Vec<MapInfo>),
+    Globals(GlobalNames),
+    Subscripts(Subscripts),
 }
 
 /// Whether the sidecar is sitting at a bare prompt and can be typed at.
@@ -816,6 +1047,7 @@ fn parse_answer(lines: &[String]) -> Option<Vec<MapInfo>> {
             maps.push((
                 format!("{class}|{map}"),
                 MapInfo {
+                    class: class.to_string(),
                     keys,
                     fixed,
                     ..MapInfo::default()
@@ -867,6 +1099,50 @@ fn parse_answer(lines: &[String]) -> Option<Vec<MapInfo>> {
         });
     }
     complete.then(|| maps.into_iter().map(|(_, map)| map).collect())
+}
+
+/// The names out of a [`build_names_query`] answer, once its end marker has
+/// arrived.
+fn parse_names(lines: &[String]) -> Option<GlobalNames> {
+    let (found, complete) = scan_names(lines);
+    complete.then_some(found)
+}
+
+/// The names in an answer so far, and whether its end marker has arrived.
+fn scan_names(lines: &[String]) -> (GlobalNames, bool) {
+    let mut found = GlobalNames::default();
+    let mut complete = false;
+    for line in lines {
+        let line = line.trim();
+        if line == MARK_END {
+            complete = true;
+        } else if line == MARK_MORE {
+            found.truncated = true;
+        } else if let Some(name) = marked(line, MARK_NAME) {
+            found.names.push(name.to_string());
+        } else if let Some(next) = marked(line, MARK_NEXT) {
+            found.next.push(next.to_string());
+        }
+    }
+    (found, complete)
+}
+
+/// The subscripts out of a [`build_subscripts_query`] answer, once its end
+/// marker has arrived.
+fn parse_subscripts(lines: &[String]) -> Option<Subscripts> {
+    let mut found = Subscripts::default();
+    let mut complete = false;
+    for line in lines {
+        let line = line.trim();
+        if line == MARK_END {
+            complete = true;
+        } else if line == MARK_MORE {
+            found.more = true;
+        } else if let Some(value) = marked(line, MARK_SUB) {
+            found.values.push(value.to_string());
+        }
+    }
+    complete.then_some(found)
 }
 
 /// The four dictionary fields both marked lines end with, in the order
@@ -996,6 +1272,91 @@ fn build_query(namespace: &str, global: &str) -> String {
     lines.join("\r") + "\r"
 }
 
+/// The lines typed into the sidecar to list the globals under `prefix`.
+///
+/// `%SYS.GlobalQuery:NameSpaceList` rather than walking `^$GLOBAL`: the walk
+/// sees only the namespace's own default database, so in an ERP namespace
+/// whose globals are mapped in from a remote one - `RDB80-FA` - it found
+/// nothing under `^T` while the query found 672. The query takes a mask and
+/// answers with the names, caret left off.
+///
+/// Every match is read, so the next characters are complete however many
+/// there are, but only the first [`NAMES_LIMIT`] are written out by name;
+/// past that the answer is the list of next characters instead.
+///
+/// The query does not see globals mapped to IRISTEMP - the ERP's
+/// `^mtemp...` - at all. So where the prefix itself is mapped to a database
+/// on this machine, that database's own `^$GLOBAL` is walked as well, through
+/// an extended reference, and what it adds is merged in without repeats.
+///
+/// The same rules as [`build_query`]: no braces, nothing after an
+/// argumentless `FOR` on its line, and the namespace checked after the `ZN`.
+fn build_names_query(namespace: &str, prefix: &str) -> String {
+    let ns = quoted(namespace);
+    let p = quoted(prefix);
+    let lines = [
+        "K cswOk,cswP,cswN,cswR,cswSc,cswX,cswI,cswY,cswS,cswD,cswB,cswG".to_string(),
+        format!("ZN {ns}"),
+        format!(
+            "S cswOk=$ZCVT($ZNSPACE,\"U\")=$ZCVT({ns},\"U\"),cswP={p},cswN=$L(cswP),cswI=0,cswR=##class(%ResultSet).%New(\"%SYS.GlobalQuery:NameSpaceList\")"
+        ),
+        format!(
+            "I cswOk S cswSc=cswR.Execute($ZNSPACE,cswP_\"*\",0) F  Q:'cswR.Next()  S cswX=cswR.Get(\"Name\") I $E(cswX,1,cswN)=cswP S cswI=cswI+1,cswS(cswX)=\"\" S:$L(cswX)>cswN cswY($E(cswX,1,cswN+1))=\"\" W:cswI'>{NAMES_LIMIT} \"{MARK_NAME}\"_cswX_\"##\",!"
+        ),
+        "I cswOk S cswD=##class(%SYS.Namespace).GetGlobalDest($ZNSPACE,cswP),cswB=\"^^\"_$P(cswD,\"^\",2),cswG=\"^\"_cswP".to_string(),
+        format!(
+            "I cswOk,$P(cswD,\"^\",1)=\"\" F  S cswG=$O(^$|cswB|GLOBAL(cswG)) Q:cswG=\"\"  S cswX=$E(cswG,2,*) Q:$E(cswX,1,cswN)'=cswP  I '$D(cswS(cswX)) S cswI=cswI+1,cswS(cswX)=\"\" S:$L(cswX)>cswN cswY($E(cswX,1,cswN+1))=\"\" W:cswI'>{NAMES_LIMIT} \"{MARK_NAME}\"_cswX_\"##\",!"
+        ),
+        format!(
+            "I cswOk,cswI>{NAMES_LIMIT} W \"{MARK_MORE}\",! S cswX=\"\" F  S cswX=$O(cswY(cswX)) Q:cswX=\"\"  W \"{MARK_NEXT}\"_cswX_\"##\",!"
+        ),
+        format!("W \"{MARK_END}\",!"),
+    ];
+    lines.join("\r") + "\r"
+}
+
+/// A subscript value as ObjectScript has to be given it: a canonical number
+/// bare, anything else a string.
+fn subscript_literal(value: &str) -> String {
+    let number = value.strip_prefix('-').unwrap_or(value);
+    let canonical = !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && (number == "0" || !number.starts_with('0'));
+    if canonical {
+        value.to_string()
+    } else {
+        quoted(value)
+    }
+}
+
+/// The lines typed into the sidecar to list what exists one level under
+/// `^global(before...)`: a `$ORDER` walk, stopped after `SUBSCRIPTS_LIMIT`.
+///
+/// Reads only. The reference is written out in full rather than reached by
+/// indirection - the global's name is letters, digits, `%` and dots, and every
+/// subscript above is a literal - so nothing typed at the prompt is ever run
+/// as code here.
+fn build_subscripts_query(namespace: &str, global: &str, before: &[String]) -> String {
+    let ns = quoted(namespace);
+    let mut reference = format!("^{global}(");
+    for value in before {
+        reference.push_str(&subscript_literal(value));
+        reference.push(',');
+    }
+    reference.push_str("cswK)");
+    let lines = [
+        "K cswOk,cswK,cswI".to_string(),
+        format!("ZN {ns}"),
+        format!("S cswOk=$ZCVT($ZNSPACE,\"U\")=$ZCVT({ns},\"U\"),cswK=\"\",cswI=0"),
+        format!(
+            "I cswOk F  S cswK=$O({reference}) Q:cswK=\"\"  S cswI=cswI+1 Q:cswI>{SUBSCRIPTS_LIMIT}  W \"{MARK_SUB}\"_cswK_\"##\",!"
+        ),
+        format!("W:cswI>{SUBSCRIPTS_LIMIT} \"{MARK_MORE}\",!"),
+        format!("W \"{MARK_END}\",!"),
+    ];
+    lines.join("\r") + "\r"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1373,15 @@ mod tests {
     /// Not an assertion: prints the exact text the sidecar would type, so it
     /// can be replayed against a live instance. Ignored because it proves
     /// nothing on its own - see the module doc.
+    #[test]
+    #[ignore]
+    fn prints_the_names_query_for_manual_replay() {
+        print!(
+            "{}",
+            build_names_query("RDB80-OM", "mtempCC").replace('\r', "\n")
+        );
+    }
+
     #[test]
     #[ignore]
     fn prints_the_query_for_manual_replay() {
@@ -1572,7 +1942,10 @@ mod tests {
 
     /// The question waiting to be asked, without the clock beside it.
     fn wanted(lookup: &DocLookup) -> Option<(String, String)> {
-        lookup.want.as_ref().map(|(key, _)| key.clone())
+        lookup.want.iter().find_map(|(q, _)| match q {
+            Question::Structure(ns, global) => Some((ns.clone(), global.clone())),
+            Question::Globals(..) | Question::Subscripts(..) => None,
+        })
     }
 
     // --- what a hover asks for ----------------------------------------------
@@ -1649,5 +2022,170 @@ mod tests {
         lookup.pump(&profile);
         assert!(lookup.sidecar.is_none());
         assert_eq!(lookup.request("USER", "CCDU"), Lookup::Unavailable);
+    }
+
+    // --- listing globals ---------------------------------------------------
+
+    #[test]
+    fn a_names_answer_is_read_only_once_its_end_marker_has_arrived() {
+        let lines: Vec<String> = [
+            "COMP80>I cswOk F  S ...",
+            "##CSWGLO##TGEADGE##",
+            "##CSWGLO##TGEAINS##",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(parse_names(&lines), None);
+        let mut done = lines.clone();
+        done.push(MARK_END.into());
+        let names = parse_names(&done).expect("complete");
+        assert_eq!(names.names, ["TGEADGE", "TGEAINS"]);
+        assert!(!names.truncated);
+    }
+
+    #[test]
+    fn a_cut_list_carries_the_characters_that_can_come_next() {
+        let names = parse_names(&answer(&[
+            "##CSWGLO##TA##",
+            "##CSWMORE##",
+            "##CSWNXT##TA##",
+            "##CSWNXT##TG##",
+        ]))
+        .expect("complete");
+        assert!(names.truncated);
+        assert_eq!(names.next, ["TA", "TG"]);
+    }
+
+    /// A shorter prefix's list is not the longer one's answer - a mapping can
+    /// send `^mtemp...` elsewhere - so the longer one is still asked. Its
+    /// names stand in meanwhile.
+    #[test]
+    fn a_shorter_prefixs_list_stands_in_while_the_longer_one_is_asked() {
+        let mut lookup = DocLookup::default();
+        lookup.names.insert(
+            ("USER".into(), "TG".into()),
+            GlobalNames {
+                names: vec!["TGA".into(), "TGEADGE".into(), "TGEAINS".into()],
+                ..GlobalNames::default()
+            },
+        );
+        let Names::Pending(meanwhile) = lookup.globals("USER", "TGE") else {
+            panic!("the longer prefix should have been asked about");
+        };
+        assert_eq!(meanwhile.names, ["TGEADGE", "TGEAINS"]);
+        assert_eq!(lookup.want.len(), 1);
+    }
+
+    /// A cut list does not know what lies past the cut, so it answers only
+    /// itself.
+    #[test]
+    fn a_cut_list_is_not_used_for_a_longer_prefix() {
+        let mut lookup = DocLookup::default();
+        lookup.names.insert(
+            ("USER".into(), "T".into()),
+            GlobalNames {
+                truncated: true,
+                ..GlobalNames::default()
+            },
+        );
+        assert_eq!(
+            lookup.globals("USER", "TG"),
+            Names::Pending(GlobalNames::default())
+        );
+    }
+
+    /// The user has typed past a prefix still waiting to be sent, and asking
+    /// it would only be answered and thrown away.
+    #[test]
+    fn a_newer_prefix_replaces_one_still_waiting_and_leaves_a_hover_alone() {
+        let mut lookup = DocLookup::default();
+        lookup.request("USER", "CCDU");
+        lookup.globals("USER", "T");
+        lookup.globals("USER", "TG");
+        let globals: Vec<_> = lookup
+            .want
+            .iter()
+            .filter(|(q, _)| matches!(q, Question::Globals(..)))
+            .collect();
+        assert_eq!(globals.len(), 1);
+        assert_eq!(globals[0].0, Question::Globals("USER".into(), "TG".into()));
+        assert_eq!(wanted(&lookup), Some(("USER".into(), "CCDU".into())));
+    }
+
+    /// The same traps as the structure query: no braces, and nothing that
+    /// should run once sitting after a `FOR` on its line.
+    #[test]
+    fn the_names_query_keeps_the_shape_a_command_line_can_run() {
+        let query = build_names_query("COMP80", "TG\"X");
+        assert!(!query.contains('{'), "{query}");
+        assert!(
+            query.contains("cswP=\"TG\"\"X\""),
+            "the prefix is quoted: {query}"
+        );
+        assert!(query.ends_with(&format!("W \"{MARK_END}\",!\r")));
+        for line in query.split('\r').filter(|l| l.contains("F  S")) {
+            assert!(!line.contains(MARK_END), "{line}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn prints_the_subscripts_query_for_manual_replay() {
+        print!(
+            "{}",
+            build_subscripts_query("RDB80-OM", "mtemp", &[]).replace('\r', "\n")
+        );
+    }
+
+    // --- existing subscripts -------------------------------------------------
+
+    #[test]
+    fn the_subscripts_above_are_written_as_literals_and_nothing_is_run_by_indirection() {
+        let query = build_subscripts_query("USER", "FTCL", &["1".into(), "a\"b".into()]);
+        assert!(query.contains("$O(^FTCL(1,\"a\"\"b\",cswK))"), "{query}");
+        assert!(!query.contains('@'), "{query}");
+        assert!(!query.contains('{'), "{query}");
+    }
+
+    #[test]
+    fn a_number_with_a_leading_zero_is_a_string_subscript() {
+        assert_eq!(subscript_literal("19"), "19");
+        assert_eq!(subscript_literal("007"), "\"007\"");
+        assert_eq!(subscript_literal("-3"), "-3");
+    }
+
+    #[test]
+    fn a_subscripts_answer_says_when_there_were_more() {
+        let found = parse_subscripts(&answer(&[
+            "##CSWSUB##194##",
+            "##CSWSUB##ABC##",
+            "##CSWMORE##",
+        ]))
+        .expect("complete");
+        assert_eq!(found.values, ["194", "ABC"]);
+        assert!(found.more);
+        assert_eq!(parse_subscripts(&["##CSWSUB##1##".to_string()]), None);
+    }
+
+    /// Live data is trusted for a moment, not for the life of the tab.
+    #[test]
+    fn a_list_of_subscripts_goes_stale_and_is_asked_for_again() {
+        let mut lookup = DocLookup::default();
+        let key = ("USER".to_string(), "mtemp".to_string(), Vec::new());
+        lookup.subscripts.insert(
+            key.clone(),
+            (
+                Instant::now(),
+                Subscripts {
+                    values: vec!["194".into()],
+                    more: false,
+                },
+            ),
+        );
+        assert!(lookup.subscripts("USER", "mtemp", &[]).is_some());
+        let old = Instant::now() - SUBSCRIPTS_FRESH - Duration::from_secs(1);
+        lookup.subscripts.insert(key, (old, Subscripts::default()));
+        assert_eq!(lookup.subscripts("USER", "mtemp", &[]), None);
     }
 }

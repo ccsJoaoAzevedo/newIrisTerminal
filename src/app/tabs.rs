@@ -174,10 +174,25 @@ impl App {
     pub(super) fn tab_strip_bounded(&mut self, ui: &mut egui::Ui, width: f32) {
         let height = ui.available_height().max(ui.spacing().interact_size.y);
         let rect = egui::Rect::from_min_size(ui.cursor().min, egui::Vec2::new(width, height));
-        ui.allocate_ui_at_rect(rect, |ui| self.tab_strip(ui));
+        // The bar has already held back its own free strip to drag by - see
+        // `FREE_STRIP` in `crate::ui::chrome` - and `width` is what is left,
+        // across the theme's left and right spaces alike. Holding back more
+        // here left a band of nothing between the tabs and the buttons.
+        ui.allocate_ui_at_rect(rect, |ui| self.tab_strip_in(ui, 0.0, true));
     }
 
+    /// The tab strip as a row of its own, the tabs sharing its width.
     pub(super) fn tab_strip(&mut self, ui: &mut egui::Ui) {
+        self.tab_strip_in(ui, 0.0, false);
+    }
+
+    /// The tabs share the row out between them, the way GNOME's Files and
+    /// Text Editor do - all of it but `reserve`, which in the title bar is
+    /// the space the window is dragged by and must not be taken.
+    ///
+    /// `in_title_bar`: the tabs are what the window is moved by, so a tab
+    /// dragged up or down moves it instead of reordering.
+    fn tab_strip_in(&mut self, ui: &mut egui::Ui, reserve: f32, in_title_bar: bool) {
         let mut to_close = None;
         let mut to_rename = None;
         let mut to_split = None;
@@ -186,8 +201,18 @@ impl App {
         let mut to_reopen = false;
         let can_reopen = !self.closed_tabs.is_empty();
         let with_namespace = self.settings.show_namespace_in_tab;
-        let buttons = self.theme().window_buttons;
-        let selected_colours = (self.theme().tab_selected, self.theme().tab_selected_text);
+        let theme = self.theme();
+        // The shown tab is the terminal's own colour, so it runs on into the
+        // terminal under it, as elementary's does; a theme that names its own
+        // selected tab still gets that.
+        let selected_colours = (
+            Some(theme.tab_selected.unwrap_or(theme.background)),
+            theme.tab_selected_text,
+        );
+        let divider = theme
+            .ui_border
+            .unwrap_or(theme.ui_foreground)
+            .gamma_multiply(0.18);
         // Shrunk to the tabs rather than filling the row: in the title bar the
         // space left over is what the window is dragged by, and a scroll area
         // that claimed the whole width would take all of it.
@@ -247,13 +272,21 @@ impl App {
         // what a drag is measured against once every tab has been laid out.
         let mut spans: Vec<(f32, f32)> = Vec::with_capacity(self.tabs.len());
         let mut dragging = None;
+        // Set when a drag has been handed to the window, so the same drag is
+        // not also read as reordering.
+        let mut window_drag = false;
         let mut to_move = None;
+        let gap = 0.0;
+        let count = self.tabs.len().max(1) as f32;
+        let room = ui.available_width() - reserve;
+        let shared = Some(((room - gap * (count - 1.0)) / count).max(TAB_MIN_WIDTH));
 
         egui::ScrollArea::horizontal()
             .auto_shrink([true, false])
             .scroll_bar_visibility(visibility)
             .show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
                 for index in 0..self.tabs.len() {
                     let selected = index == self.active;
                     let split = self.tabs[index].split.is_some();
@@ -266,18 +299,50 @@ impl App {
                         // the tab neither loses it nor bakes it in.
                         label.push_str(" · SQL");
                     }
-                    let response = tab_label(ui, self.tabs[index].uid, selected, label, selected_colours)
-                        .on_hover_text(tr("Double-click to rename, drag to reorder."));
+                    let (response, close) =
+                        tab_pill(ui, self.tabs[index].uid, selected, label, selected_colours, shared);
+                    // A line between two tabs neither of which is shown: the
+                    // shown one is set off by its colour already.
+                    let next_selected = index + 1 == self.active;
+                    if index + 1 < self.tabs.len() && !selected && !next_selected {
+                        let r = response.rect;
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(r.right() - 0.5, r.top() + r.height() * 0.25),
+                                egui::pos2(r.right() - 0.5, r.bottom() - r.height() * 0.25),
+                            ],
+                            egui::Stroke::new(1.0_f32, divider),
+                        );
+                    }
+                    let response =
+                        response.on_hover_text(tr("Double-click to rename, drag to reorder."));
                     if response.clicked() {
                         to_activate = Some(index);
                     }
                     // The tab being moved is the one shown, the way it is
                     // everywhere else tabs are dragged: what is under the strip
                     // should be the session the user has hold of.
+                    // In the title bar, a drag that sets off up or down is
+                    // the window being moved - the bar has no other free
+                    // space to take hold of - and so is any drag of a lone
+                    // tab, which has nowhere to be reordered to.
+                    if in_title_bar && response.drag_started() {
+                        let moved = ui.input(|i| {
+                            i.pointer
+                                .press_origin()
+                                .zip(i.pointer.interact_pos())
+                                .map(|(from, to)| to - from)
+                        });
+                        let upright = moved.is_some_and(|d| d.y.abs() > d.x.abs());
+                        if upright || self.tabs.len() == 1 {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            window_drag = true;
+                        }
+                    }
                     if response.drag_started() {
                         to_activate = Some(index);
                     }
-                    if response.dragged() {
+                    if response.dragged() && !window_drag {
                         dragging = Some(index);
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                     }
@@ -354,13 +419,10 @@ impl App {
                             ui.close_menu();
                         }
                     });
-                    let close = chrome::close_tab_button(ui, &buttons)
-                        .on_hover_text(tr("Close this tab."));
-                    if close.clicked() {
+                    if close.is_some_and(|close| close.on_hover_text(tr("Close this tab.")).clicked()) {
                         to_close = Some(index);
                     }
-                    spans.push((response.rect.left(), close.rect.right()));
-                    ui.separator();
+                    spans.push((response.rect.left(), response.rect.right()));
                 }
 
                 let pointer = ui.ctx().pointer_interact_pos();
@@ -588,12 +650,8 @@ impl App {
         let mut commit = false;
         let mut cancel = false;
 
-        egui::Window::new(tr("Rename tab"))
-            .id(egui::Id::new("nit-rename-tab"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
+        crate::ui::dialog::show(ctx, "nit-rename-tab", tr("Rename tab"), &mut open, |ui| {
+            {
                 // A split tab is two sessions under one entry, so it is renamed
                 // two names at a time. The `1:` and `2:` are the panes
                 // themselves and cannot be edited away.
@@ -628,17 +686,18 @@ impl App {
                 // The one button there used to be for this is what an empty
                 // field already does, and two ways to say the same thing in a
                 // dialog this small only asks the user which one is real.
-                ui.small(tr("Empty goes back to default."));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button(tr("Rename")).clicked() {
+                ui.weak(tr("Empty goes back to default."));
+                use crate::ui::dialog::{actions, button, Role};
+                actions(ui, |ui| {
+                    if button(ui, tr("Rename"), Role::Suggested).clicked() {
                         commit = true;
                     }
-                    if ui.button(tr("Cancel")).clicked() {
+                    if button(ui, tr("Cancel"), Role::Plain).clicked() {
                         cancel = true;
                     }
                 });
-            });
+            }
+        });
 
         if commit {
             let named = |text: &str| {
@@ -659,72 +718,105 @@ impl App {
     }
 }
 
-/// One tab's name in the strip: a selectable label, drawn exactly as egui's
-/// own, that can also be dragged.
+/// The narrowest and widest a tab is drawn. Between the two it fits its name;
+/// past the widest the name is cut short with an ellipsis, so one long name
+/// cannot push every other tab off the strip.
+const TAB_MIN_WIDTH: f32 = 120.0;
+const TAB_MAX_WIDTH: f32 = 220.0;
+
+/// One tab, drawn the way elementary's Files and Terminal draw theirs: the
+/// whole height of its bar, square, the one shown filled with the terminal's
+/// colour so it runs on into the terminal, the rest flat until hovered. The
+/// close button is inside it on the left - shown on the tab being looked at
+/// and on the one under the pointer - and the name is centred. `width` is
+/// the tab's share of a row it fills; `None` sizes it to its name.
 ///
-/// Not `ui.selectable_label`, because that takes its id from egui's counter,
-/// which numbers widgets by where they are drawn - and `push_id` around it
-/// does not help, since a child `Ui` seeds its counter from its parent's
-/// rather than from the id it was given. A drag is tracked by id, and the tab
-/// being dragged changes place every time it passes another one: with an id
-/// that belongs to the place, the drag stayed behind and was taken up by
-/// whichever tab moved into it, which then moved in turn, and the tabs went
-/// round in a circle under a pointer that was holding still. The id here is
-/// the tab's own, so it goes wherever the tab goes.
-///
-/// Click and drag both: egui only calls it a drag once the pointer has moved
-/// past the click threshold, so a click still selects and a double-click still
-/// renames.
-/// One tab's label. `colours` is the theme's fill and text for the selected
-/// tab, either of which may be left to the widget colours.
-fn tab_label(
+/// The close button is registered after the tab, so it is the one a click on
+/// it reaches; the tab itself takes clicks, drags and the context menu.
+fn tab_pill(
     ui: &mut egui::Ui,
     uid: u64,
     selected: bool,
     text: String,
     colours: (Option<egui::Color32>, Option<egui::Color32>),
-) -> egui::Response {
-    let padding = ui.spacing().button_padding;
-    let galley = egui::WidgetText::from(text).into_galley(
-        ui,
-        None,
-        ui.available_width() - 2.0 * padding.x,
-        egui::TextStyle::Button,
-    );
-    let mut size = galley.size() + 2.0 * padding;
-    size.y = size.y.max(ui.spacing().interact_size.y);
-    let (rect, _) = ui.allocate_at_least(size, egui::Sense::hover());
+    width: Option<f32>,
+) -> (egui::Response, Option<egui::Response>) {
+    let base = ui.spacing().interact_size.y + 4.0;
+    let height = ui.available_height().max(base);
+    let close_side = base - 8.0;
+    let pad = 8.0;
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let outer = width.unwrap_or(TAB_MAX_WIDTH);
+    let room = outer - 2.0 * (pad + close_side);
+    let mut job = egui::text::LayoutJob::simple_singleline(text, font, egui::Color32::PLACEHOLDER);
+    job.wrap = egui::text::TextWrapping {
+        max_width: room,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let width = width.unwrap_or_else(|| {
+        (galley.size().x + 2.0 * (pad + close_side)).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+    });
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let response = ui.interact(
         rect,
         egui::Id::new(("nit-tab", uid)),
         egui::Sense::click_and_drag(),
     );
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + pad + close_side / 2.0, rect.center().y),
+        egui::Vec2::splat(close_side),
+    );
+    let shows_close = selected || ui.rect_contains_pointer(rect);
+    let close = shows_close.then(|| {
+        ui.interact(
+            close_rect,
+            egui::Id::new(("nit-tab-close", uid)),
+            egui::Sense::click(),
+        )
+    });
 
     if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact_selectable(&response, selected);
-        if selected || response.hovered() || response.highlighted() || response.has_focus() {
-            let fill = match colours.0 {
-                Some(fill) if selected => fill,
-                _ => visuals.weak_bg_fill,
-            };
-            ui.painter().rect(
-                rect.expand(visuals.expansion),
-                visuals.rounding,
-                fill,
-                visuals.bg_stroke,
+        let visuals = ui.visuals();
+        if selected {
+            let fill = colours.0.unwrap_or(visuals.extreme_bg_color);
+            ui.painter().rect_filled(rect, 0.0, fill);
+        } else if response.hovered() || response.dragged() {
+            ui.painter().rect_filled(
+                rect,
+                0.0,
+                visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.5),
             );
         }
-        let at = ui
-            .layout()
-            .align_size_within_rect(galley.size(), rect.shrink2(padding))
-            .min;
         let ink = match colours.1 {
             Some(ink) if selected => ink,
-            _ => visuals.text_color(),
+            _ if selected => visuals.strong_text_color(),
+            _ => visuals.text_color().gamma_multiply(0.7),
         };
+        let at = rect.center() - galley.size() / 2.0;
         ui.painter().galley(at, galley, ink);
+
+        if let Some(close) = close.as_ref() {
+            if close.hovered() {
+                ui.painter()
+                    .rect_filled(close_rect, 2.0, visuals.widgets.hovered.bg_fill);
+            }
+            let arm = close_side * 0.22;
+            let c = close_rect.center();
+            let stroke = egui::Stroke::new(1.4_f32, ink);
+            ui.painter().line_segment(
+                [c + egui::vec2(-arm, -arm), c + egui::vec2(arm, arm)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [c + egui::vec2(-arm, arm), c + egui::vec2(arm, -arm)],
+                stroke,
+            );
+        }
     }
-    response
+    (response, close)
 }
 
 /// Where the tab being dragged belongs, given the left and right edge of every

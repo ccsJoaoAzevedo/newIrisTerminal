@@ -20,16 +20,25 @@
 //! - what is on the screen right now, which catches a name that has just been
 //!   printed by a `zwrite` or a listing.
 //!
-//! The server is never asked. A side session in the way of
-//! [`crate::features::doc_lookup`] could list every class and global, but it
-//! costs a licence slot and a login, and a name that has never once appeared
-//! in front of the user is rarely the one they are reaching for.
+//! - for a `^GLOBAL`, the namespace itself, asked down the tooltip's own side
+//!   session - see [`crate::features::doc_lookup`] - so a global nobody has
+//!   typed yet is still offered. Where the prefix matches more than the popup
+//!   holds, the names already used come first and the rest are folded into
+//!   one line per next character, `^TG…`, which accepting types and narrows.
+//! - inside a global's subscripts, the global's own class documentation: what
+//!   the subscript being typed is, and the constants and listed values it can
+//!   take.
+//!
+//! The side session holds an IRIS licence slot while it is open, which is why
+//! none of the server's part happens with the global tooltip turned off.
 //!
 //! Recomputed only when the line on screen changes, and only after the user
 //! has typed: a frame that draws nothing new asks for nothing here.
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::features::doc_lookup::{DocLookup, GlobalNames, Lookup, MapInfo, Names, Subscripts};
+use crate::i18n::{tr, tr1, tr2};
 use crate::term::syntax::{self, Kind};
 use crate::term::{lineedit, sql, Grid};
 
@@ -40,6 +49,13 @@ pub const MAX_SHOWN: usize = 10;
 /// How many names of each sort are remembered. A session that prints a large
 /// listing must not grow this without bound.
 const MAX_NAMES: usize = 4_000;
+
+/// How many names already used are kept ahead of the folded `^TG…` lines.
+const RECENT_SHOWN: usize = 4;
+
+/// How many lines a folded popup may hold: every character a global name can
+/// go on with, near enough, so none is hidden behind the scroll.
+const MAX_FOLDED: usize = 30;
 
 /// What the word under the cursor is, judged from what comes before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +76,9 @@ pub enum Context {
     Class,
     /// Anything at the SQL shell's prompt.
     Sql,
+    /// One subscript of a global's reference, `^X(1,` - the word is what has
+    /// been typed of that subscript so far, quote and all.
+    Subscript,
 }
 
 /// The word being completed: what it is, and the part of it a suggestion
@@ -85,6 +104,8 @@ pub enum Category {
     SqlKeyword,
     SqlFunction,
     Table,
+    /// A value a global's documentation says a subscript can hold.
+    Subscript,
 }
 
 impl Category {
@@ -126,6 +147,7 @@ impl Category {
             Category::Entry => "entry point",
             Category::SqlKeyword => "keyword",
             Category::Table => "table",
+            Category::Subscript => "value",
         }
     }
 }
@@ -136,12 +158,35 @@ pub struct Candidate {
     /// The whole word the token becomes, without its sigil.
     pub text: String,
     pub category: Category,
+    /// Said beside it instead of the category's label: how many globals a
+    /// folded line stands for, which class a constant subscript belongs to.
+    pub note: Option<String>,
+    /// A folded line, `^TG…`: accepting it types the one character and opens
+    /// the popup again on what is left, rather than finishing a name.
+    pub narrows: bool,
 }
 
 impl Candidate {
+    fn new(text: impl Into<String>, category: Category) -> Self {
+        Candidate {
+            text: text.into(),
+            category,
+            note: None,
+            narrows: false,
+        }
+    }
+
     /// As shown in the popup.
     pub fn display(&self) -> String {
-        format!("{}{}", self.category.sigil(), self.text)
+        let more = if self.narrows { "…" } else { "" };
+        format!("{}{}{more}", self.category.sigil(), self.text)
+    }
+
+    /// The small word beside it.
+    pub fn label(&self) -> String {
+        self.note
+            .clone()
+            .unwrap_or_else(|| tr(self.category.label()).to_string())
     }
 }
 
@@ -586,7 +631,21 @@ fn starts_like_sql(chars: &[char]) -> bool {
 /// most likely means; the name seen most often; the shortest; the first
 /// alphabetically. A name the token already spells in full is not offered:
 /// there is nothing left to complete.
-pub fn candidates<'a>(token: &Token, vocabulary: &'a Vocabulary) -> Vec<Candidate> {
+pub fn candidates(token: &Token, vocabulary: &Vocabulary) -> Vec<Candidate> {
+    candidates_with(token, vocabulary, None)
+}
+
+/// [`candidates`], with what the namespace itself says it has under the
+/// token's prefix.
+///
+/// Once there are more matches than the popup holds - or the server would not
+/// even list them all - the list is folded: the names already used, best
+/// first, then one line per character that can come next.
+pub fn candidates_with<'a>(
+    token: &Token,
+    vocabulary: &'a Vocabulary,
+    server: Option<&'a GlobalNames>,
+) -> Vec<Candidate> {
     let typed: Vec<char> = token.text.chars().collect();
     type Pool<'a> = Vec<(u8, Category, &'a str)>;
     // Typed in the wrong case sorts last; then preference, most used, shortest.
@@ -629,7 +688,16 @@ pub fn candidates<'a>(token: &Token, vocabulary: &'a Vocabulary) -> Vec<Candidat
                 Category::Global,
                 v.globals.iter().map(String::as_str),
             );
+            if let Some(server) = server {
+                add(
+                    p,
+                    globals,
+                    Category::Global,
+                    server.names.iter().map(String::as_str),
+                );
+            }
         }
+        Context::Subscript => {}
         Context::Class => {
             add(p, 0, Category::Class, v.classes.iter().map(String::as_str));
             add(p, 1, Category::Class, CLASSES.iter().copied());
@@ -648,10 +716,7 @@ pub fn candidates<'a>(token: &Token, vocabulary: &'a Vocabulary) -> Vec<Candidat
             name.len() > typed.len() && prefix_ci(&typed, &name)
         })
         .map(|(preference, category, name)| {
-            let candidate = Candidate {
-                text: name.to_string(),
-                category,
-            };
+            let candidate = Candidate::new(name, category);
             let wrong_case = !category.case_insensitive() && !name.starts_with(&token.text);
             let uses = vocabulary.uses(&candidate);
             (
@@ -667,19 +732,295 @@ pub fn candidates<'a>(token: &Token, vocabulary: &'a Vocabulary) -> Vec<Candidat
         .collect();
     ranked.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.text.cmp(&y.text)));
 
-    let mut out: Vec<Candidate> = Vec::new();
-    for (_, candidate) in ranked {
+    let mut out: Vec<(u32, Candidate)> = Vec::new();
+    for (rank, candidate) in ranked {
         // `SELECT` is both a keyword and a `$` function, and a class can be
         // both seen and listed; one line in the popup each.
-        if out.iter().any(|c| c.display() == candidate.display()) {
+        if out.iter().any(|(_, c)| c.display() == candidate.display()) {
             continue;
         }
-        out.push(candidate);
-        if out.len() == MAX_SHOWN {
+        out.push((rank.2 .0, candidate));
+    }
+    let truncated = server.is_some_and(|s| s.truncated);
+    if out.len() <= MAX_SHOWN && !truncated {
+        return out.into_iter().map(|(_, c)| c).collect();
+    }
+    if server.is_none() {
+        return out.into_iter().take(MAX_SHOWN).map(|(_, c)| c).collect();
+    }
+    fold(
+        &typed,
+        out,
+        server.map_or(&[][..], |s| &s.next[..]),
+        truncated,
+    )
+}
+
+/// The names already used, then one line per next character.
+///
+/// `next` is the server's own list of next characters, which is all there is
+/// to go on past the cut when it would not list every name - and why the
+/// counts are left off then: they would count only the names before the cut.
+fn fold(
+    typed: &[char],
+    ranked: Vec<(u32, Candidate)>,
+    next: &[String],
+    truncated: bool,
+) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = ranked
+        .iter()
+        .filter(|(uses, _)| *uses > 0)
+        .take(RECENT_SHOWN)
+        .map(|(_, c)| c.clone())
+        .collect();
+    let mut groups: std::collections::BTreeMap<String, (usize, Category)> = Default::default();
+    for (_, c) in &ranked {
+        let head: String = c.text.chars().take(typed.len() + 1).collect();
+        groups.entry(head).or_insert((0, c.category)).0 += 1;
+    }
+    for head in next {
+        groups.entry(head.clone()).or_insert((0, Category::Global));
+    }
+    for (head, (count, category)) in groups {
+        if out.len() >= MAX_FOLDED {
             break;
+        }
+        // A line standing for one name might as well be the name.
+        if count == 1 && !truncated {
+            if let Some((_, only)) = ranked.iter().find(|(_, c)| c.text.starts_with(&head)) {
+                if !out.contains(only) {
+                    out.push(only.clone());
+                }
+                continue;
+            }
+        }
+        // `^TG` itself, when `^T` is typed: a whole name, not a fold.
+        let whole = ranked.iter().any(|(_, c)| c.text == head) && count == 1;
+        out.push(Candidate {
+            note: Some(if truncated || count == 0 {
+                tr("more").to_string()
+            } else {
+                tr1("{} names", &count.to_string())
+            }),
+            narrows: !whole,
+            ..Candidate::new(head, category)
+        });
+    }
+    out
+}
+
+/// The subscript of a global reference the cursor is in, judged from what
+/// was typed before it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spot {
+    /// Without the caret.
+    pub global: String,
+    /// The subscripts already typed, a string literal's quotes taken off.
+    pub before: Vec<String>,
+    /// What has been typed of this one, as typed.
+    pub text: String,
+    /// Every subscript above this one is a number or a string literal, so
+    /// the node they name can be looked up. A variable cannot be, from here.
+    pub literal: bool,
+}
+
+/// Where in `^NAME(a,b,` the cursor is - or `None` outside one. Only the
+/// innermost open bracket counts: in `^X($P(a,` the cursor is in `$P`'s
+/// arguments, not the global's.
+pub fn subscript_at(before: &[char]) -> Option<Spot> {
+    let mut open = Vec::new();
+    let mut quoted = false;
+    for (i, c) in before.iter().enumerate() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' if !quoted => open.push(i),
+            ')' if !quoted => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    let bracket = *open.last()?;
+    let head = &before[..bracket];
+    let start = run_start(head, |c| {
+        c.is_ascii_alphanumeric() || matches!(c, '%' | '.')
+    });
+    let caret = start.checked_sub(1)?;
+    if head[caret] != '^' || start == bracket {
+        return None;
+    }
+    // `$$Tag^ROUTINE(` and `do ^ROUTINE(` pass arguments, not subscripts.
+    if (caret > 0 && head[caret - 1].is_ascii_alphanumeric()) || after_call_command(&head[..caret])
+    {
+        return None;
+    }
+    let mut parts = vec![String::new()];
+    let (mut depth, mut quoted) = (0usize, false);
+    for &c in &before[bracket + 1..] {
+        match c {
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth = depth.saturating_sub(1),
+            ',' if !quoted && depth == 0 => {
+                parts.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(last) = parts.last_mut() {
+            last.push(c);
+        }
+    }
+    let text = parts.pop().unwrap_or_default();
+    let literal = parts.iter().all(|p| is_literal(p.trim()));
+    Some(Spot {
+        global: head[start..bracket].iter().collect(),
+        before: parts.iter().map(|p| unquote(p)).collect(),
+        text,
+        literal,
+    })
+}
+
+/// A number or a whole string literal - a subscript whose value is known
+/// without running anything.
+fn is_literal(typed: &str) -> bool {
+    let number = typed.strip_prefix('-').unwrap_or(typed);
+    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return true;
+    }
+    typed.len() >= 2
+        && typed.starts_with('"')
+        && typed.ends_with('"')
+        && !typed[1..typed.len() - 1].replace("\"\"", "").contains('"')
+}
+
+/// A subscript as IRIS holds it: a string literal without its quotes, and
+/// with its doubled quotes single again.
+fn unquote(typed: &str) -> String {
+    let typed = typed.trim();
+    match typed.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => typed.to_string(),
+    }
+}
+
+/// A value as it has to be typed: a number bare, anything else quoted.
+fn literal(value: &str) -> String {
+    let number = value.strip_prefix('-').unwrap_or(value);
+    let canonical = !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && (number == "0" || !number.starts_with('0'));
+    if canonical || value.starts_with('"') {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    }
+}
+
+/// What the subscript at `spot` is, and the values its maps say it can hold.
+///
+/// Only the maps whose constants agree with the subscripts already typed are
+/// asked: `^FTCL(e,c,19,` is past the point where the map with 24 in third
+/// place has anything to say.
+pub fn subscript_help(maps: &[MapInfo], spot: &Spot) -> (Option<String>, Vec<Candidate>) {
+    let position = spot.before.len() + 1;
+    let fits: Vec<&MapInfo> = maps
+        .iter()
+        .filter(|m| m.keys >= position)
+        .filter(|m| {
+            m.fixed
+                .iter()
+                .filter(|(at, _)| *at < position)
+                .all(|(at, value)| {
+                    spot.before.get(at - 1).map(String::as_str) == Some(unquote(value).as_str())
+                })
+        })
+        .collect();
+    let mut described: Vec<String> = Vec::new();
+    let mut items: Vec<Candidate> = Vec::new();
+    for map in &fits {
+        if let Some(info) = map.key_info.iter().find(|k| k.position == position) {
+            let description = &info.doc.description;
+            if !description.is_empty() && !described.contains(description) {
+                described.push(description.clone());
+            }
+            for (value, label) in &info.doc.value_list {
+                push_value(&mut items, literal(value), label);
+            }
+        } else if let Some((_, value)) = map.fixed.iter().find(|(at, _)| *at == position) {
+            push_value(
+                &mut items,
+                literal(&unquote(value)),
+                short_class(&map.class),
+            );
+        }
+    }
+    let typed: Vec<char> = spot.text.chars().collect();
+    items.retain(|c| {
+        let name: Vec<char> = c.text.chars().collect();
+        name.len() > typed.len() && prefix_ci(&typed, &name)
+    });
+    items.truncate(MAX_FOLDED);
+    let hint = (!fits.is_empty()).then(|| {
+        let position = position.to_string();
+        match described.len() {
+            0 => tr1("Key: {}", &position),
+            _ => {
+                described.truncate(3);
+                tr2("Key: {} - {}", &position, &described.join(" / "))
+            }
+        }
+    });
+    (hint, items)
+}
+
+fn push_value(items: &mut Vec<Candidate>, text: String, note: &str) {
+    if let Some(known) = items.iter_mut().find(|c| c.text == text) {
+        // The same constant in several maps: one line, naming the first.
+        if !known.note.as_deref().unwrap_or_default().ends_with('…') {
+            known.note = known.note.take().map(|n| format!("{n} …"));
+        }
+        return;
+    }
+    items.push(Candidate {
+        note: (!note.is_empty()).then(|| note.to_string()),
+        ..Candidate::new(text, Category::Subscript)
+    });
+}
+
+/// The subscripts that exist under the node, as suggestions for the one
+/// being typed: only those it extends, each as it has to be typed.
+fn existing_subscripts(found: &Subscripts, spot: &Spot) -> Vec<Candidate> {
+    let typed: Vec<char> = spot.text.chars().collect();
+    let mut out: Vec<Candidate> = found
+        .values
+        .iter()
+        .map(|value| literal(value))
+        .filter(|text| {
+            let name: Vec<char> = text.chars().collect();
+            name.len() > typed.len() && prefix_ci(&typed, &name)
+        })
+        .map(|text| Candidate {
+            note: Some(tr("exists").to_string()),
+            ..Candidate::new(text, Category::Subscript)
+        })
+        .collect();
+    if found.more {
+        if let Some(last) = out.last_mut() {
+            last.note = Some(tr("exists, and more").to_string());
         }
     }
     out
+}
+
+/// `CadCliente.Endereco` of `br.com.x.CadCliente.Endereco`: the end that
+/// tells two classes of one package apart.
+fn short_class(class: &str) -> &str {
+    let mut dots = class.rmatch_indices('.');
+    match (dots.next(), dots.next()) {
+        (Some(_), Some((at, _))) => &class[at + 1..],
+        _ => class,
+    }
 }
 
 fn prefix_ci(typed: &[char], name: &[char]) -> bool {
@@ -725,6 +1066,9 @@ pub fn edit_for(typed: &str, candidate: &Candidate) -> Option<Edit> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Popup {
     pub token: Token,
+    /// A line above the suggestions saying what the word being typed is:
+    /// which subscript of the global, as its documentation names it.
+    pub hint: Option<String>,
     pub items: Vec<Candidate>,
     pub selected: usize,
     /// The user has moved through the list, which is what lets Enter accept
@@ -756,18 +1100,86 @@ impl Popup {
     }
 }
 
+/// The namespace a session is in, and the side session that can be asked
+/// about it.
+pub struct Server<'a> {
+    pub lookup: &'a mut DocLookup,
+    pub namespace: &'a str,
+}
+
 /// The suggestions for the line the cursor is on, if any are worth offering.
 ///
 /// `None` off a prompt - a full-screen routine paints wherever it likes, and a
 /// suggestion over it would be over somebody else's screen - and anywhere but
 /// the end of the line.
 pub fn suggest(grid: &Grid, vocabulary: &mut Vocabulary) -> Option<Popup> {
+    suggest_with(grid, vocabulary, None, &mut false)
+}
+
+/// [`suggest`], asking `server` for what only the namespace knows. `waiting`
+/// is set when it has been asked and has not answered yet, which is the
+/// caller's cue to look again shortly.
+pub fn suggest_with(
+    grid: &Grid,
+    vocabulary: &mut Vocabulary,
+    server: Option<&mut Server>,
+    waiting: &mut bool,
+) -> Option<Popup> {
     let line = lineedit::current(grid)?;
     if !line.at_end() {
         return None;
     }
     let prompt = lineedit::prompt(grid)?;
     let before = typed_before_cursor(grid, line);
+    if !prompt.sql {
+        if let Some(spot) = subscript_at(&before) {
+            let server = server?;
+            let mut loading = false;
+            let maps = match server.lookup.request(server.namespace, &spot.global) {
+                Lookup::Ready(maps) => maps,
+                Lookup::Pending => {
+                    *waiting = true;
+                    loading = true;
+                    Vec::new()
+                }
+                // An undocumented global - `^mtemp` - still has subscripts.
+                Lookup::NotFound | Lookup::Unavailable => Vec::new(),
+            };
+            let (mut hint, mut items) = subscript_help(&maps, &spot);
+            // What exists there now, ahead of what the documentation says
+            // could: the value being reached for is usually one in use.
+            if spot.literal {
+                match server
+                    .lookup
+                    .subscripts(server.namespace, &spot.global, &spot.before)
+                {
+                    Some(found) => {
+                        let existing = existing_subscripts(&found, &spot);
+                        items.retain(|c| !existing.iter().any(|e| e.text == c.text));
+                        items.splice(0..0, existing);
+                        items.truncate(MAX_FOLDED);
+                    }
+                    None => {
+                        *waiting = true;
+                        loading = true;
+                    }
+                }
+            }
+            if loading && hint.is_none() {
+                hint = Some(tr1("Looking up ^{}…", &spot.global));
+            }
+            return (hint.is_some() || !items.is_empty()).then_some(Popup {
+                token: Token {
+                    context: Context::Subscript,
+                    text: spot.text,
+                },
+                hint,
+                items,
+                selected: 0,
+                navigated: false,
+            });
+        }
+    }
     let token = token_at(&before, prompt.sql)?;
     // The fixed lists need no help; the rest are only as good as what has
     // been seen, and what is on screen right now is the freshest of it.
@@ -777,9 +1189,31 @@ pub fn suggest(grid: &Grid, vocabulary: &mut Vocabulary) -> Option<Popup> {
     ) {
         vocabulary.harvest_screen(grid);
     }
-    let items = candidates(&token, vocabulary);
-    (!items.is_empty()).then_some(Popup {
+    // While the namespace is still answering, what has arrived so far is
+    // offered with a line above it saying the list is not complete - rather
+    // than nothing, or a list that silently grows under the selection.
+    let mut hint = None;
+    let names = match (token.context, server) {
+        (Context::Caret { routine: false }, Some(server)) => {
+            match server.lookup.globals(server.namespace, &token.text) {
+                Names::Ready(names) => Some(names),
+                Names::Pending(so_far) => {
+                    *waiting = true;
+                    hint = Some(match so_far.names.len() {
+                        0 => tr1("Looking up ^{}…", &token.text),
+                        n => tr1("Still loading… {} so far", &n.to_string()),
+                    });
+                    Some(so_far)
+                }
+                Names::Unavailable => None,
+            }
+        }
+        _ => None,
+    };
+    let items = candidates_with(&token, vocabulary, names.as_ref());
+    (!items.is_empty() || hint.is_some()).then_some(Popup {
         token,
+        hint,
         items,
         selected: 0,
         navigated: false,
@@ -803,6 +1237,9 @@ struct Seen {
     line: usize,
     col: usize,
     text: Vec<char>,
+    /// How many answers the side session had given, so one arriving is a
+    /// change worth working the popup out again for.
+    answers: u64,
 }
 
 /// One session's autocomplete: whether to look, and what was found.
@@ -815,6 +1252,8 @@ pub struct Completion {
     armed: bool,
     seen: Option<Seen>,
     popup: Option<Popup>,
+    /// The last look asked the side session something it has not answered.
+    waiting: bool,
 }
 
 impl Completion {
@@ -828,6 +1267,13 @@ impl Completion {
         self.armed = false;
         self.seen = None;
         self.popup = None;
+        self.waiting = false;
+    }
+
+    /// Whether an answer is on its way that would change the popup. Nothing
+    /// schedules a frame for the steps before it arrives, so the caller does.
+    pub fn waiting(&self) -> bool {
+        self.waiting
     }
 
     pub fn popup(&self) -> Option<&Popup> {
@@ -844,6 +1290,17 @@ impl Completion {
     /// Costs nothing while disarmed and closed, which is every frame but the
     /// ones a user is typing in.
     pub fn refresh(&mut self, grid: &Grid, vocabulary: &mut Vocabulary) {
+        self.refresh_with(grid, vocabulary, None);
+    }
+
+    /// [`Completion::refresh`], asking `server` for what only the namespace
+    /// knows.
+    pub fn refresh_with(
+        &mut self,
+        grid: &Grid,
+        vocabulary: &mut Vocabulary,
+        mut server: Option<Server>,
+    ) {
         if !self.armed && self.popup.is_none() {
             return;
         }
@@ -857,12 +1314,14 @@ impl Completion {
             line: grid.scrollback.len() + grid.cursor.row,
             col: line.cursor,
             text: typed_before_cursor(grid, line),
+            answers: server.as_ref().map_or(0, |s| s.lookup.answers()),
         };
         if self.seen.as_ref() == Some(&seen) {
             return;
         }
         self.seen = Some(seen);
-        self.popup = suggest(grid, vocabulary);
+        self.waiting = false;
+        self.popup = suggest_with(grid, vocabulary, server.as_mut(), &mut self.waiting);
     }
 }
 
@@ -1020,10 +1479,7 @@ mod tests {
 
     #[test]
     fn only_the_missing_part_is_sent_in_the_case_being_typed() {
-        let command = Candidate {
-            text: "write".into(),
-            category: Category::Command,
-        };
+        let command = Candidate::new("write", Category::Command);
         assert_eq!(
             edit_for("wr", &command),
             Some(Edit {
@@ -1035,10 +1491,7 @@ mod tests {
             edit_for("WR", &command).map(|e| e.insert).as_deref(),
             Some("ITE")
         );
-        let keyword = Candidate {
-            text: "SELECT".into(),
-            category: Category::SqlKeyword,
-        };
+        let keyword = Candidate::new("SELECT", Category::SqlKeyword);
         assert_eq!(
             edit_for("sel", &keyword).map(|e| e.insert).as_deref(),
             Some("ect")
@@ -1050,10 +1503,7 @@ mod tests {
     /// come back right.
     #[test]
     fn a_case_sensitive_name_rubs_out_what_was_typed_in_the_wrong_case() {
-        let global = Candidate {
-            text: "CSW1GEN".into(),
-            category: Category::Global,
-        };
+        let global = Candidate::new("CSW1GEN", Category::Global);
         assert_eq!(
             edit_for("CSw", &global),
             Some(Edit {
@@ -1118,6 +1568,7 @@ mod tests {
     #[test]
     fn the_selection_wraps_and_moving_it_is_what_lets_enter_accept() {
         let mut popup = Popup {
+            hint: None,
             token: Token {
                 context: Context::Dollar,
                 text: "zd".into(),
@@ -1156,5 +1607,168 @@ mod tests {
 
         completion.refresh(&grid_with("<BREAK>"), &mut v);
         assert!(completion.popup().is_none(), "the prompt went away");
+    }
+
+    // --- the server's globals, folded ---------------------------------------
+
+    fn caret(text: &str) -> Token {
+        Token {
+            context: Context::Caret { routine: false },
+            text: text.into(),
+        }
+    }
+
+    fn names(names: &[&str]) -> GlobalNames {
+        GlobalNames {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            ..GlobalNames::default()
+        }
+    }
+
+    #[test]
+    fn a_global_nobody_has_typed_is_offered_once_the_namespace_lists_it() {
+        let v = Vocabulary::default();
+        let listed = names(&["TGEADGE", "TGEAINS", "TGEBX"]);
+        let found = candidates_with(&caret("TGE"), &v, Some(&listed));
+        let shown: Vec<String> = found.iter().map(Candidate::display).collect();
+        assert_eq!(shown, ["^TGEBX", "^TGEADGE", "^TGEAINS"]);
+    }
+
+    /// Too many to list: the names already used first, then a line per next
+    /// character that says how many it stands for.
+    #[test]
+    fn more_matches_than_the_popup_holds_fold_into_the_next_character() {
+        let mut v = Vocabulary::default();
+        v.harvest_line("zw ^TMX");
+        let mut many: Vec<String> = (0..8).map(|i| format!("TG{i}")).collect();
+        many.extend((0..6).map(|i| format!("TC{i}")));
+        many.push("TMX".into());
+        let listed = GlobalNames {
+            names: many,
+            ..GlobalNames::default()
+        };
+        let found = candidates_with(&caret("T"), &v, Some(&listed));
+        let shown: Vec<String> = found.iter().map(Candidate::display).collect();
+        assert_eq!(shown, ["^TMX", "^TC…", "^TG…"], "used first, then folds");
+        assert!(found[1].narrows);
+        assert_eq!(found[1].note.as_deref(), Some("6 names"));
+        assert_eq!(
+            edit_for("T", &found[2]).map(|e| e.insert).as_deref(),
+            Some("G"),
+            "a fold types one character"
+        );
+    }
+
+    /// Past the server's cut only its list of next characters is complete,
+    /// so that is what the folds come from, and they carry no count.
+    #[test]
+    fn a_cut_list_folds_into_the_servers_next_characters() {
+        let v = Vocabulary::default();
+        let listed = GlobalNames {
+            names: vec!["TA1".into(), "TA2".into()],
+            truncated: true,
+            next: vec!["TA".into(), "TZ".into()],
+        };
+        let found = candidates_with(&caret("T"), &v, Some(&listed));
+        let shown: Vec<String> = found.iter().map(Candidate::display).collect();
+        assert_eq!(shown, ["^TA…", "^TZ…"]);
+        assert_eq!(found[1].note.as_deref(), Some("more"));
+    }
+
+    // --- subscripts ---------------------------------------------------------
+
+    fn spot(text: &str) -> Option<Spot> {
+        subscript_at(&chars(text))
+    }
+
+    #[test]
+    fn the_subscript_being_typed_is_counted_past_strings_and_nested_calls() {
+        let found = spot("zw ^FTCL(1,\"a,b\",$P(x,\",\",2),19").expect("a subscript");
+        assert_eq!(found.global, "FTCL");
+        assert_eq!(found.before, ["1", "a,b", "$P(x,\",\",2)"]);
+        assert_eq!(found.text, "19");
+        assert_eq!(spot("s x=^TGEAINS(").map(|s| s.before.len()), Some(0));
+    }
+
+    #[test]
+    fn a_routines_arguments_and_a_closed_reference_are_not_subscripts() {
+        assert_eq!(spot("d ^CSW(1,"), None);
+        assert_eq!(spot("w $$Get^CSW(1,"), None);
+        assert_eq!(spot("w ^X(1),"), None);
+        assert_eq!(spot("w ^X($P(a,"), None);
+    }
+
+    fn map(
+        class: &str,
+        keys: usize,
+        fixed: &[(usize, &str)],
+        described: &[(usize, &str)],
+    ) -> MapInfo {
+        MapInfo {
+            class: class.into(),
+            keys,
+            fixed: fixed.iter().map(|(at, v)| (*at, v.to_string())).collect(),
+            key_info: described
+                .iter()
+                .map(|(at, d)| crate::features::doc_lookup::KeyInfo {
+                    position: *at,
+                    doc: crate::features::doc_lookup::Doc {
+                        description: d.to_string(),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            ..MapInfo::default()
+        }
+    }
+
+    /// Straight after the bracket: what the first subscript is called.
+    #[test]
+    fn the_first_subscript_is_named_as_soon_as_the_bracket_is_typed() {
+        let maps = [map("X.Cliente", 2, &[], &[(1, "Empresa"), (2, "Cliente")])];
+        let (hint, items) = subscript_help(&maps, &spot("zw ^FTCL(").unwrap());
+        assert_eq!(hint.as_deref(), Some("Key: 1 - Empresa"));
+        assert!(items.is_empty());
+    }
+
+    /// A constant subscript is offered with the class it picks, and once one
+    /// is typed only the maps it agrees with are asked about what follows.
+    #[test]
+    fn constants_are_offered_and_then_narrow_the_maps() {
+        let maps = [
+            map(
+                "a.b.Cli.Endereco",
+                4,
+                &[(3, "19")],
+                &[(1, "Empresa"), (4, "Sequência")],
+            ),
+            map(
+                "a.b.Cli.Contato",
+                4,
+                &[(3, "24")],
+                &[(1, "Empresa"), (4, "Contato")],
+            ),
+        ];
+        let (_, items) = subscript_help(&maps, &spot("zw ^FTCL(1,2,").unwrap());
+        let offered: Vec<(String, String)> =
+            items.iter().map(|c| (c.text.clone(), c.label())).collect();
+        assert_eq!(
+            offered,
+            [
+                ("19".to_string(), "Cli.Endereco".to_string()),
+                ("24".to_string(), "Cli.Contato".to_string())
+            ]
+        );
+        let (hint, _) = subscript_help(&maps, &spot("zw ^FTCL(1,2,24,").unwrap());
+        assert_eq!(hint.as_deref(), Some("Key: 4 - Contato"));
+    }
+
+    /// A constant that is not a number has to be typed as a string.
+    #[test]
+    fn a_constant_that_is_not_a_number_is_offered_quoted() {
+        assert_eq!(literal("19"), "19");
+        assert_eq!(literal("007"), "\"007\"");
+        assert_eq!(literal("ABC"), "\"ABC\"");
+        assert_eq!(literal("\"ABC\""), "\"ABC\"");
     }
 }
