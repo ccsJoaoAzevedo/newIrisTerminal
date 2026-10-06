@@ -241,3 +241,25 @@ fn clearing_a_shell_keeps_the_transcript_and_empties_the_screen() {
         failed.join("\n  ")
     );
 }
+
+/// A session whose program exits by itself - IRIS after a `HALT`, here a
+/// shell told to `exit` - has to say it ended.
+///
+/// On Windows the pseudo-console keeps its output pipe open after the
+/// program has gone, so the reader never sees the end of it; before the
+/// process itself was watched, the tab sat frozen at this point, deaf to
+/// every key, with no Reconnect to offer.
+#[test]
+#[ignore = "starts a process on this machine"]
+fn a_session_whose_program_exits_says_it_ended() {
+    let cmd = std::path::PathBuf::from(std::env::var("ComSpec").unwrap_or("cmd.exe".into()));
+    let mut session =
+        Session::shell(&cmd, &["/c".into(), "echo bye".into()], None, 80, 24).expect("opens");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ended = false;
+    while Instant::now() < deadline && !ended {
+        ended = session.drain().1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ended, "the program exited and the session never said so");
+}

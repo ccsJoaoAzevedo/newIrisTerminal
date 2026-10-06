@@ -1124,6 +1124,23 @@ fn font_size(ui: &mut Ui, c: &mut Ctx<'_>) {
     c.changed |= prefs::slider(ui, &mut c.settings.font_size, 8.0..=28.0, None, |s| s).changed();
 }
 
+fn tab_width(ui: &mut Ui, c: &mut Ctx<'_>) {
+    let options: Vec<(crate::config::TabWidth, &str)> = crate::config::TabWidth::ALL
+        .iter()
+        .map(|&width| (width, tr(width.label())))
+        .collect();
+    c.changed |= prefs::segmented(ui, &mut c.settings.tab_width, &options);
+}
+
+fn autocomplete_mode(ui: &mut Ui, c: &mut Ctx<'_>) {
+    let options: Vec<(crate::config::AutocompleteMode, &str)> =
+        crate::config::AutocompleteMode::ALL
+            .iter()
+            .map(|&mode| (mode, tr(mode.label())))
+            .collect();
+    c.changed |= prefs::segmented(ui, &mut c.settings.autocomplete_mode, &options);
+}
+
 fn cursor_style(ui: &mut Ui, c: &mut Ctx<'_>) {
     let options: Vec<(CursorStyle, &str)> = CursorStyle::ALL
         .iter()
@@ -1200,6 +1217,9 @@ fn title_bar() -> Vec<Section> {
                 })
                 .hint("Puts the tabs on the same row as the window buttons, from the new-session button across to the gear. One row instead of two; the session line - instance, PID and size - goes, since the tabs already say which session it is.")
                 .keys(&["tabs", "abas"]),
+                Item::control("tab_width", "Tab width", tab_width)
+                    .hint("Fill the bar: the tabs share the whole row between them. Fixed size: each tab is as wide as its name, within limits, and the rest of the row is left free - in the title bar, somewhere to drag the window by. The tabs look the same either way.")
+                    .keys(&["tabs", "abas", "width", "largura", "size", "tamanho", "fixed", "fixo"]),
             ],
         ),
         section(
@@ -1386,6 +1406,10 @@ fn keyboard() -> Vec<Section> {
                 Item::toggle("autocomplete", "Autocomplete", |s| &mut s.autocomplete)
                     .sub("Offers the rest of the word being typed at an IRIS prompt. Tab accepts, Esc closes.")
                     .keys(&["completion", "intellisense", "suggest", "sugestao", "completar"]),
+                Item::control("autocomplete_mode", "Autocomplete offers", autocomplete_mode)
+                    .when(|c| c.settings.autocomplete)
+                    .hint("Everything: commands, functions, globals, routines, classes, and inside a global's subscripts what exists there and what its documentation says could. Only global data: nothing but the subscripts that exist under the node being typed - ^mtemp(\"CC shows every subscript starting with CC, and narrows as you type. Either way the subscripts come from a second session of the same profile, which holds an IRIS licence while it is open.")
+                    .keys(&["completion", "data", "dados", "global", "subscript", "mtemp", "completar"]),
             ],
         ),
         section(
@@ -1961,8 +1985,47 @@ fn about() -> Vec<Section> {
                     .keys(&["network", "http", "credentials", "rede", "credenciais"]),
             ],
         ),
+        section(
+            "Usage report",
+            vec![
+                Item::control("usage_report_email", "Send to", usage_report_email)
+                    .keys(&["usage", "report", "e-mail", "email", "feedback", "uso", "relatorio"]),
+                Item::toggle("ask_usage_report", "Offer to send it after each update", |s| {
+                    &mut s.ask_usage_report
+                })
+                .keys(&["usage", "report", "update", "uso", "relatorio", "atualizacao"]),
+                Item::control("send_usage_report", "Send it now", send_usage_report)
+                    .keys(&["usage", "report", "send", "uso", "relatorio", "enviar"]),
+            ],
+        )
+        .footer("Which settings you use differently from a fresh install, and how many profiles, macros and themes you have - never server addresses, user names, paths or commands. It is put into an e-mail in your own mail program, addressed to whoever is named here, and nothing is sent until you send it."),
         section("Did you know?", tips),
     ]
+}
+
+fn usage_report_email(ui: &mut Ui, c: &mut Ctx<'_>) {
+    c.changed |= ui
+        .add(
+            egui::TextEdit::singleline(&mut c.settings.usage_report_email)
+                .hint_text(tr("name@company.com"))
+                .desired_width(220.0),
+        )
+        .changed();
+}
+
+/// Straight into an e-mail, without the dialog that asks after an update:
+/// that dialog is drawn in the main window, behind this one, and the address
+/// it would ask for is the field just above.
+fn send_usage_report(ui: &mut Ui, c: &mut Ctx<'_>) {
+    let to = c.settings.usage_report_email.trim().to_string();
+    let ready = crate::features::usage::plausible_address(&to);
+    let send = ui
+        .add_enabled_ui(ready, |ui| prefs::button(ui, tr("Send now")))
+        .inner
+        .on_disabled_hover_text(tr("Type the address to send it to first."));
+    if send.clicked() {
+        c.requests.push(UiRequest::SendUsageReport(to));
+    }
 }
 
 fn proxy() -> Vec<Section> {

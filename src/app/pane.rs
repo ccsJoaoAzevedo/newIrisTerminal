@@ -455,18 +455,22 @@ impl App {
         };
         // The side session costs a licence slot, so it is asked only where the
         // global tooltip - which is what the user turned on to pay for it - is
-        // on too.
+        // on too, or where the autocomplete offers nothing but what the side
+        // session finds, which is the same choice made from the other end.
+        let mode = self.settings.autocomplete_mode;
+        let paid_for = self.settings.intellisense != crate::config::IntellisenseMode::Off
+            || mode == crate::config::AutocompleteMode::DataOnly;
         let namespace = tab.namespace.clone();
         let server = namespace
             .as_deref()
-            .filter(|_| self.settings.intellisense != crate::config::IntellisenseMode::Off)
+            .filter(|_| paid_for)
             .filter(|_| !tab.profile.is_shell())
             .map(|namespace| crate::features::autocomplete::Server {
                 lookup: &mut tab.doc_lookup,
                 namespace,
             });
         tab.completion
-            .refresh_with(&tab.grid, &mut self.vocabulary, server);
+            .refresh_with(&tab.grid, &mut self.vocabulary, server, mode);
         if tab.completion.waiting() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }

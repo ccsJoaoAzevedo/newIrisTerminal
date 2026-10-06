@@ -37,7 +37,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::features::doc_lookup::{DocLookup, GlobalNames, Lookup, MapInfo, Names, Subscripts};
+use crate::config::AutocompleteMode;
+use crate::features::doc_lookup::{
+    DocLookup, Existing, GlobalNames, Lookup, MapInfo, Names, SubscriptPrefix, SubscriptValue,
+    Subscripts,
+};
 use crate::i18n::{tr, tr1, tr2};
 use crate::term::syntax::{self, Kind};
 use crate::term::{lineedit, sql, Grid};
@@ -988,29 +992,102 @@ fn push_value(items: &mut Vec<Candidate>, text: String, note: &str) {
     });
 }
 
-/// The subscripts that exist under the node, as suggestions for the one
-/// being typed: only those it extends, each as it has to be typed.
-fn existing_subscripts(found: &Subscripts, spot: &Spot) -> Vec<Candidate> {
-    let typed: Vec<char> = spot.text.chars().collect();
-    let mut out: Vec<Candidate> = found
-        .values
-        .iter()
-        .map(|value| literal(value))
-        .filter(|text| {
-            let name: Vec<char> = text.chars().collect();
-            name.len() > typed.len() && prefix_ci(&typed, &name)
-        })
-        .map(|text| Candidate {
-            note: Some(tr("exists").to_string()),
-            ..Candidate::new(text, Category::Subscript)
-        })
-        .collect();
-    if found.more {
-        if let Some(last) = out.last_mut() {
-            last.note = Some(tr("exists, and more").to_string());
+/// The subscripts that exist under the node and extend what was typed of
+/// this one, each as it has to be typed.
+///
+/// Listed one per line while they fit in the popup; past that, or when the
+/// server would not list them all, folded the way a long list of global names
+/// is - one line per character that can come next, `"CC…`, which accepting
+/// types and narrows.
+fn existing_subscripts(found: &Subscripts, prefix: &SubscriptPrefix) -> Vec<Candidate> {
+    let typed_len = match prefix {
+        SubscriptPrefix::Any => 0,
+        SubscriptPrefix::Strings(p) | SubscriptPrefix::Numbers(p) => p.chars().count(),
+    };
+    let values: Vec<&SubscriptValue> = found.values.iter().filter(|v| prefix.admits(v)).collect();
+    if values.len() <= MAX_SHOWN && !found.more {
+        return values
+            .into_iter()
+            .map(|v| Candidate {
+                note: Some(tr("exists").to_string()),
+                ..Candidate::new(typed_value(v), Category::Subscript)
+            })
+            .collect();
+    }
+    // Numbers first, as IRIS collates them.
+    let mut groups: std::collections::BTreeMap<(bool, String), usize> = Default::default();
+    for v in &values {
+        let head: String = v.value.chars().take(typed_len + 1).collect();
+        *groups.entry((!v.number, head)).or_default() += 1;
+    }
+    for next in found.next.iter().filter(|n| prefix.admits(n)) {
+        groups
+            .entry((!next.number, next.value.clone()))
+            .or_default();
+    }
+    let mut out = Vec::new();
+    for ((string, head), count) in groups {
+        if out.len() >= MAX_FOLDED {
+            break;
         }
+        let start = SubscriptValue {
+            value: head,
+            number: !string,
+        };
+        // The value that is exactly what was typed: nothing to fold, but its
+        // closing quote is still worth offering.
+        if start.value.chars().count() <= typed_len {
+            out.push(Candidate {
+                note: Some(tr("exists").to_string()),
+                ..Candidate::new(typed_value(&start), Category::Subscript)
+            });
+            continue;
+        }
+        // A line standing for one value might as well be the value.
+        if count == 1 && !found.more {
+            if let Some(only) = values
+                .iter()
+                .find(|v| v.number == start.number && v.value.starts_with(&start.value))
+            {
+                out.push(Candidate {
+                    note: Some(tr("exists").to_string()),
+                    ..Candidate::new(typed_value(only), Category::Subscript)
+                });
+                continue;
+            }
+        }
+        out.push(Candidate {
+            note: Some(if found.more || count == 0 {
+                tr("more").to_string()
+            } else {
+                tr1("{} values", &count.to_string())
+            }),
+            narrows: true,
+            ..Candidate::new(typed_start(&start), Category::Subscript)
+        });
     }
     out
+}
+
+/// A value found under a node, as it has to be typed: a number bare, a
+/// string quoted. Told by the server rather than by the look of it, which is
+/// what keeps `1.5` bare and `007` quoted.
+fn typed_value(found: &SubscriptValue) -> String {
+    if found.number {
+        found.value.clone()
+    } else {
+        format!("\"{}\"", found.value.replace('"', "\"\""))
+    }
+}
+
+/// The start of a value, as typed so far: a string's opening quote and no
+/// closing one, so typing it leaves the literal open to go on with.
+fn typed_start(found: &SubscriptValue) -> String {
+    if found.number {
+        found.value.clone()
+    } else {
+        format!("\"{}", found.value.replace('"', "\"\""))
+    }
 }
 
 /// `CadCliente.Endereco` of `br.com.x.CadCliente.Endereco`: the end that
@@ -1113,16 +1190,21 @@ pub struct Server<'a> {
 /// suggestion over it would be over somebody else's screen - and anywhere but
 /// the end of the line.
 pub fn suggest(grid: &Grid, vocabulary: &mut Vocabulary) -> Option<Popup> {
-    suggest_with(grid, vocabulary, None, &mut false)
+    suggest_with(grid, vocabulary, None, AutocompleteMode::Full, &mut false)
 }
 
 /// [`suggest`], asking `server` for what only the namespace knows. `waiting`
 /// is set when it has been asked and has not answered yet, which is the
 /// caller's cue to look again shortly.
+///
+/// In [`AutocompleteMode::DataOnly`] nothing is offered but the subscripts
+/// that exist under the node being typed: no commands, no names, and none of
+/// what the documentation says a subscript could hold.
 pub fn suggest_with(
     grid: &Grid,
     vocabulary: &mut Vocabulary,
     server: Option<&mut Server>,
+    mode: AutocompleteMode,
     waiting: &mut bool,
 ) -> Option<Popup> {
     let line = lineedit::current(grid)?;
@@ -1131,38 +1213,55 @@ pub fn suggest_with(
     }
     let prompt = lineedit::prompt(grid)?;
     let before = typed_before_cursor(grid, line);
+    let data_only = mode == AutocompleteMode::DataOnly;
     if !prompt.sql {
         if let Some(spot) = subscript_at(&before) {
             let server = server?;
             let mut loading = false;
-            let maps = match server.lookup.request(server.namespace, &spot.global) {
-                Lookup::Ready(maps) => maps,
-                Lookup::Pending => {
-                    *waiting = true;
-                    loading = true;
-                    Vec::new()
-                }
-                // An undocumented global - `^mtemp` - still has subscripts.
-                Lookup::NotFound | Lookup::Unavailable => Vec::new(),
-            };
-            let (mut hint, mut items) = subscript_help(&maps, &spot);
-            // What exists there now, ahead of what the documentation says
-            // could: the value being reached for is usually one in use.
-            if spot.literal {
-                match server
-                    .lookup
-                    .subscripts(server.namespace, &spot.global, &spot.before)
-                {
-                    Some(found) => {
-                        let existing = existing_subscripts(&found, &spot);
-                        items.retain(|c| !existing.iter().any(|e| e.text == c.text));
-                        items.splice(0..0, existing);
-                        items.truncate(MAX_FOLDED);
-                    }
-                    None => {
+            let (mut hint, mut items) = if data_only {
+                (None, Vec::new())
+            } else {
+                let maps = match server.lookup.request(server.namespace, &spot.global) {
+                    Lookup::Ready(maps) => maps,
+                    Lookup::Pending => {
                         *waiting = true;
                         loading = true;
+                        Vec::new()
                     }
+                    // An undocumented global - `^mtemp` - still has subscripts.
+                    Lookup::NotFound | Lookup::Unavailable => Vec::new(),
+                };
+                subscript_help(&maps, &spot)
+            };
+            // What exists there now, ahead of what the documentation says
+            // could: the value being reached for is usually one in use.
+            let prefix = spot
+                .literal
+                .then(|| SubscriptPrefix::of_typed(&spot.text))
+                .flatten();
+            if let Some(prefix) = prefix {
+                let found = match server.lookup.subscripts(
+                    server.namespace,
+                    &spot.global,
+                    &spot.before,
+                    &prefix,
+                ) {
+                    Existing::Ready(found) => Some(found),
+                    Existing::Pending(so_far) => {
+                        *waiting = true;
+                        loading = true;
+                        so_far
+                    }
+                };
+                if let Some(found) = found {
+                    let typed: Vec<char> = spot.text.chars().collect();
+                    let existing: Vec<Candidate> = existing_subscripts(&found, &prefix)
+                        .into_iter()
+                        .filter(|c| c.text.chars().count() > typed.len())
+                        .collect();
+                    items.retain(|c| !existing.iter().any(|e| e.text == c.text));
+                    items.splice(0..0, existing);
+                    items.truncate(MAX_FOLDED);
                 }
             }
             if loading && hint.is_none() {
@@ -1179,6 +1278,9 @@ pub fn suggest_with(
                 navigated: false,
             });
         }
+    }
+    if data_only {
+        return None;
     }
     let token = token_at(&before, prompt.sql)?;
     // The fixed lists need no help; the rest are only as good as what has
@@ -1290,7 +1392,7 @@ impl Completion {
     /// Costs nothing while disarmed and closed, which is every frame but the
     /// ones a user is typing in.
     pub fn refresh(&mut self, grid: &Grid, vocabulary: &mut Vocabulary) {
-        self.refresh_with(grid, vocabulary, None);
+        self.refresh_with(grid, vocabulary, None, AutocompleteMode::Full);
     }
 
     /// [`Completion::refresh`], asking `server` for what only the namespace
@@ -1300,6 +1402,7 @@ impl Completion {
         grid: &Grid,
         vocabulary: &mut Vocabulary,
         mut server: Option<Server>,
+        mode: AutocompleteMode,
     ) {
         if !self.armed && self.popup.is_none() {
             return;
@@ -1321,7 +1424,7 @@ impl Completion {
         }
         self.seen = Some(seen);
         self.waiting = false;
-        self.popup = suggest_with(grid, vocabulary, server.as_mut(), &mut self.waiting);
+        self.popup = suggest_with(grid, vocabulary, server.as_mut(), mode, &mut self.waiting);
     }
 }
 
@@ -1770,5 +1873,102 @@ mod tests {
         assert_eq!(literal("007"), "\"007\"");
         assert_eq!(literal("ABC"), "\"ABC\"");
         assert_eq!(literal("\"ABC\""), "\"ABC\"");
+    }
+
+    // --- what exists under a node ------------------------------------------
+
+    fn found(values: &[(&str, bool)], more: bool, next: &[(&str, bool)]) -> Subscripts {
+        let value = |&(value, number): &(&str, bool)| SubscriptValue {
+            value: value.to_string(),
+            number,
+        };
+        Subscripts {
+            values: values.iter().map(value).collect(),
+            more,
+            next: next.iter().map(value).collect(),
+        }
+    }
+
+    /// The server says which values are numbers, so `1.5` is typed bare and
+    /// `007` quoted, though both look like digits.
+    #[test]
+    fn a_value_found_is_offered_the_way_it_has_to_be_typed() {
+        let items = existing_subscripts(
+            &found(
+                &[("1.5", true), ("007", false), ("a\"b", false)],
+                false,
+                &[],
+            ),
+            &SubscriptPrefix::Any,
+        );
+        let texts: Vec<&str> = items.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["1.5", "\"007\"", "\"a\"\"b\""]);
+        assert!(items.iter().all(|c| !c.narrows));
+    }
+
+    /// More than the popup holds folds into one line per next character, the
+    /// way `^mtemp…` does for global names - numbers first, as IRIS collates.
+    #[test]
+    fn more_values_than_the_popup_holds_fold_into_the_next_character() {
+        let many: Vec<String> = (0..12)
+            .map(|i| format!("CC{}", (b'A' + i % 3) as char))
+            .collect();
+        let mut values: Vec<(&str, bool)> = many.iter().map(|v| (v.as_str(), false)).collect();
+        values.push(("CD", false));
+        let items = existing_subscripts(
+            &found(&values, false, &[]),
+            &SubscriptPrefix::Strings("C".into()),
+        );
+        let shown: Vec<(String, bool)> =
+            items.iter().map(|c| (c.text.clone(), c.narrows)).collect();
+        assert_eq!(
+            shown,
+            [("\"CC".to_string(), true), ("\"CD\"".to_string(), false)]
+        );
+        assert_eq!(items[0].display(), "\"CC…");
+    }
+
+    /// A list the server cut short is folded on what it says can come next,
+    /// which covers the values it never listed.
+    #[test]
+    fn a_cut_list_of_values_folds_into_the_servers_next_characters() {
+        let items = existing_subscripts(
+            &found(
+                &[("1", true), ("10", true)],
+                true,
+                &[("1", true), ("2", true), ("A", false)],
+            ),
+            &SubscriptPrefix::Any,
+        );
+        let texts: Vec<&str> = items.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["1", "2", "\"A"]);
+        assert!(items.iter().all(|c| c.narrows));
+    }
+
+    /// `"%CSW1A` typed, and a routine named exactly that among hundreds that
+    /// go on from it: offered closed, rather than folded into nothing.
+    #[test]
+    fn a_value_that_is_exactly_what_was_typed_is_offered_closed_in_a_fold() {
+        let items = existing_subscripts(
+            &found(
+                &[("AB", false), ("ABC", false)],
+                true,
+                &[("AB", false), ("ABC", false)],
+            ),
+            &SubscriptPrefix::Strings("AB".into()),
+        );
+        let shown: Vec<(&str, bool)> = items.iter().map(|c| (c.text.as_str(), c.narrows)).collect();
+        assert_eq!(shown, [("\"AB\"", false), ("\"ABC", true)]);
+    }
+
+    /// Only global data: nothing pops up for a command, a function or a name.
+    #[test]
+    fn only_global_data_offers_nothing_outside_a_subscript() {
+        let mut v = Vocabulary::default();
+        let grid = grid_with("USER>wr");
+        assert!(
+            suggest_with(&grid, &mut v, None, AutocompleteMode::DataOnly, &mut false).is_none()
+        );
+        assert!(suggest_with(&grid, &mut v, None, AutocompleteMode::Full, &mut false).is_some());
     }
 }

@@ -152,6 +152,10 @@ impl PtySession {
 
         let (tx, rx) = crossbeam_channel::unbounded();
         let closed = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        if let Some(process) = child.as_raw_handle() {
+            spawn_exit_watch(process, tx.clone(), Arc::clone(&closed));
+        }
         spawn_reader(reader, tx, Arc::clone(&closed));
 
         Ok(PtySession {
@@ -466,6 +470,69 @@ fn session_under(shell: u32) -> Option<u32> {
 #[cfg(not(windows))]
 fn session_under(_shell: u32) -> Option<u32> {
     None
+}
+
+/// How long the output a session printed on its way out is given to arrive
+/// after the process has gone, before the session is called ended.
+#[cfg(windows)]
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Reports the session closed when its process exits.
+///
+/// The reader alone never finds out on Windows. A pseudo-console keeps its
+/// output pipe open for as long as the console itself is open, whether or
+/// not anything is still attached to it, so a `HALT` - typed, or run by a
+/// routine - left the reader blocked on a pipe that would never say another
+/// word: the tab sat frozen, deaf to every key, until it was closed. The
+/// process handle is what does signal, so a thread waits on that.
+///
+/// The handle is duplicated rather than borrowed: the child owns its own and
+/// closes it when the session is dropped, which may be while this thread is
+/// still waiting on it.
+#[cfg(windows)]
+fn spawn_exit_watch(
+    process: std::os::windows::io::RawHandle,
+    tx: Sender<SessionEvent>,
+    closed: Arc<AtomicBool>,
+) {
+    use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, WaitForSingleObject, INFINITE};
+
+    let mut own = std::ptr::null_mut();
+    // SAFETY: `process` is the child's live process handle, and `own` is a
+    // place for the duplicate, which this function alone then owns.
+    let duplicated = unsafe {
+        let me = GetCurrentProcess();
+        DuplicateHandle(me, process as _, me, &mut own, 0, 0, DUPLICATE_SAME_ACCESS)
+    };
+    if duplicated == 0 {
+        return;
+    }
+    // A handle is a pointer, which is not `Send`; the thread only ever hands
+    // it back to the two calls that take it.
+    let own = own as usize;
+    let spawned = std::thread::Builder::new()
+        .name("iris-pty-exit".into())
+        .spawn(move || {
+            // SAFETY: `own` is the duplicate made above, waited on and closed
+            // here and nowhere else.
+            unsafe {
+                WaitForSingleObject(own as _, INFINITE);
+                CloseHandle(own as _);
+            }
+            std::thread::sleep(EXIT_GRACE);
+            closed.store(true, Ordering::Relaxed);
+            // Gone already when the tab was closed, which is what killed it.
+            if tx.send(SessionEvent::Closed).is_ok() {
+                crate::pty::wake();
+            }
+        });
+    if spawned.is_err() {
+        // SAFETY: the thread that would have owned it never started.
+        unsafe {
+            CloseHandle(own as _);
+        }
+    }
 }
 
 fn spawn_reader(

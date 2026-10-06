@@ -384,6 +384,7 @@ impl App {
         if app.settings.check_for_updates {
             app.updates.start_check();
         }
+        app.note_version_started();
 
         App::apply_style(&cc.egui_ctx, &app.theme(), &app.settings);
         app.apply_font(&cc.egui_ctx);

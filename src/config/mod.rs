@@ -179,6 +179,56 @@ impl IntellisenseMode {
     }
 }
 
+/// What the autocomplete popup offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutocompleteMode {
+    /// Commands, functions, globals, routines, classes, SQL, and inside a
+    /// global's subscripts both what exists there and what its documentation
+    /// says could.
+    #[default]
+    Full,
+    /// Only the subscripts that exist under the node being typed. Nothing
+    /// pops up anywhere else.
+    #[serde(rename = "data")]
+    DataOnly,
+}
+
+impl AutocompleteMode {
+    pub const ALL: [AutocompleteMode; 2] = [AutocompleteMode::Full, AutocompleteMode::DataOnly];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AutocompleteMode::Full => "Everything",
+            AutocompleteMode::DataOnly => "Only global data",
+        }
+    }
+}
+
+/// How much of their row the tabs take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabWidth {
+    /// The tabs share the whole row out between them, GNOME-style.
+    #[default]
+    Shared,
+    /// Each tab is as wide as its name, within fixed bounds, and the rest of
+    /// the row is left empty - which in the title bar is somewhere to drag
+    /// the window by. What the tabs were before they shared the row.
+    Fixed,
+}
+
+impl TabWidth {
+    pub const ALL: [TabWidth; 2] = [TabWidth::Shared, TabWidth::Fixed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TabWidth::Shared => "Fill the bar",
+            TabWidth::Fixed => "Fixed size",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -254,6 +304,9 @@ pub struct Settings {
     /// A switch because the popup claims Up, Down, Tab and Escape while it is
     /// open, and someone used to those reaching IRIS may want them back.
     pub autocomplete: bool,
+    /// Whether the popup offers everything it knows, or only the subscripts
+    /// that exist under the node being typed.
+    pub autocomplete_mode: AutocompleteMode,
     /// Colour a line typed at the SQL shell's prompt (`USER>>`) as SQL rather
     /// than as ObjectScript. Only matters while
     /// `terminal_syntax_highlight` is on; off, such a line is coloured as
@@ -326,6 +379,9 @@ pub struct Settings {
     /// because the two cannot both have the middle of the bar; the tabs name
     /// the session anyway, which is most of what that line was for.
     pub tabs_in_title_bar: bool,
+    /// Whether the tabs share their row out between them or each keep a
+    /// width of its own. Only the space they take: they are drawn the same.
+    pub tab_width: TabWidth,
     /// Reopen at the size the window was last closed at. Off opens every
     /// launch at [`Settings::default_geometry`].
     pub save_terminal_size: bool,
@@ -388,6 +444,15 @@ pub struct Settings {
     /// Which screen saver covers the window after a while without input, and
     /// how long that while is. Set from its own dialog, reached from Settings.
     pub screensaver: crate::features::screensaver::Config,
+    /// Who the usage report goes to. Empty until the user types an address:
+    /// nothing is ever sent anywhere the user has not named. See
+    /// [`crate::features::usage`].
+    pub usage_report_email: String,
+    /// Offer to send the usage report the first time a new version starts.
+    pub ask_usage_report: bool,
+    /// The version that last ran, so the first start of a newer one is known
+    /// to be the first start after an update.
+    pub last_version: String,
 }
 
 impl Default for Settings {
@@ -409,6 +474,7 @@ impl Default for Settings {
             recall_mid_line: true,
             surround_selection: true,
             autocomplete: true,
+            autocomplete_mode: AutocompleteMode::default(),
             sql_highlight: true,
             ui_scale: 1.0,
             title_bar_scale: 1.0,
@@ -429,6 +495,7 @@ impl Default for Settings {
             confirm_close_with_live_session: true,
             close_to_tray: false,
             tabs_in_title_bar: false,
+            tab_width: TabWidth::default(),
             save_terminal_size: false,
             default_cols: DEFAULT_TERMINAL_COLS,
             default_rows: DEFAULT_TERMINAL_ROWS,
@@ -445,6 +512,9 @@ impl Default for Settings {
             check_for_updates: true,
             proxy_user: String::new(),
             screensaver: crate::features::screensaver::Config::default(),
+            usage_report_email: String::new(),
+            ask_usage_report: true,
+            last_version: String::new(),
         }
     }
 }

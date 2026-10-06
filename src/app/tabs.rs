@@ -279,7 +279,11 @@ impl App {
         let gap = 0.0;
         let count = self.tabs.len().max(1) as f32;
         let room = ui.available_width() - reserve;
-        let shared = Some(((room - gap * (count - 1.0)) / count).max(TAB_MIN_WIDTH));
+        // Fixed, each tab sizes itself to its name between the two bounds -
+        // the space the tabs took before they shared the row - and is drawn
+        // exactly as a shared one is.
+        let shared = (self.settings.tab_width == crate::config::TabWidth::Shared)
+            .then(|| ((room - gap * (count - 1.0)) / count).max(TAB_MIN_WIDTH));
 
         egui::ScrollArea::horizontal()
             .auto_shrink([true, false])

@@ -19,6 +19,7 @@
 //!   right-click menu, and reads the command line it launches with.
 //! - [`iris_terminal`] stands this app in for the IRIS tray's Terminal.
 //! - [`update`] checks for a newer release and installs it.
+//! - [`usage`] reports which settings are in use, by e-mail, when asked to.
 
 pub mod analyze;
 pub mod autocomplete;
@@ -34,3 +35,4 @@ pub mod natives;
 pub mod screensaver;
 pub mod snake;
 pub mod update;
+pub mod usage;

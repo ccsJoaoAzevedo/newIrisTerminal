@@ -43,9 +43,20 @@ const MARK_NEXT: &str = "##CSWNXT##";
 /// [`DocLookup::subscripts`] question.
 const MARK_SUB: &str = "##CSWSUB##";
 
-/// How many existing subscripts one question lists. A list for picking from,
-/// not a dump: `^mtemp` can hold one per process on a busy server.
-const SUBSCRIPTS_LIMIT: usize = 50;
+/// How many existing subscripts one question lists by value before it says
+/// only which characters can come next, the way a list of global names does.
+///
+/// It used to be the whole of what was ever asked: the first fifty under the
+/// node, filtered on this side by what had been typed - so a value past the
+/// fiftieth was never offered whatever was typed. The prefix is now part of
+/// the question, and this only bounds how much of one answer is spelled out.
+const SUBSCRIPTS_LIMIT: usize = 500;
+
+/// How many matching subscripts one question walks at most. `^mtemp` can hold
+/// one per process on a busy server, and an ERP global millions of ids; the
+/// walk stops here rather than hold the side session for minutes, and the
+/// answer says there was more.
+const SUBSCRIPTS_SCAN: usize = 20_000;
 
 /// How long a list of existing subscripts is trusted. Unlike a global's
 /// structure it is live data - another process makes and kills them as it
@@ -535,17 +546,89 @@ enum Question {
     /// namespace, prefix.
     Globals(String, String),
     /// The subscripts that exist one level under a node, for autocomplete:
-    /// namespace, global, and the subscripts above that level, as values.
-    Subscripts(String, String, Vec<String>),
+    /// namespace, global, the subscripts above that level as values, and what
+    /// has been typed of this one.
+    Subscripts(String, String, Vec<String>, SubscriptPrefix),
 }
 
-/// The subscripts found under one node.
+/// What has been typed of a subscript, as the server is asked about it.
+///
+/// Numbers and strings collate apart - every number before every string - so
+/// the two are walked separately, and what was typed already says which one
+/// is meant: `"AB` is a string, `12` is a number. Nothing typed yet is both.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SubscriptPrefix {
+    Any,
+    Strings(String),
+    Numbers(String),
+}
+
+impl SubscriptPrefix {
+    /// The prefix a subscript typed so far stands for - `None` when it is not
+    /// a literal at all, a variable or a function call, which only running it
+    /// could put a value to.
+    pub fn of_typed(typed: &str) -> Option<Self> {
+        let typed = typed.trim_start();
+        if typed.is_empty() {
+            return Some(SubscriptPrefix::Any);
+        }
+        if let Some(rest) = typed.strip_prefix('"') {
+            // A doubled quote is one quote in the value. A lone one closes the
+            // literal, and a closed literal has nothing left to complete.
+            let value = rest.replace("\"\"", "\u{0}");
+            if value.contains('"') {
+                return None;
+            }
+            return Some(SubscriptPrefix::Strings(value.replace('\u{0}', "\"")));
+        }
+        typed
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| SubscriptPrefix::Numbers(typed.to_string()))
+    }
+
+    /// Whether a value found under this node is one this prefix asks for.
+    pub fn admits(&self, found: &SubscriptValue) -> bool {
+        match self {
+            SubscriptPrefix::Any => true,
+            SubscriptPrefix::Strings(p) => !found.number && found.value.starts_with(p.as_str()),
+            SubscriptPrefix::Numbers(p) => found.number && found.value.starts_with(p.as_str()),
+        }
+    }
+
+    /// Whether every value this prefix asks for is one `wider` asks for too,
+    /// so that a complete answer for `wider` answers this one as well.
+    fn within(&self, wider: &SubscriptPrefix) -> bool {
+        match (wider, self) {
+            (SubscriptPrefix::Any, _) => true,
+            (SubscriptPrefix::Strings(w), SubscriptPrefix::Strings(p))
+            | (SubscriptPrefix::Numbers(w), SubscriptPrefix::Numbers(p)) => {
+                p.starts_with(w.as_str())
+            }
+            _ => false,
+        }
+    }
+}
+
+/// One subscript, or one run of characters a subscript starts with, and
+/// whether it is a number - which decides whether it is typed bare or quoted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptValue {
+    pub value: String,
+    pub number: bool,
+}
+
+/// The subscripts found under one node that start with one prefix.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Subscripts {
     /// In collating order, as values: a string without its quotes.
-    pub values: Vec<String>,
-    /// There were more than `SUBSCRIPTS_LIMIT`.
+    pub values: Vec<SubscriptValue>,
+    /// There were more than `SUBSCRIPTS_LIMIT`, so `values` is only the
+    /// first of them and `next` is what is complete instead.
     pub more: bool,
+    /// Every distinct start one character longer than the prefix asked
+    /// about, filled only when the list was cut: what can be typed next.
+    pub next: Vec<SubscriptValue>,
 }
 
 /// The globals a namespace has under one prefix.
@@ -559,6 +642,15 @@ pub struct GlobalNames {
     /// Every distinct prefix one character longer than the one asked about,
     /// filled only when the list is truncated: what the user can type next.
     pub next: Vec<String>,
+}
+
+/// Whether the subscripts under a prefix are known.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Existing {
+    Ready(Subscripts),
+    /// Asked, and not answered yet: what a shorter prefix's complete answer
+    /// has under this one, if there is one to go on with.
+    Pending(Option<Subscripts>),
 }
 
 /// Whether the globals under a prefix are known.
@@ -605,7 +697,7 @@ struct Sidecar {
 pub struct DocLookup {
     cache: HashMap<(String, String), Result<Vec<MapInfo>, ()>>,
     names: HashMap<(String, String), GlobalNames>,
-    subscripts: HashMap<(String, String, Vec<String>), (Instant, Subscripts)>,
+    subscripts: HashMap<SubscriptsKey, (Instant, Subscripts)>,
     /// What has arrived of the globals question being answered, read off the
     /// sidecar's screen before the end marker - and which question it is.
     so_far: Option<(Question, GlobalNames)>,
@@ -622,6 +714,9 @@ pub struct DocLookup {
     /// a tooltip is not worth a reconnect attempt per frame.
     unavailable: bool,
 }
+
+/// Namespace, global, the subscripts above, and the prefix of this one.
+type SubscriptsKey = (String, String, Vec<String>, SubscriptPrefix);
 
 /// How long the answer may take before the global is written off. Generous:
 /// it covers opening the session and logging in as well as the query itself.
@@ -725,8 +820,14 @@ impl DocLookup {
         })
     }
 
-    /// The subscripts that exist under `^global(before...)` in `namespace`,
-    /// or `None` while they are being asked for.
+    /// The subscripts that exist under `^global(before...)` in `namespace`
+    /// and start with `prefix`, or a note that they have been asked for.
+    ///
+    /// Each prefix is a question of its own, asked again as every character
+    /// is typed, the way a global's name is: the server walks the whole level
+    /// from the prefix on, so what it lists is everything that matches rather
+    /// than the matches among the first few. While the answer is on its way, a
+    /// complete answer for a shorter prefix stands in for it.
     ///
     /// Fresh for `SUBSCRIPTS_FRESH`, then asked again: what is under a node
     /// changes as other processes run.
@@ -735,23 +836,53 @@ impl DocLookup {
         namespace: &str,
         global: &str,
         before: &[String],
-    ) -> Option<Subscripts> {
-        let key = (namespace.to_string(), global.to_string(), before.to_vec());
+        prefix: &SubscriptPrefix,
+    ) -> Existing {
+        let key = (
+            namespace.to_string(),
+            global.to_string(),
+            before.to_vec(),
+            prefix.clone(),
+        );
         if let Some((at, found)) = self.subscripts.get(&key) {
             if at.elapsed() < SUBSCRIPTS_FRESH {
-                return Some(found.clone());
+                return Existing::Ready(found.clone());
             }
         }
         if self.unavailable {
-            return Some(Subscripts::default());
+            return Existing::Ready(Subscripts::default());
         }
-        let question = Question::Subscripts(key.0, key.1, key.2);
+        let wider = self.wider_subscripts(&key);
+        let question = Question::Subscripts(key.0, key.1, key.2, key.3);
         if !self.asking(|q| *q == question) {
             self.want
                 .retain(|(q, _)| !matches!(q, Question::Subscripts(..)));
             self.want.push((question, Instant::now()));
         }
-        None
+        Existing::Pending(wider)
+    }
+
+    /// What a fresh, complete answer for a shorter prefix of the same node has
+    /// under this one.
+    fn wider_subscripts(&self, key: &SubscriptsKey) -> Option<Subscripts> {
+        let (ns, global, before, prefix) = key;
+        let (_, (_, wider)) = self.subscripts.iter().find(|((n, g, b, p), (at, found))| {
+            n == ns
+                && g == global
+                && b == before
+                && prefix.within(p)
+                && !found.more
+                && at.elapsed() < SUBSCRIPTS_FRESH
+        })?;
+        Some(Subscripts {
+            values: wider
+                .values
+                .iter()
+                .filter(|v| prefix.admits(v))
+                .cloned()
+                .collect(),
+            ..Subscripts::default()
+        })
     }
 
     /// How many answers have arrived, ever. A caller that saw a question
@@ -914,13 +1045,18 @@ impl DocLookup {
             (Question::Globals(ns, prefix), _) => {
                 self.names.insert((ns, prefix), GlobalNames::default());
             }
-            (Question::Subscripts(ns, global, before), answer) => {
+            (Question::Subscripts(ns, global, before, prefix), answer) => {
                 let found = match answer {
                     Some(Answer::Subscripts(found)) => found,
                     _ => Subscripts::default(),
                 };
+                // One entry per prefix typed, so the stale ones are let go
+                // as new ones come in rather than kept for the life of the
+                // tab.
                 self.subscripts
-                    .insert((ns, global, before), (Instant::now(), found));
+                    .retain(|_, (at, _)| at.elapsed() < SUBSCRIPTS_FRESH);
+                self.subscripts
+                    .insert((ns, global, before, prefix), (Instant::now(), found));
             }
         }
     }
@@ -932,7 +1068,9 @@ impl DocLookup {
         let query = match &question {
             Question::Structure(ns, global) => build_query(ns, global),
             Question::Globals(ns, prefix) => build_names_query(ns, prefix),
-            Question::Subscripts(ns, global, before) => build_subscripts_query(ns, global, before),
+            Question::Subscripts(ns, global, before, prefix) => {
+                build_subscripts_query(ns, global, before, prefix)
+            }
         };
         // Everything this session has ever said, gone, so the previous
         // answer's markers cannot be read as this one's. Both halves matter:
@@ -1138,11 +1276,24 @@ fn parse_subscripts(lines: &[String]) -> Option<Subscripts> {
             complete = true;
         } else if line == MARK_MORE {
             found.more = true;
-        } else if let Some(value) = marked(line, MARK_SUB) {
-            found.values.push(value.to_string());
+        } else if let Some(value) = marked(line, MARK_SUB).and_then(kind_and_value) {
+            found.values.push(value);
+        } else if let Some(next) = marked(line, MARK_NEXT).and_then(kind_and_value) {
+            found.next.push(next);
         }
     }
     complete.then_some(found)
+}
+
+/// `N|1.5` or `S|ABC`: what the walk found, and which of the two walks found
+/// it. Told apart by the server rather than guessed here, because `1.5` and
+/// `007` look alike as text and are typed differently - one bare, one quoted.
+fn kind_and_value(payload: &str) -> Option<SubscriptValue> {
+    let (kind, value) = payload.split_once('|')?;
+    Some(SubscriptValue {
+        value: value.to_string(),
+        number: kind == "N",
+    })
 }
 
 /// The four dictionary fields both marked lines end with, in the order
@@ -1330,28 +1481,79 @@ fn subscript_literal(value: &str) -> String {
 }
 
 /// The lines typed into the sidecar to list what exists one level under
-/// `^global(before...)`: a `$ORDER` walk, stopped after `SUBSCRIPTS_LIMIT`.
+/// `^global(before...)` and starts with `prefix`: a `$ORDER` walk from the
+/// prefix on, every match counted and the first `SUBSCRIPTS_LIMIT` written
+/// out, and past those the characters that can come next - the same answer
+/// a list of global names gives.
+///
+/// Strings start where the prefix would sort and stop at the first that no
+/// longer begins with it. A prefix that is itself a number, `1`, cannot be
+/// stood on as a string - `^X("1")` is `^X(1)` - so the walk starts just
+/// before `"1"_$C(0)`, the least string longer than it.
+///
+/// Numbers collate by value, not by spelling, so those that begin with `1`
+/// are 1 to 2, then 10 to 20, then 100 to 200: each run is reached with one
+/// `$ORDER` and walked to its end, and the walk stops at the first power of
+/// ten with no number at or past it.
 ///
 /// Reads only. The reference is written out in full rather than reached by
 /// indirection - the global's name is letters, digits, `%` and dots, and every
 /// subscript above is a literal - so nothing typed at the prompt is ever run
-/// as code here.
-fn build_subscripts_query(namespace: &str, global: &str, before: &[String]) -> String {
+/// as code here. The same rules as [`build_query`] otherwise: no braces, and
+/// nothing after an argumentless `FOR` on its line.
+fn build_subscripts_query(
+    namespace: &str,
+    global: &str,
+    before: &[String],
+    prefix: &SubscriptPrefix,
+) -> String {
     let ns = quoted(namespace);
-    let mut reference = format!("^{global}(");
+    let mut head = format!("^{global}(");
     for value in before {
-        reference.push_str(&subscript_literal(value));
-        reference.push(',');
+        head.push_str(&subscript_literal(value));
+        head.push(',');
     }
-    reference.push_str("cswK)");
-    let lines = [
-        "K cswOk,cswK,cswI".to_string(),
-        format!("ZN {ns}"),
-        format!("S cswOk=$ZCVT($ZNSPACE,\"U\")=$ZCVT({ns},\"U\"),cswK=\"\",cswI=0"),
+    let at = |var: &str| format!("{head}{var})");
+    let (k, lo, before_space, after_number, own) = (
+        at("cswK"),
+        at("cswLo"),
+        at("\" \""),
+        at("cswP_$C(0)"),
+        at("cswP"),
+    );
+    let p = match prefix {
+        SubscriptPrefix::Any => String::new(),
+        SubscriptPrefix::Strings(p) | SubscriptPrefix::Numbers(p) => p.clone(),
+    };
+    let found = |kind: &str| {
         format!(
-            "I cswOk F  S cswK=$O({reference}) Q:cswK=\"\"  S cswI=cswI+1 Q:cswI>{SUBSCRIPTS_LIMIT}  W \"{MARK_SUB}\"_cswK_\"##\",!"
+            "S cswI=cswI+1,cswY(\"{kind}\",$E(cswK,1,cswN+1))=\"\" W:cswI'>{SUBSCRIPTS_LIMIT} \"{MARK_SUB}{kind}|\"_cswK_\"##\",!"
+        )
+    };
+    let walk = match prefix {
+        SubscriptPrefix::Any => format!(
+            "I cswOk S cswK=\"\" F  S cswK=$O({k}) Q:cswK=\"\"  Q:cswI'<{SUBSCRIPTS_SCAN}  S cswT=$S(cswK=+cswK:\"N\",1:\"S\"),cswI=cswI+1,cswY(cswT,$E(cswK,1,1))=\"\" W:cswI'>{SUBSCRIPTS_LIMIT} \"{MARK_SUB}\"_cswT_\"|\"_cswK_\"##\",!"
         ),
-        format!("W:cswI>{SUBSCRIPTS_LIMIT} \"{MARK_MORE}\",!"),
+        SubscriptPrefix::Strings(_) => format!(
+            "I cswOk S cswK=$S(cswP=\"\":$O({before_space},-1),cswP=+cswP:$O({after_number},-1),1:$O({own},-1)) F  S cswK=$O({k}) Q:cswK=\"\"  Q:$E(cswK,1,cswN)'=cswP  Q:cswI'<{SUBSCRIPTS_SCAN}  {}",
+            found("S")
+        ),
+        SubscriptPrefix::Numbers(_) => format!(
+            "I cswOk,cswP=+cswP S cswM=1 F  S cswLo=cswP*cswM,cswHi=cswLo+cswM,cswM=cswM*10 Q:cswM>1E20  Q:(cswP=0)&(cswM>10)  Q:cswI'<{SUBSCRIPTS_SCAN}  S cswK=$O({lo},-1),cswJ=$O({k}) Q:cswJ=\"\"  Q:cswJ'=+cswJ  F  S cswK=$O({k}) Q:cswK=\"\"  Q:cswK'=+cswK  Q:cswK'<cswHi  Q:cswI'<{SUBSCRIPTS_SCAN}  I $E(cswK,1,cswN)=cswP {}",
+            found("N")
+        ),
+    };
+    let lines = [
+        "K cswOk,cswK,cswI,cswJ,cswP,cswN,cswM,cswLo,cswHi,cswT,cswX,cswY".to_string(),
+        format!("ZN {ns}"),
+        format!(
+            "S cswOk=$ZCVT($ZNSPACE,\"U\")=$ZCVT({ns},\"U\"),cswP={},cswN=$L(cswP),cswI=0",
+            quoted(&p)
+        ),
+        walk,
+        format!(
+            "I cswOk,cswI>{SUBSCRIPTS_LIMIT} W \"{MARK_MORE}\",! S cswT=\"\" F  S cswT=$O(cswY(cswT)) Q:cswT=\"\"  S cswX=\"\" F  S cswX=$O(cswY(cswT,cswX)) Q:cswX=\"\"  W \"{MARK_NEXT}\"_cswT_\"|\"_cswX_\"##\",!"
+        ),
         format!("W \"{MARK_END}\",!"),
     ];
     lines.join("\r") + "\r"
@@ -2132,20 +2334,66 @@ mod tests {
     #[test]
     #[ignore]
     fn prints_the_subscripts_query_for_manual_replay() {
-        print!(
-            "{}",
-            build_subscripts_query("RDB80-OM", "mtemp", &[]).replace('\r', "\n")
-        );
+        for prefix in [
+            SubscriptPrefix::Any,
+            SubscriptPrefix::Strings("AB".into()),
+            SubscriptPrefix::Numbers("1".into()),
+        ] {
+            print!(
+                "{}",
+                build_subscripts_query("RDB80-OM", "mtemp", &[], &prefix).replace('\r', "\n")
+            );
+        }
     }
 
     // --- existing subscripts -------------------------------------------------
 
     #[test]
     fn the_subscripts_above_are_written_as_literals_and_nothing_is_run_by_indirection() {
-        let query = build_subscripts_query("USER", "FTCL", &["1".into(), "a\"b".into()]);
-        assert!(query.contains("$O(^FTCL(1,\"a\"\"b\",cswK))"), "{query}");
-        assert!(!query.contains('@'), "{query}");
-        assert!(!query.contains('{'), "{query}");
+        for prefix in [
+            SubscriptPrefix::Any,
+            SubscriptPrefix::Strings("x".into()),
+            SubscriptPrefix::Numbers("1".into()),
+        ] {
+            let query =
+                build_subscripts_query("USER", "FTCL", &["1".into(), "a\"b".into()], &prefix);
+            assert!(query.contains("$O(^FTCL(1,\"a\"\"b\",cswK))"), "{query}");
+            assert!(!query.contains('@'), "{query}");
+            assert!(!query.contains('{'), "{query}");
+        }
+    }
+
+    /// The prefix goes to the server, quoted, rather than being matched here
+    /// against the first few values - which is what hid every value past them.
+    #[test]
+    fn what_was_typed_of_the_subscript_is_part_of_the_question() {
+        let query = build_subscripts_query(
+            "USER",
+            "mtemp",
+            &[],
+            &SubscriptPrefix::Strings("CC\"x".into()),
+        );
+        assert!(query.contains("cswP=\"CC\"\"x\""), "{query}");
+        assert!(query.contains("$E(cswK,1,cswN)'=cswP"), "{query}");
+        // A string prefix that is also a number starts past the number.
+        assert!(query.contains("$O(^mtemp(cswP_$C(0)),-1)"), "{query}");
+    }
+
+    /// Every line the query types has to fit on one row of the sidecar, or
+    /// the device wraps it and a continuation row starts mid-command.
+    #[test]
+    fn every_line_of_the_subscripts_query_fits_the_sidecar() {
+        let before: Vec<String> = vec!["CONSISTEM".into(), "12345".into(), "ABCDEFGH".into()];
+        for prefix in [
+            SubscriptPrefix::Any,
+            SubscriptPrefix::Strings("ABC".into()),
+            SubscriptPrefix::Numbers("12".into()),
+        ] {
+            let query = build_subscripts_query("RDB80-OM", "TABELAGRANDE", &before, &prefix);
+            for line in query.split('\r') {
+                assert!(line.len() < SIDECAR_COLS as usize - 16, "{line}");
+            }
+        }
     }
 
     #[test]
@@ -2156,36 +2404,137 @@ mod tests {
     }
 
     #[test]
-    fn a_subscripts_answer_says_when_there_were_more() {
+    fn what_is_typed_says_whether_a_string_or_a_number_is_meant() {
+        use SubscriptPrefix::*;
+        assert_eq!(SubscriptPrefix::of_typed(""), Some(Any));
+        assert_eq!(
+            SubscriptPrefix::of_typed("\""),
+            Some(Strings(String::new()))
+        );
+        assert_eq!(
+            SubscriptPrefix::of_typed("\"AB"),
+            Some(Strings("AB".into()))
+        );
+        assert_eq!(
+            SubscriptPrefix::of_typed("\"a\"\"b"),
+            Some(Strings("a\"b".into()))
+        );
+        assert_eq!(SubscriptPrefix::of_typed("12"), Some(Numbers("12".into())));
+        // A closed literal has nothing left to complete; a variable has no
+        // value this side can know.
+        assert_eq!(SubscriptPrefix::of_typed("\"AB\""), None);
+        assert_eq!(SubscriptPrefix::of_typed("cod"), None);
+    }
+
+    fn value(value: &str, number: bool) -> SubscriptValue {
+        SubscriptValue {
+            value: value.into(),
+            number,
+        }
+    }
+
+    #[test]
+    fn a_subscripts_answer_says_when_there_were_more_and_what_comes_next() {
         let found = parse_subscripts(&answer(&[
-            "##CSWSUB##194##",
-            "##CSWSUB##ABC##",
+            "##CSWSUB##N|194##",
+            "##CSWSUB##S|ABC##",
             "##CSWMORE##",
+            "##CSWNXT##N|19##",
+            "##CSWNXT##S|AB##",
         ]))
         .expect("complete");
-        assert_eq!(found.values, ["194", "ABC"]);
+        assert_eq!(found.values, [value("194", true), value("ABC", false)]);
         assert!(found.more);
-        assert_eq!(parse_subscripts(&["##CSWSUB##1##".to_string()]), None);
+        assert_eq!(found.next, [value("19", true), value("AB", false)]);
+        assert_eq!(parse_subscripts(&["##CSWSUB##N|1##".to_string()]), None);
+    }
+
+    fn key(prefix: SubscriptPrefix) -> SubscriptsKey {
+        ("USER".to_string(), "mtemp".to_string(), Vec::new(), prefix)
     }
 
     /// Live data is trusted for a moment, not for the life of the tab.
     #[test]
     fn a_list_of_subscripts_goes_stale_and_is_asked_for_again() {
         let mut lookup = DocLookup::default();
-        let key = ("USER".to_string(), "mtemp".to_string(), Vec::new());
+        let any = SubscriptPrefix::Any;
+        let found = Subscripts {
+            values: vec![value("194", true)],
+            ..Subscripts::default()
+        };
+        lookup
+            .subscripts
+            .insert(key(any.clone()), (Instant::now(), found.clone()));
+        assert_eq!(
+            lookup.subscripts("USER", "mtemp", &[], &any),
+            Existing::Ready(found)
+        );
+        let old = Instant::now() - SUBSCRIPTS_FRESH - Duration::from_secs(1);
+        lookup
+            .subscripts
+            .insert(key(any.clone()), (old, Subscripts::default()));
+        assert_eq!(
+            lookup.subscripts("USER", "mtemp", &[], &any),
+            Existing::Pending(None)
+        );
+    }
+
+    /// Each character typed is a question of its own, and a complete answer
+    /// for fewer characters is what the popup shows until it is answered.
+    #[test]
+    fn a_shorter_prefixs_subscripts_stand_in_while_the_longer_one_is_asked() {
+        let mut lookup = DocLookup::default();
         lookup.subscripts.insert(
-            key.clone(),
+            key(SubscriptPrefix::Strings("CC".into())),
             (
                 Instant::now(),
                 Subscripts {
-                    values: vec!["194".into()],
-                    more: false,
+                    values: vec![value("CCA", false), value("CCB", false)],
+                    ..Subscripts::default()
                 },
             ),
         );
-        assert!(lookup.subscripts("USER", "mtemp", &[]).is_some());
-        let old = Instant::now() - SUBSCRIPTS_FRESH - Duration::from_secs(1);
-        lookup.subscripts.insert(key, (old, Subscripts::default()));
-        assert_eq!(lookup.subscripts("USER", "mtemp", &[]), None);
+        let longer = SubscriptPrefix::Strings("CCB".into());
+        assert_eq!(
+            lookup.subscripts("USER", "mtemp", &[], &longer),
+            Existing::Pending(Some(Subscripts {
+                values: vec![value("CCB", false)],
+                ..Subscripts::default()
+            }))
+        );
+        assert_eq!(
+            wanted_subscripts(&lookup),
+            Some(Question::Subscripts(
+                "USER".into(),
+                "mtemp".into(),
+                Vec::new(),
+                longer
+            ))
+        );
+        // A list cut short is not the whole of the longer prefix's.
+        lookup.subscripts.clear();
+        lookup.subscripts.insert(
+            key(SubscriptPrefix::Any),
+            (
+                Instant::now(),
+                Subscripts {
+                    values: vec![value("CCA", false)],
+                    more: true,
+                    ..Subscripts::default()
+                },
+            ),
+        );
+        assert_eq!(
+            lookup.subscripts("USER", "mtemp", &[], &SubscriptPrefix::Strings("CC".into())),
+            Existing::Pending(None)
+        );
+    }
+
+    fn wanted_subscripts(lookup: &DocLookup) -> Option<Question> {
+        lookup
+            .want
+            .iter()
+            .map(|(q, _)| q.clone())
+            .find(|q| matches!(q, Question::Subscripts(..)))
     }
 }

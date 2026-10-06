@@ -57,6 +57,11 @@ pub enum UiRequest {
     /// Open Settings on this page - the way into what used to be a manager's
     /// window of its own.
     OpenSettings(crate::ui::settings_view::Route),
+    /// Put the usage report into an e-mail to this address, in the user's
+    /// own mail program.
+    SendUsageReport(String),
+    /// Stop offering the usage report after updates.
+    StopAskingUsageReport,
 }
 
 /// State the panels own between frames.
@@ -82,6 +87,8 @@ pub struct PanelState {
     pub pending: Option<PendingMacro>,
     /// An IRIS helper waiting on its fields.
     pub pending_native: Option<PendingNative>,
+    /// The usage report, offered and waiting on an answer.
+    pub usage: Option<UsageOffer>,
     /// The proxy password as it is being typed. Handed to the credential store
     /// when the field loses focus and cleared immediately, so the secret is not
     /// left sitting in the app's state for the rest of the session.
@@ -383,6 +390,88 @@ pub fn pending_native_dialog(ctx: &Context, state: &mut PanelState) -> Option<Ui
 /// Two steps, because they are two different waits: the download runs on a
 /// thread and can take a while over a proxy, and only once it is on disk is
 /// there anything to restart into.
+/// The usage report, offered after an update: what it says, and who it is to
+/// go to.
+#[derive(Clone, Debug)]
+pub struct UsageOffer {
+    /// The report as it will be sent, shown in full before it is.
+    pub report: String,
+    /// The address, as it is being typed.
+    pub email: String,
+}
+
+/// Asks whether to send the usage report, and to whom.
+///
+/// The address is typed by the user every time it is not already set: the
+/// report goes to whoever the person sending it chooses, and never anywhere
+/// by default.
+pub fn usage_report_dialog(ctx: &Context, state: &mut PanelState) -> Option<UiRequest> {
+    let offer = state.usage.as_mut()?;
+    let mut open = true;
+    let mut request = None;
+    let mut dismissed = false;
+    dialog::show(
+        ctx,
+        "nit-usage-report",
+        tr("Help decide what to keep"),
+        &mut open,
+        |ui| {
+            ui.set_max_width(460.0);
+            ui.label(tr(
+            "Sending this report says which options you use differently from a fresh install, so the ones nobody uses can go and the ones everybody changes can become the default. It is put into an e-mail in your own mail program, for you to send.",
+        ));
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(tr("Send to"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut offer.email)
+                        .hint_text(tr("name@company.com"))
+                        .desired_width(260.0),
+                );
+            });
+            egui::CollapsingHeader::new(tr("What is sent"))
+                .id_source("nit-usage-report-preview")
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&offer.report).monospace().small(),
+                                )
+                                .selectable(true),
+                            );
+                        });
+                });
+            ui.weak(tr(
+            "No server addresses, user names, paths or command history. Profiles, macros and themes are only counted.",
+        ));
+            let can_send = crate::features::usage::plausible_address(&offer.email);
+            dialog::actions(ui, |ui| {
+                let send = ui.add_enabled_ui(can_send, |ui| {
+                    dialog::button(ui, tr("Send"), Role::Suggested)
+                });
+                if send.inner.clicked() {
+                    request = Some(UiRequest::SendUsageReport(offer.email.trim().to_string()));
+                }
+                if dialog::button(ui, tr("Not now"), Role::Plain).clicked() {
+                    dismissed = true;
+                }
+                if dialog::button(ui, tr("Don't ask again"), Role::Plain)
+                    .on_hover_text(tr("Settings, About, still sends it whenever you want."))
+                    .clicked()
+                {
+                    request = Some(UiRequest::StopAskingUsageReport);
+                }
+            });
+        },
+    );
+    if !open || dismissed || request.is_some() {
+        state.usage = None;
+    }
+    request
+}
+
 pub fn update_dialog(ctx: &Context, state: &mut crate::app::UpdateState) -> bool {
     let Some(release) = state.available.clone() else {
         return false;

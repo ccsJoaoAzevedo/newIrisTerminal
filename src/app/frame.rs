@@ -354,6 +354,9 @@ impl eframe::App for App {
         if let Some(request) = panels::pending_native_dialog(ctx, &mut self.panels) {
             requests.push(request);
         }
+        if let Some(request) = panels::usage_report_dialog(ctx, &mut self.panels) {
+            requests.push(request);
+        }
         // The themes and the macros are edited in place, so the terminal
         // behind the window repaints in the colour being dragged; the requests
         // are carried out below, so a colour changed this frame is on screen

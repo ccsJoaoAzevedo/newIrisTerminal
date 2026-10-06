@@ -372,6 +372,9 @@ impl App {
         // both what goes in the middle of the bar and whether the session's own
         // line is drawn at all.
         let inline_tabs = self.settings.tabs_in_title_bar && !self.tabs.is_empty();
+        // Tabs of a fixed width leave the bar's own free strip after them, as
+        // they did before they filled it; only tabs that fill it give it up.
+        let tabs_fill = inline_tabs && self.settings.tab_width == crate::config::TabWidth::Shared;
         // Taken out of `self` for the length of the row, because the gear is
         // handed to `chrome` as a `&mut bool` while the closure still holds
         // `self` for the tab strip.
@@ -442,7 +445,7 @@ impl App {
                     on_top: pin,
                     new_tab: Some(&mut new_tab),
                     tabs: &mut middle,
-                    tabs_fill: inline_tabs,
+                    tabs_fill,
                 },
             );
         });
@@ -536,6 +539,11 @@ impl App {
                 self.screensaver = Some(crate::ui::screensaver_view::Running::new(config));
             }
             UiRequest::OpenSettings(route) => self.panels.open_settings(route),
+            UiRequest::SendUsageReport(to) => self.send_usage_report(ctx, to),
+            UiRequest::StopAskingUsageReport => {
+                self.settings.ask_usage_report = false;
+                self.handle_request(ctx, UiRequest::SettingsChanged);
+            }
             UiRequest::SavePersonalMacros => {
                 let path = config::personal_macros_path();
                 let xml = macros::to_xml(&self.macro_groups);

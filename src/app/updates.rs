@@ -178,3 +178,83 @@ impl App {
         }
     }
 }
+
+impl App {
+    /// Records the version now running, and offers the usage report when it
+    /// is newer than the one that ran last - the first start after an update.
+    ///
+    /// Not on a first install: there is nothing yet for a report to say.
+    pub(super) fn note_version_started(&mut self) {
+        let last = std::mem::replace(&mut self.settings.last_version, update::CURRENT.to_string());
+        if last == update::CURRENT {
+            return;
+        }
+        let updated = !last.is_empty() && update::is_newer(update::CURRENT, &last);
+        if let Err(e) = self.settings.save() {
+            log::warn!("could not record the version that started: {e:#}");
+        }
+        if updated && self.settings.ask_usage_report {
+            self.panels.usage = Some(crate::ui::panels::UsageOffer {
+                report: self.usage_report(),
+                email: self.settings.usage_report_email.clone(),
+            });
+        }
+    }
+
+    fn usage_report(&self) -> String {
+        use crate::features::macros::Origin;
+        let count = |origin: Origin| {
+            self.macro_groups
+                .iter()
+                .filter(|g| g.origin == origin)
+                .map(|g| g.macros.len())
+                .sum::<usize>()
+        };
+        let inventory = crate::features::usage::Inventory {
+            personal_macros: count(Origin::Personal),
+            organisation_macros: self
+                .settings
+                .org_macros()
+                .map(|_| count(Origin::Organization)),
+            own_themes: self.themes.iter().filter(|t| !t.builtin).count(),
+        };
+        crate::features::usage::report(&self.settings, &inventory)
+    }
+
+    /// Puts the usage report into an e-mail to `to`, in the user's own mail
+    /// program, for them to send.
+    ///
+    /// The report goes on the clipboard as well, whatever else happens: a mail
+    /// program cuts a long `mailto:` link short, and some machines have no
+    /// program set to open one at all - and either way, pasting it is a
+    /// gesture everyone already knows.
+    pub(super) fn send_usage_report(&mut self, ctx: &Context, to: String) {
+        use crate::features::usage;
+        if self.settings.usage_report_email != to {
+            self.settings.usage_report_email = to.clone();
+            if let Err(e) = self.settings.save() {
+                self.set_status(tr1("Could not save settings: {}", &format!("{e:#}")));
+            }
+        }
+        let report = self.usage_report();
+        ctx.copy_text(report.clone());
+        let subject = format!("newIrisTerminal {} - usage report", update::CURRENT);
+        let mut link = usage::mailto(&to, &subject, &report);
+        if link.len() > usage::MAILTO_LIMIT {
+            link = usage::mailto(
+                &to,
+                &subject,
+                tr("The report is on the clipboard: paste it here (Ctrl+V)."),
+            );
+        }
+        match usage::open(&link) {
+            Ok(()) => self.set_status(tr(
+                "The report is ready to send in your mail program. It is on the clipboard too.",
+            )),
+            Err(e) => self.set_status(tr1(
+                "No mail program could be opened ({}). The report is on the clipboard: paste it into an e-mail.",
+                &format!("{e:#}"),
+            )),
+        }
+    }
+}
