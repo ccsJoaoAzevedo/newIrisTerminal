@@ -1194,7 +1194,7 @@ fn parse_answer(lines: &[String]) -> Option<Vec<MapInfo>> {
             continue;
         }
         if let Some(rest) = marked(line, MARK_KEY) {
-            let mut fields = rest.split('|');
+            let mut fields = rest.splitn(4, '|');
             let (Some(class), Some(map), Some(position)) = (
                 fields.next(),
                 fields.next(),
@@ -1208,14 +1208,14 @@ fn parse_answer(lines: &[String]) -> Option<Vec<MapInfo>> {
             };
             map.key_info.push(KeyInfo {
                 position,
-                doc: parse_doc(&mut fields),
+                doc: parse_doc(fields.next().unwrap_or_default()),
             });
             continue;
         }
         let Some(rest) = marked(line, MARK) else {
             continue;
         };
-        let mut fields = rest.split('|');
+        let mut fields = rest.splitn(5, '|');
         let (Some(class), Some(map), Some(seq), Some(delim)) =
             (fields.next(), fields.next(), fields.next(), fields.next())
         else {
@@ -1233,7 +1233,7 @@ fn parse_answer(lines: &[String]) -> Option<Vec<MapInfo>> {
             piece,
             sub,
             sub_delim,
-            doc: parse_doc(&mut fields),
+            doc: parse_doc(fields.next().unwrap_or_default()),
         });
     }
     complete.then(|| maps.into_iter().map(|(_, map)| map).collect())
@@ -1300,10 +1300,23 @@ fn kind_and_value(payload: &str) -> Option<SubscriptValue> {
 /// `EditarDadosPropriedade^%CSWDOCGLOBALRG` returns them: description, size,
 /// type, then the display list's values and its labels.
 ///
+/// Read from the right, because the description is free text and the only
+/// field that does contain a `|` in practice - `(tipoTributosGrade_"|"_seqTributo)`.
+/// Split from the left, everything after its bar slid one field over and the
+/// rest of the description came out as the size.
+///
 /// A line cut short by anything is read as far as it goes rather than
 /// dropped: a piece with a description and nothing else still says more than
 /// its number does.
-fn parse_doc<'a>(fields: &mut impl Iterator<Item = &'a str>) -> Doc {
+fn parse_doc(fields: &str) -> Doc {
+    let mut from_right: Vec<&str> = fields.rsplitn(5, '|').collect();
+    from_right.reverse();
+    // Fewer than five fields means the line was cut short, and then it is
+    // the trailing ones that are missing, not the description.
+    if from_right.len() < 5 {
+        from_right = fields.split('|').collect();
+    }
+    let mut fields = from_right.into_iter();
     let description = fields.next().unwrap_or_default().to_string();
     let size = fields.next().unwrap_or_default().to_string();
     let kind = fields.next().unwrap_or_default().to_string();
@@ -1895,6 +1908,29 @@ mod tests {
         assert_eq!(maps[0].pieces[2].sub, Some(1));
         assert_eq!(maps[0].pieces[2].sub_delim, Some(';'));
         assert_eq!(maps[0].pieces[2].label(), "12,1");
+    }
+
+    /// The ERP writes concatenated keys as `a_"|"_b` in its descriptions, and
+    /// that bar is the field separator of the answer. The description has to
+    /// keep it, and the size after it has to stay the size.
+    #[test]
+    fn a_bar_inside_a_description_stays_in_the_description() {
+        let maps = parse_answer(&answer(&[
+            "##CSWMAP##Fis.TribGradeAcat|TRIBMap|4|##",
+            "##CSWKEY##Fis.TribGradeAcat|TRIBMap|3|Chave de Controle de Tributo (tipoTributosGrade_\"|\"_seqTributo)|20|%String||##",
+            "##CSWTIP##Fis.TribGradeAcat|TRIBMap|1||Nota (a_\"|\"_b)|10|%String||##",
+        ]))
+        .expect("a complete answer");
+        let key = &maps[0].key_info[0].doc;
+        assert_eq!(
+            key.description,
+            "Chave de Controle de Tributo (tipoTributosGrade_\"|\"_seqTributo)"
+        );
+        assert_eq!(key.size, "20");
+        assert_eq!(key.kind, "%String");
+        let piece = &maps[0].pieces[0].doc;
+        assert_eq!(piece.description, "Nota (a_\"|\"_b)");
+        assert_eq!(piece.size, "10");
     }
 
     /// The subscripts are described the same way the pieces are, and picked
