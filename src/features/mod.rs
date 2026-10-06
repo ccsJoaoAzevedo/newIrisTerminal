@@ -15,14 +15,19 @@
 //! - [`analyze`] hands a transcript to Claude Code.
 //! - [`autocomplete`] suggests the rest of the word being typed at a prompt.
 //! - [`snake`] is the easter egg `/snake` opens, and is a game, not a terminal.
+//! - [`explorer_menu`] puts "Open newIrisTerminal here" in Explorer's
+//!   right-click menu, and reads the command line it launches with.
+//! - [`iris_terminal`] stands this app in for the IRIS tray's Terminal.
 //! - [`update`] checks for a newer release and installs it.
 
 pub mod analyze;
 pub mod autocomplete;
 pub mod autologon;
 pub mod doc_lookup;
+pub mod explorer_menu;
 pub mod export;
 pub mod history;
+pub mod iris_terminal;
 pub mod logging;
 pub mod macros;
 pub mod natives;

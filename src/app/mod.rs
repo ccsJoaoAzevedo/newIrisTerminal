@@ -216,6 +216,16 @@ const OUTPUT_FRAME: Duration = Duration::from_millis(33);
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_launch(cc, Default::default())
+    }
+
+    /// [`App::new`], opening what the command line asked for instead of the
+    /// usual first tab: a shell in a folder from Explorer's menu, or a session
+    /// for the IRIS tray's Terminal entry.
+    pub fn with_launch(
+        cc: &eframe::CreationContext<'_>,
+        launch: crate::features::explorer_menu::Launch,
+    ) -> Self {
         // So a session's reader thread can ask for the frame that will show
         // what it just read, instead of the UI redrawing forever on the chance
         // that something arrived.
@@ -390,7 +400,15 @@ impl App {
             .filter(|saved| !saved.tabs.is_empty());
         if let Some(saved) = saved {
             app.restore_session(saved);
-        } else if app.settings.open_on_start {
+        }
+        let server = launch
+            .server
+            .as_deref()
+            .and_then(|name| app.servers.get(name))
+            .map(|server| Profile::for_server(server, &app.instances, &Profile::default()));
+        if let Some(first) = launch.profile().or(server) {
+            app.open_tab(first);
+        } else if launch.as_terminal || (app.tabs.is_empty() && app.settings.open_on_start) {
             app.open_new_tab();
         }
         app

@@ -1455,7 +1455,86 @@ fn sessions() -> Vec<Section> {
                 .sub("Other command interpreters, offered under Shells in the new-session menu.")
                 .keys(&["cmd", "powershell", "bash", "wsl", "git", "interpreter", "interpretador"])],
         ),
+        section(
+            "IRIS tray",
+            vec![Item::rows("iris_terminal", "Open from the IRIS tray's Terminal", iris_terminal_rows)
+                .keys(&["iristerm", "tray", "launcher", "cube", "bandeja", "cubo"])],
+        )
+        .footer("Stands this app in for Iristerm.exe in the instance's bin folder, so the Terminal entry of the IRIS tray menu opens it. The original is kept beside it and put back when this is turned off."),
     ]
+}
+
+/// One row per local instance whose `bin` folder is known.
+fn iris_terminal_rows(card: &mut Card<'_>, _: &mut Ctx<'_>) {
+    use crate::features::iris_terminal::{self, State};
+    let launcher = crate::pty::launcher::launcher();
+    let instances: Vec<_> = crate::pty::launcher::instances(launcher.as_ref())
+        .into_iter()
+        .filter_map(|i| Some((i.name, i.bin_dir?)))
+        .collect();
+    if instances.is_empty() {
+        card.row(Row::new(tr("No local instance found.")), |_| ());
+    }
+    for (name, bin) in instances {
+        // Read off the disk on every frame the page is open, which is a whole
+        // file read: cached until something here changes it.
+        let state = iris_terminal_state(&bin, false);
+        let subtitle = match state {
+            State::Overwritten => {
+                tr("An IRIS upgrade replaced it. Turn on again to stand in for the new one.")
+            }
+            State::Missing => tr("Iristerm.exe not found in its bin folder."),
+            _ => "",
+        };
+        let error = IRIS_TERMINAL_ERROR.lock().ok().and_then(|e| e.clone());
+        let subtitle = error.as_deref().unwrap_or(subtitle);
+        let shown = bin.display().to_string();
+        let subtitle = if subtitle.is_empty() {
+            shown.as_str()
+        } else {
+            subtitle
+        };
+        card.row(Row::new(&name).subtitle(subtitle), |ui| {
+            let mut on = state == State::Installed;
+            let enabled = state != State::Missing;
+            let changed = ui
+                .add_enabled_ui(enabled, |ui| prefs::toggle(ui, &mut on).changed())
+                .inner;
+            if changed {
+                let result = if on {
+                    iris_terminal::install(&bin)
+                } else {
+                    iris_terminal::uninstall(&bin)
+                };
+                // A folder under Program Files needs elevation; saying so
+                // beats a switch that flips back without a word.
+                if let Ok(mut slot) = IRIS_TERMINAL_ERROR.lock() {
+                    *slot = result.err().map(|e| format!("{}: {e}", tr("Failed")));
+                }
+                iris_terminal_state(&bin, true);
+            }
+        });
+    }
+}
+
+static IRIS_TERMINAL_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn iris_terminal_state(
+    bin: &std::path::Path,
+    reread: bool,
+) -> crate::features::iris_terminal::State {
+    use std::collections::HashMap;
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<std::path::PathBuf, crate::features::iris_terminal::State>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if reread {
+        cache.remove(bin);
+    }
+    *cache
+        .entry(bin.to_path_buf())
+        .or_insert_with(|| crate::features::iris_terminal::state(bin))
 }
 
 /// One row per profile, leading to its own page, and the button that adds
@@ -1776,6 +1855,9 @@ fn shells() -> Vec<Section> {
         .footer("Other command interpreters, offered under Shells in the new-session menu. Every one of them is a .toml file in the folder below - the ones found installed on this machine were written there for you, and can be renamed, re-armed or deleted like any other."),
         untitled(vec![Item::control("shells_folder", "Shells folder", shells_folder)
             .keys(&["folder", "toml", "reload", "pasta", "recarregar"])]),
+        untitled(vec![Item::control("explorer_menu", "Explorer right-click menu", explorer_menu)
+            .keys(&["explorer", "context", "right-click", "folder", "contexto", "pasta"])])
+        .footer("Adds \"Open newIrisTerminal here\" to the menu of a folder, with a submenu of these shells. On Windows 11 it is under \"Show more options\"."),
     ]
 }
 
@@ -1810,6 +1892,27 @@ fn shells_folder(ui: &mut Ui, c: &mut Ctx<'_>) {
         // asks for it on every frame it is open. This is the way to say a
         // file has just changed.
         crate::plugins::shells::refresh();
+        // The submenu is a copy of the list, so it follows the reload.
+        if crate::features::explorer_menu::is_registered() {
+            let _ = crate::features::explorer_menu::register();
+        }
+    }
+}
+
+/// Reads the registry rather than a setting: the entry is the state, and it
+/// may have been removed by hand.
+fn explorer_menu(ui: &mut Ui, _: &mut Ctx<'_>) {
+    use crate::features::explorer_menu;
+    let mut on = explorer_menu::is_registered();
+    if prefs::toggle(ui, &mut on).changed() {
+        let result = if on {
+            explorer_menu::register()
+        } else {
+            explorer_menu::unregister()
+        };
+        if let Err(e) = result {
+            log::warn!("explorer menu: {e}");
+        }
     }
 }
 

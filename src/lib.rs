@@ -62,12 +62,21 @@ pub fn run() -> eframe::Result<()> {
     // small and the alternative is threading it through `run_native`'s
     // callback.
     let settings = config::Settings::load();
+    // The copy standing in for the tray's terminal only passes the request on
+    // to the real install, so updating that one updates both.
+    if features::iris_terminal::running_as_terminal() && features::iris_terminal::forward() {
+        return Ok(());
+    }
+    let mut launch = features::explorer_menu::Launch::parse(std::env::args().skip(1));
+    launch.as_terminal |= features::iris_terminal::running_as_terminal();
 
     // With closing to the tray on, a launch that finds another copy running
     // brings that one forward instead of starting a second, the way
     // Notepad++ does. Otherwise every launch after a close-to-tray left one
     // more hidden copy behind, each holding its sessions open.
-    if settings.close_to_tray && ui::tray::wake_existing() {
+    // Not for a launch from Explorer's menu, though: the running copy cannot
+    // be told which folder, so a window of its own opens there instead.
+    if settings.close_to_tray && launch == Default::default() && ui::tray::wake_existing() {
         return Ok(());
     }
 
@@ -115,6 +124,6 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "newIrisTerminal",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(app::App::with_launch(cc, launch)))),
     )
 }
