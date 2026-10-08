@@ -18,6 +18,7 @@ use egui::{Color32, Context, Pos2, Rect, Rounding, Stroke, Ui, Vec2};
 use super::{section, untitled, Category, Ctx, Item, Page, Section};
 use crate::features::screensaver::{Config, DvdContent, Kind, LogoContent};
 use crate::i18n::tr;
+use crate::ui::file_dialog;
 use crate::ui::panels::{UiRequest, WARNING};
 use crate::ui::prefs::{self, Card, Row};
 use crate::ui::screensaver_view::SaverView;
@@ -236,12 +237,20 @@ fn logo_image(card: &mut Card<'_>, c: &mut Ctx<'_>) {
     let saver = &mut c.settings.screensaver;
     let mut changed = false;
     card.row(Row::new(tr("File")).subtitle(note.as_deref()), |ui| {
-        if cfg!(windows)
+        if file_dialog::AVAILABLE
             && ui
                 .add_enabled(picking.is_none(), prefs::button_widget(tr("Browse...")))
                 .clicked()
         {
-            *picking = Some(pick_image(ui.ctx(), &saver.logo_image));
+            *picking = Some(file_dialog::pick(
+                ui.ctx(),
+                tr("Choose a picture"),
+                file_dialog::Kind {
+                    name: tr("Images"),
+                    patterns: "*.png;*.gif",
+                },
+                &saver.logo_image,
+            ));
         }
         let edit = egui::TextEdit::singleline(&mut saver.logo_image)
             .desired_width(220.0)
@@ -380,81 +389,10 @@ fn monitor_top(ui: &mut Ui, c: &mut Ctx<'_>) {
 /// The answer of a file dialog opened from the page, whatever page is on
 /// screen when it comes.
 pub(super) fn collect_picked_image(ctx: &Context, c: &mut Ctx<'_>) {
-    let state = &mut c.state.screensaver;
-    let Some(picking) = state.picking.as_ref() else {
-        return;
-    };
-    match picking.try_recv() {
-        Ok(picked) => {
-            state.picking = None;
-            if let Some(path) = picked {
-                c.settings.screensaver.logo_image = path;
-                c.changed = true;
-            }
-        }
-        // Often enough to see its answer, and no more: the thread wakes the
-        // window itself when it has one.
-        Err(std::sync::mpsc::TryRecvError::Empty) => {
-            ctx.request_repaint_after_for(Duration::from_millis(250), egui::ViewportId::ROOT);
-        }
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => state.picking = None,
+    if let Some(path) = file_dialog::collect(ctx, &mut c.state.screensaver.picking) {
+        c.settings.screensaver.logo_image = path;
+        c.changed = true;
     }
-}
-
-/// Opens the system's file dialog for a PNG or GIF, starting at `current`;
-/// the answer arrives on the receiver, `None` if it was cancelled.
-fn pick_image(ctx: &Context, current: &str) -> Receiver<Option<String>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let ctx = ctx.clone();
-    let current = current.trim().to_owned();
-    let title = tr("Choose a picture");
-    let kind = tr("Images");
-    std::thread::spawn(move || {
-        let _ = tx.send(open_file_dialog(title, kind, &current));
-        ctx.request_repaint_of(egui::ViewportId::ROOT);
-    });
-    rx
-}
-
-#[cfg(windows)]
-fn open_file_dialog(title: &str, kind: &str, current: &str) -> Option<String> {
-    use windows_sys::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
-    };
-    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-    // Pairs of name and pattern, each ended by a NUL, and the list by one more.
-    let filter: Vec<u16> = format!("{kind} (*.png, *.gif)\0*.png;*.gif\0\0")
-        .encode_utf16()
-        .collect();
-    let title = wide(title);
-    let mut file = vec![0u16; 4096];
-    // Starting from the file already chosen opens the dialog in its folder.
-    for (slot, unit) in file.iter_mut().zip(current.encode_utf16().take(4095)) {
-        *slot = unit;
-    }
-    // SAFETY: OPENFILENAMEW is plain data - integers, pointers and an
-    // optional callback - for which all zeroes is the documented "unset".
-    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
-    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-    ofn.lpstrFilter = filter.as_ptr();
-    ofn.lpstrFile = file.as_mut_ptr();
-    ofn.nMaxFile = file.len() as u32;
-    ofn.lpstrTitle = title.as_ptr();
-    // NOCHANGEDIR: left to itself the dialog moves the whole process's
-    // working directory to wherever the file was.
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    // SAFETY: every buffer the struct points at outlives the call.
-    if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
-        return None;
-    }
-    let end = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    Some(String::from_utf16_lossy(&file[..end]))
-}
-
-/// Elsewhere there is no dialog to open, and the path is typed instead.
-#[cfg(not(windows))]
-fn open_file_dialog(_title: &str, _kind: &str, _current: &str) -> Option<String> {
-    None
 }
 
 /// The CRT the preview runs on: a beige-grey bezel, the screen, and a stand.

@@ -42,6 +42,8 @@ pub enum UiRequest {
     ToggleAlwaysOnTop,
     /// Write the personal macro file back to disk.
     SavePersonalMacros,
+    /// Read both macro files again, after the organisation's has moved.
+    ReloadMacros,
     /// Show a folder in the platform's file manager.
     OpenFolder(std::path::PathBuf),
     /// Ask GitHub whether there is a newer version, and say either way.

@@ -702,6 +702,7 @@ pub fn settings_dialog(
     // misses the file a dialog has just picked.
     macros::forget_stale_selection(&mut c);
     screensaver::collect_picked_image(ctx, &mut c);
+    macros::collect_picked_org_file(ctx, &mut c);
     crate::ui::detach::shell(
         ctx,
         "nit-settings",
@@ -1132,6 +1133,14 @@ fn tab_width(ui: &mut Ui, c: &mut Ctx<'_>) {
     c.changed |= prefs::segmented(ui, &mut c.settings.tab_width, &options);
 }
 
+fn tab_close_side(ui: &mut Ui, c: &mut Ctx<'_>) {
+    let options: Vec<(crate::config::TabCloseSide, &str)> = crate::config::TabCloseSide::ALL
+        .iter()
+        .map(|&side| (side, tr(side.label())))
+        .collect();
+    c.changed |= prefs::segmented(ui, &mut c.settings.tab_close_side, &options);
+}
+
 fn autocomplete_mode(ui: &mut Ui, c: &mut Ctx<'_>) {
     let options: Vec<(crate::config::AutocompleteMode, &str)> =
         crate::config::AutocompleteMode::ALL
@@ -1220,6 +1229,9 @@ fn title_bar() -> Vec<Section> {
                 Item::control("tab_width", "Tab width", tab_width)
                     .hint("Fill the bar: the tabs share the whole row between them. Fixed size: each tab is as wide as its name, within limits, and the rest of the row is left free - in the title bar, somewhere to drag the window by. The tabs look the same either way.")
                     .keys(&["tabs", "abas", "width", "largura", "size", "tamanho", "fixed", "fixo"]),
+                Item::control("tab_close_side", "Close button position", tab_close_side)
+                    .hint("Which end of each tab the button that closes it is drawn at.")
+                    .keys(&["tabs", "abas", "close", "fechar", "left", "right", "esquerda", "direita"]),
             ],
         ),
         section(

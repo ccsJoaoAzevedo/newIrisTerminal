@@ -229,6 +229,27 @@ impl TabWidth {
     }
 }
 
+/// Which end of a tab its close button sits at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabCloseSide {
+    /// Where GNOME puts it, and where it has always been here.
+    #[default]
+    Left,
+    Right,
+}
+
+impl TabCloseSide {
+    pub const ALL: [TabCloseSide; 2] = [TabCloseSide::Left, TabCloseSide::Right];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TabCloseSide::Left => "Left",
+            TabCloseSide::Right => "Right",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -382,6 +403,8 @@ pub struct Settings {
     /// Whether the tabs share their row out between them or each keep a
     /// width of its own. Only the space they take: they are drawn the same.
     pub tab_width: TabWidth,
+    /// Which end of each tab the close button is drawn at.
+    pub tab_close_side: TabCloseSide,
     /// Reopen at the size the window was last closed at. Off opens every
     /// launch at [`Settings::default_geometry`].
     pub save_terminal_size: bool,
@@ -496,6 +519,7 @@ impl Default for Settings {
             close_to_tray: false,
             tabs_in_title_bar: false,
             tab_width: TabWidth::default(),
+            tab_close_side: TabCloseSide::default(),
             save_terminal_size: false,
             default_cols: DEFAULT_TERMINAL_COLS,
             default_rows: DEFAULT_TERMINAL_ROWS,

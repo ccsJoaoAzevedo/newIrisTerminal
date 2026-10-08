@@ -841,6 +841,15 @@ const PT_BR: &[(&str, &str)] = &[
     ("Fixed size", "Tamanho fixo"),
     ("Fill the bar: the tabs share the whole row between them. Fixed size: each tab is as wide as its name, within limits, and the rest of the row is left free - in the title bar, somewhere to drag the window by. The tabs look the same either way.",
      "Preencher a barra: as abas dividem a linha inteira entre si. Tamanho fixo: cada aba tem a largura do seu nome, dentro de limites, e o resto da linha fica livre - na barra de título, um lugar para arrastar a janela. As abas têm a mesma aparência nos dois casos."),
+    // Organization macro file dialog
+    ("Choose the organization macro file", "Escolha o arquivo de macros da organização"),
+    ("Macro files", "Arquivos de macros"),
+    // Tab close side
+    ("Close button position", "Posição do botão fechar"),
+    ("Left", "Esquerda"),
+    ("Right", "Direita"),
+    ("Which end of each tab the button that closes it is drawn at.",
+     "Em qual ponta de cada aba fica o botão que a fecha."),
     // Autocomplete mode
     ("Autocomplete offers", "O autocompletar oferece"),
     ("Only global data", "Só dados de globais"),

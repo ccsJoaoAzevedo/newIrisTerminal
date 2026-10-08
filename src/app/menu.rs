@@ -384,71 +384,84 @@ impl App {
         // once decided per end, and a theme with left-hand buttons and the
         // buttons switched off drew it on neither.
         let pin = Some(self.settings.always_on_top);
-        ui.horizontal(|ui| {
-            // Both of these need the app, and the bar holds both at once; they
-            // are never called at the same time, which is all the cell has to
-            // know.
-            let app = std::cell::RefCell::new(&mut *self);
-            let mut new_tab = |ui: &mut egui::Ui| {
-                let (clicked, picked) = app.borrow().new_tab_control(ui, buttons);
-                open_default |= clicked;
-                pick = pick.take().or(picked);
-            };
-            // Whatever stands where the theme puts the tabs: the tabs, when the
-            // setting has moved them up here, and the session's own line -
-            // instance, PID, geometry - when it has not. The two cannot both
-            // have that place, and the tabs say which session it is anyway.
-            //
-            // Macros, Export and the IRIS utilities all used to sit beside it.
-            // Every one of them was about the output rather than about the
-            // app, and all three are now on the terminal's own right-click
-            // menu, beside the session they act on; writing macros is in
-            // Settings, with the themes.
-            let mut middle = |ui: &mut egui::Ui, room: f32| -> Option<WindowAction> {
-                let mut app = app.borrow_mut();
-                if inline_tabs {
-                    // Drawn in the row rather than into a rectangle handed to
-                    // `chrome`, which is what lets the row's own cursor
-                    // measure them. Bounded, or a strip of tabs long enough
-                    // would run under the window buttons.
-                    app.tab_strip_bounded(ui, room);
-                    return None;
-                }
-                let tab = app.active_tab()?;
-                let (cols, rows) = app.view_size;
-                // The instance, then what identifies this session of it, then
-                // how big the window is - in that order because that is how
-                // specific each one is.
-                let pid = match tab.pid().filter(|_| app.settings.show_pid) {
-                    Some(pid) => format!("  PID {pid}"),
-                    None => String::new(),
+        // The row is as tall as what is tallest in it from the start. A plain
+        // `horizontal` row starts a button high and grows when the taller tabs
+        // are drawn, which centred every button ahead of the tabs on the short
+        // row and left them sitting high on the tall one.
+        let height = if inline_tabs {
+            super::tabs::tab_height(ui)
+        } else {
+            ui.spacing().interact_size.y
+        };
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), height),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                // Both of these need the app, and the bar holds both at once; they
+                // are never called at the same time, which is all the cell has to
+                // know.
+                let app = std::cell::RefCell::new(&mut *self);
+                let mut new_tab = |ui: &mut egui::Ui| {
+                    let (clicked, picked) = app.borrow().new_tab_control(ui, buttons);
+                    open_default |= clicked;
+                    pick = pick.take().or(picked);
                 };
-                let info = format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint());
-                // Reading matter, and nothing else: the window is dragged by
-                // it like any other empty stretch of the bar.
-                chrome::drag_text(
+                // Whatever stands where the theme puts the tabs: the tabs, when the
+                // setting has moved them up here, and the session's own line -
+                // instance, PID, geometry - when it has not. The two cannot both
+                // have that place, and the tabs say which session it is anyway.
+                //
+                // Macros, Export and the IRIS utilities all used to sit beside it.
+                // Every one of them was about the output rather than about the
+                // app, and all three are now on the terminal's own right-click
+                // menu, beside the session they act on; writing macros is in
+                // Settings, with the themes.
+                let mut middle = |ui: &mut egui::Ui, room: f32| -> Option<WindowAction> {
+                    let mut app = app.borrow_mut();
+                    if inline_tabs {
+                        // Drawn in the row rather than into a rectangle handed to
+                        // `chrome`, which is what lets the row's own cursor
+                        // measure them. Bounded, or a strip of tabs long enough
+                        // would run under the window buttons.
+                        app.tab_strip_bounded(ui, room);
+                        return None;
+                    }
+                    let tab = app.active_tab()?;
+                    let (cols, rows) = app.view_size;
+                    // The instance, then what identifies this session of it, then
+                    // how big the window is - in that order because that is how
+                    // specific each one is.
+                    let pid = match tab.pid().filter(|_| app.settings.show_pid) {
+                        Some(pid) => format!("  PID {pid}"),
+                        None => String::new(),
+                    };
+                    let info = format!("{}{pid}  {cols}x{rows}", tab.profile.endpoint());
+                    // Reading matter, and nothing else: the window is dragged by
+                    // it like any other empty stretch of the bar.
+                    chrome::drag_text(
+                        ui,
+                        egui::RichText::new(info).weak(),
+                        true,
+                        "nit-main",
+                        "session",
+                    )
+                };
+                action = chrome::title_bar(
                     ui,
-                    egui::RichText::new(info).weak(),
-                    true,
-                    "nit-main",
-                    "session",
-                )
-            };
-            action = chrome::title_bar(
-                ui,
-                chrome::TitleBar {
-                    style: buttons,
-                    window_controls: own_buttons,
-                    window: "nit-main",
-                    draggable: true,
-                    settings: Some(&mut show_settings),
-                    on_top: pin,
-                    new_tab: Some(&mut new_tab),
-                    tabs: &mut middle,
-                    tabs_fill,
-                },
-            );
-        });
+                    chrome::TitleBar {
+                        style: buttons,
+                        window_controls: own_buttons,
+                        window: "nit-main",
+                        draggable: true,
+                        settings: Some(&mut show_settings),
+                        on_top: pin,
+                        new_tab: Some(&mut new_tab),
+                        tabs: &mut middle,
+                        tabs_fill,
+                    },
+                );
+            },
+        );
         self.panels.show_settings = show_settings;
 
         // A pick opens that session and leaves the default alone. Making the
@@ -553,6 +566,16 @@ impl App {
                         &path.display().to_string(),
                     )),
                     Err(e) => self.set_status(tr1("Could not save macros: {}", &format!("{e:#}"))),
+                }
+            }
+            UiRequest::ReloadMacros => {
+                // Only when a file is browsed for, never as the path is typed:
+                // the file is often on a share, and a read per keystroke would
+                // stall the window on every one.
+                let report = super::load_macros(&self.settings);
+                self.macro_groups = report.groups;
+                if let Some(problem) = report.problems.first() {
+                    self.set_status(problem.clone());
                 }
             }
         }

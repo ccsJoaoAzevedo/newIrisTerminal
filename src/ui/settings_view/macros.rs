@@ -20,6 +20,7 @@ use super::{
 };
 use crate::features::macros::{Macro, MacroGroup, Origin, Param, ParamUse};
 use crate::i18n::{tr, tr1, tr2};
+use crate::ui::file_dialog;
 use crate::ui::panels::{UiRequest, WARNING};
 use crate::ui::prefs::{self, Card, Row};
 use crate::ui::shortcut;
@@ -79,6 +80,8 @@ pub struct MacroPageState {
     /// A macro Delete has been pressed on, waiting on the confirmation that a
     /// deleted macro is not recoverable.
     confirm_delete: Option<(usize, usize)>,
+    /// The file dialog choosing the organisation's file, while it is open.
+    picking_org: Option<std::sync::mpsc::Receiver<Option<String>>>,
 }
 
 impl MacroPageState {
@@ -600,9 +603,25 @@ fn org_macros(card: &mut Card<'_>, c: &mut Ctx<'_>) {
         Some(true) => tr("Found."),
         Some(false) => tr("Not reachable right now - personal macros will still load."),
     };
+    let picking = &mut c.state.macros.picking_org;
     let settings = &mut *c.settings;
     let mut changed = false;
     card.row(Row::new(tr("Path")).subtitle(subtitle), |ui| {
+        if file_dialog::AVAILABLE
+            && ui
+                .add_enabled(picking.is_none(), prefs::button_widget(tr("Browse...")))
+                .clicked()
+        {
+            *picking = Some(file_dialog::pick(
+                ui.ctx(),
+                tr("Choose the organization macro file"),
+                file_dialog::Kind {
+                    name: tr("Macro files"),
+                    patterns: "*.xml",
+                },
+                &settings.org_macros_path.display().to_string(),
+            ));
+        }
         let mut org = settings.org_macros_path.display().to_string();
         let edit = egui::TextEdit::singleline(&mut org).desired_width(260.0);
         let edit = if status == Some(false) {
@@ -616,6 +635,27 @@ fn org_macros(card: &mut Card<'_>, c: &mut Ctx<'_>) {
         }
     });
     c.changed |= changed;
+}
+
+/// The answer of the organisation file's dialog, whatever page is on screen
+/// when it comes.
+pub(super) fn collect_picked_org_file(ctx: &egui::Context, c: &mut Ctx<'_>) {
+    if let Some(path) = file_dialog::collect(ctx, &mut c.state.macros.picking_org) {
+        c.settings.org_macros_path = std::path::PathBuf::from(path);
+        c.changed = true;
+        // The organisation's groups come first in the list, so loading a
+        // different file moves every personal macro's place in it: the editor
+        // lets go of the one it is on - keeping what was typed - before the
+        // indices it holds come to mean another macro.
+        let state = &mut c.state.macros;
+        if state.select(None, c.macro_groups) {
+            c.requests.push(UiRequest::SavePersonalMacros);
+        }
+        state.selected_group = None;
+        state.group_rename = None;
+        state.confirm_delete = None;
+        c.requests.push(UiRequest::ReloadMacros);
+    }
 }
 
 /// A copy of `source`, under a name that says it is one.

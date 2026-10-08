@@ -78,11 +78,21 @@ impl eframe::App for App {
         // panel's own margin and the line under it would leave a band above
         // and below them that is neither tab nor terminal.
         let tabs_inline = self.settings.tabs_in_title_bar && !self.tabs.is_empty();
+        // And across to the window's edge, at an end they are the last thing
+        // at - see `chrome::main_tabs_ends`.
+        let (flush_left, flush_right) = if tabs_inline {
+            crate::ui::chrome::main_tabs_ends(
+                &theme.window_buttons,
+                self.settings.tab_width == crate::config::TabWidth::Shared,
+            )
+        } else {
+            (false, false)
+        };
         let bar_frame = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
             top: if tabs_inline { 0.0 } else { 2.0 },
             bottom: if tabs_inline { 0.0 } else { 2.0 },
-            left: 8.0,
-            right: 8.0,
+            left: if flush_left { 0.0 } else { 8.0 },
+            right: if flush_right { 0.0 } else { 8.0 },
         });
         egui::TopBottomPanel::top("menu")
             .frame(bar_frame)

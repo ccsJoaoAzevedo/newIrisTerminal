@@ -1,10 +1,10 @@
 [package]
 name = "new-iris-terminal"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "Terminal emulator for InterSystems IRIS"
 license = "MIT"
-repository = "https://github.com/ccsJoaoAzevedo/newIrisTerminal"
+repository = "https://github.com/consistem/new-iris-terminal"
 build = "build.rs"
 
 [dependencies]

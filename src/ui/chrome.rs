@@ -587,11 +587,19 @@ pub struct TitleBar<'a> {
 }
 
 /// One item of the order, laid out: its kind, and the width it advances the
-/// row by.
-fn item_width(bar: &TitleBar, button: TitleButton, side: f32, tabs: f32, gap: f32) -> f32 {
+/// row by. `tabs_gap` is what follows the tabs, which is nothing when they are
+/// the last thing on the bar.
+fn item_width(
+    bar: &TitleBar,
+    button: TitleButton,
+    side: f32,
+    tabs: f32,
+    gap: f32,
+    tabs_gap: f32,
+) -> f32 {
     match button {
         TitleButton::LeftSpace | TitleButton::RightSpace => 0.0,
-        TitleButton::Tabs => tabs + gap,
+        TitleButton::Tabs => tabs + tabs_gap,
         b if drawn(bar, b) => side + gap,
         _ => 0.0,
     }
@@ -609,6 +617,46 @@ fn drawn(bar: &TitleBar, button: TitleButton) -> bool {
         TitleButton::Tabs => true,
         TitleButton::LeftSpace | TitleButton::RightSpace => false,
     }
+}
+
+/// Whether the tabs reach the left-hand and the right-hand end of the bar.
+///
+/// An end they reach is one the window's own margin should be taken off, so
+/// they run to the edge of the window as GNOME's do. Kept, the margin and the
+/// row's spacing after the last tab left a strip of bar beyond them that was
+/// neither tab nor anything to drag - wide enough to look like a missing
+/// button, whenever every button had been ordered to the other end.
+///
+/// The left end is reached by tabs that open the left-hand group. The right is
+/// reached by tabs nothing drawn follows, when they either fill the bar or are
+/// packed against that end.
+fn tabs_ends(
+    order: &[TitleButton],
+    fill: bool,
+    drawn: &dyn Fn(TitleButton) -> bool,
+) -> (bool, bool) {
+    let Some(at) = order.iter().position(|b| *b == TitleButton::Tabs) else {
+        return (false, false);
+    };
+    let left_space = order.iter().position(|b| *b == TitleButton::LeftSpace);
+    let right_space = order.iter().position(|b| *b == TitleButton::RightSpace);
+    let leading = left_space.is_some_and(|space| at < space);
+    let trailing = right_space.is_some_and(|space| at > space);
+    let first = leading && !order[..at].iter().any(|b| drawn(*b));
+    let last = (fill || trailing) && !order[at + 1..].iter().any(|b| drawn(*b));
+    (first, last)
+}
+
+/// `tabs_ends` for the main window, whose bar has every control it can have:
+/// which the frame around the bar has to know before the bar is drawn.
+pub fn main_tabs_ends(style: &WindowButtons, fill: bool) -> (bool, bool) {
+    tabs_ends(&style.order, fill, &|button| match button {
+        TitleButton::Close | TitleButton::Minimize | TitleButton::Maximize | TitleButton::OnTop => {
+            style.shows(button)
+        }
+        TitleButton::LeftSpace | TitleButton::RightSpace => false,
+        TitleButton::Settings | TitleButton::NewTab | TitleButton::Tabs => true,
+    })
 }
 
 /// Where the centred group starts, given where the left group ended, where the
@@ -646,21 +694,26 @@ pub fn title_bar(ui: &mut Ui, mut bar: TitleBar) -> Option<WindowAction> {
     let tabs_id = Id::new(("nit-titlebar-tabs-width", bar.window));
     let remembered: f32 = ui.data(|d| d.get_temp(tabs_id)).unwrap_or(0.0);
 
+    // Tabs at the very end of the bar need no spacing after them: there is
+    // nothing for it to separate them from.
+    let (_, tabs_last) = tabs_ends(&style.order, bar.tabs_fill, &|b| drawn(&bar, b));
+    let tabs_gap = if tabs_last { 0.0 } else { gap };
+
     // What the tabs may take: the bar less every button on it and the strip
     // that is always left free.
     let fixed: f32 = style
         .order
         .iter()
         .filter(|b| **b != TitleButton::Tabs)
-        .map(|b| item_width(&bar, *b, side, 0.0, gap))
+        .map(|b| item_width(&bar, *b, side, 0.0, gap, tabs_gap))
         .sum();
     let free = if bar.tabs_fill { 0.0 } else { FREE_STRIP };
-    let tabs_room = (full.end - full.start - fixed - gap - free).max(60.0);
+    let tabs_room = (full.end - full.start - fixed - tabs_gap - free).max(60.0);
     let tabs_guess = remembered.min(tabs_room);
     let width_of = |bar: &TitleBar, group: &[TitleButton]| -> f32 {
         group
             .iter()
-            .map(|b| item_width(bar, *b, side, tabs_guess, gap))
+            .map(|b| item_width(bar, *b, side, tabs_guess, gap, tabs_gap))
             .sum()
     };
     let middle_width = width_of(&bar, style.middle());
@@ -1040,6 +1093,32 @@ mod tests {
     #[test]
     fn the_middle_group_is_centred_on_the_whole_bar() {
         assert_eq!(centred_start(0.0..1000.0, 100.0, 900.0, 200.0), 400.0);
+    }
+
+    #[test]
+    fn tabs_reach_the_end_of_the_bar_only_when_nothing_drawn_is_beyond_them() {
+        use TitleButton::*;
+        let all = |b: TitleButton| !matches!(b, LeftSpace | RightSpace);
+        // Every button on the left: the tabs that fill the rest run to the
+        // right-hand edge, and a fixed-width strip of them does not.
+        let left = [
+            Close, Minimize, Maximize, Settings, NewTab, Tabs, LeftSpace, RightSpace,
+        ];
+        assert_eq!(tabs_ends(&left, true, &all), (false, true));
+        assert_eq!(tabs_ends(&left, false, &all), (false, false));
+        // Every button on the right: the tabs open the bar.
+        let right = [
+            Tabs, LeftSpace, RightSpace, Settings, Minimize, Maximize, Close,
+        ];
+        assert_eq!(tabs_ends(&right, true, &all), (true, false));
+        // Packed against the right end, they reach it at any width.
+        let packed = [Close, LeftSpace, RightSpace, Tabs];
+        assert_eq!(tabs_ends(&packed, false, &all), (false, true));
+        // A button the theme has hidden is not something between them and
+        // the edge.
+        let hidden = |b: TitleButton| all(b) && b != Close;
+        let close_last = [Tabs, LeftSpace, RightSpace, Close];
+        assert_eq!(tabs_ends(&close_last, true, &hidden), (true, true));
     }
 
     #[test]

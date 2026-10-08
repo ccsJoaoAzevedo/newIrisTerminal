@@ -1014,19 +1014,30 @@ fn existing_subscripts(found: &Subscripts, prefix: &SubscriptPrefix) -> Vec<Cand
             })
             .collect();
     }
-    // Numbers first, as IRIS collates them.
-    let mut groups: std::collections::BTreeMap<(bool, String), usize> = Default::default();
-    for v in &values {
-        let head: String = v.value.chars().take(typed_len + 1).collect();
-        *groups.entry((!v.number, head)).or_default() += 1;
-    }
-    for next in found.next.iter().filter(|n| prefix.admits(n)) {
-        groups
-            .entry((!next.number, next.value.clone()))
-            .or_default();
+    // As deep as the list allows: one character past what was typed split
+    // two hundred values into `"0…` and `"1…`, two lines that said next to
+    // nothing. Every character more is a line per what follows it, for as
+    // long as the lines still fit. Not past a list the server cut short: what
+    // it names beyond the cut is the next character alone, and a deeper
+    // grouping of the part before the cut would pass for all of them.
+    let depth = if found.more {
+        typed_len + 1
+    } else {
+        (typed_len + 1..=typed_len + FOLD_DEPTH)
+            .take_while(|&depth| fold_groups(&values, depth).len() <= MAX_FOLDED)
+            .last()
+            .unwrap_or(typed_len + 1)
+    };
+    let mut groups = fold_groups(&values, depth);
+    if found.more {
+        for next in found.next.iter().filter(|n| prefix.admits(n)) {
+            groups
+                .entry((!next.number, next.value.clone()))
+                .or_insert((0, None));
+        }
     }
     let mut out = Vec::new();
-    for ((string, head), count) in groups {
+    for ((string, head), (count, only)) in groups {
         if out.len() >= MAX_FOLDED {
             break;
         }
@@ -1044,17 +1055,12 @@ fn existing_subscripts(found: &Subscripts, prefix: &SubscriptPrefix) -> Vec<Cand
             continue;
         }
         // A line standing for one value might as well be the value.
-        if count == 1 && !found.more {
-            if let Some(only) = values
-                .iter()
-                .find(|v| v.number == start.number && v.value.starts_with(&start.value))
-            {
-                out.push(Candidate {
-                    note: Some(tr("exists").to_string()),
-                    ..Candidate::new(typed_value(only), Category::Subscript)
-                });
-                continue;
-            }
+        if let (1, Some(only), false) = (count, only, found.more) {
+            out.push(Candidate {
+                note: Some(tr("exists").to_string()),
+                ..Candidate::new(typed_value(only), Category::Subscript)
+            });
+            continue;
         }
         out.push(Candidate {
             note: Some(if found.more || count == 0 {
@@ -1067,6 +1073,29 @@ fn existing_subscripts(found: &Subscripts, prefix: &SubscriptPrefix) -> Vec<Cand
         });
     }
     out
+}
+
+/// How many characters past what was typed a folded list of subscripts may
+/// group by.
+const FOLD_DEPTH: usize = 5;
+
+/// Subscript values by whether they are strings and how they start: how many
+/// share the start, and the one value when there is only one.
+type FoldGroups<'a> =
+    std::collections::BTreeMap<(bool, String), (usize, Option<&'a SubscriptValue>)>;
+
+/// `values` grouped by their first `depth` characters, numbers first as IRIS
+/// collates them: how many fall in each group, and the value itself when it is
+/// the only one.
+fn fold_groups<'a>(values: &[&'a SubscriptValue], depth: usize) -> FoldGroups<'a> {
+    let mut groups = FoldGroups::default();
+    for v in values {
+        let head: String = v.value.chars().take(depth).collect();
+        let group = groups.entry((!v.number, head)).or_insert((0, None));
+        group.0 += 1;
+        group.1 = (group.0 == 1).then_some(*v);
+    }
+    groups
 }
 
 /// A value found under a node, as it has to be typed: a number bare, a
@@ -1906,26 +1935,44 @@ mod tests {
         assert!(items.iter().all(|c| !c.narrows));
     }
 
-    /// More than the popup holds folds into one line per next character, the
-    /// way `^mtemp…` does for global names - numbers first, as IRIS collates.
+    /// More than the popup holds folds on as many characters as still leaves
+    /// a line per group: `XA0…`, `XA1…`, not `X…` alone.
     #[test]
-    fn more_values_than_the_popup_holds_fold_into_the_next_character() {
-        let many: Vec<String> = (0..12)
-            .map(|i| format!("CC{}", (b'A' + i % 3) as char))
+    fn a_long_list_folds_as_deep_as_the_popup_has_lines_for() {
+        let many: Vec<String> = ['A', 'B', 'C']
+            .iter()
+            .flat_map(|a| (0..12).map(move |n| format!("X{a}{n:02}")))
             .collect();
         let mut values: Vec<(&str, bool)> = many.iter().map(|v| (v.as_str(), false)).collect();
-        values.push(("CD", false));
-        let items = existing_subscripts(
-            &found(&values, false, &[]),
-            &SubscriptPrefix::Strings("C".into()),
-        );
-        let shown: Vec<(String, bool)> =
-            items.iter().map(|c| (c.text.clone(), c.narrows)).collect();
+        values.push(("Y", false));
+        let items = existing_subscripts(&found(&values, false, &[]), &SubscriptPrefix::Any);
+        let shown: Vec<(&str, bool)> = items.iter().map(|c| (c.text.as_str(), c.narrows)).collect();
+        // One more character would be a line for each of the 36 values.
         assert_eq!(
             shown,
-            [("\"CC".to_string(), true), ("\"CD\"".to_string(), false)]
+            [
+                ("\"XA0", true),
+                ("\"XA1", true),
+                ("\"XB0", true),
+                ("\"XB1", true),
+                ("\"XC0", true),
+                ("\"XC1", true),
+                ("\"Y\"", false),
+            ]
         );
-        assert_eq!(items[0].display(), "\"CC…");
+        assert_eq!(items[0].label(), tr1("{} values", "10"));
+        assert_eq!(items[0].display(), "\"XA0…");
+    }
+
+    /// However few the groups, no deeper than `FOLD_DEPTH` characters: past
+    /// that a line is most of the value, and the list is no longer a summary.
+    #[test]
+    fn a_fold_goes_no_deeper_than_five_characters() {
+        let many: Vec<String> = (0..12).map(|n| format!("ABCDEFGH{n:02}")).collect();
+        let values: Vec<(&str, bool)> = many.iter().map(|v| (v.as_str(), false)).collect();
+        let items = existing_subscripts(&found(&values, false, &[]), &SubscriptPrefix::Any);
+        let texts: Vec<&str> = items.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["\"ABCDE"]);
     }
 
     /// A list the server cut short is folded on what it says can come next,

@@ -26,6 +26,7 @@ pub mod completion;
 pub mod desktop;
 pub mod detach;
 pub mod dialog;
+pub mod file_dialog;
 pub mod fonts;
 pub mod icons;
 pub mod input;

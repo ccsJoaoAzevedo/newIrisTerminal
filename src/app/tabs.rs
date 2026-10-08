@@ -201,6 +201,7 @@ impl App {
         let mut to_reopen = false;
         let can_reopen = !self.closed_tabs.is_empty();
         let with_namespace = self.settings.show_namespace_in_tab;
+        let close_side = self.settings.tab_close_side;
         let theme = self.theme();
         // The shown tab is the terminal's own colour, so it runs on into the
         // terminal under it, as elementary's does; a theme that names its own
@@ -304,7 +305,15 @@ impl App {
                         label.push_str(" · SQL");
                     }
                     let (response, close) =
-                        tab_pill(ui, self.tabs[index].uid, selected, label, selected_colours, shared);
+                        tab_pill(
+                        ui,
+                        self.tabs[index].uid,
+                        selected,
+                        label,
+                        selected_colours,
+                        shared,
+                        close_side,
+                    );
                     // A line between two tabs neither of which is shown: the
                     // shown one is set off by its colour already.
                     let next_selected = index + 1 == self.active;
@@ -728,11 +737,26 @@ impl App {
 const TAB_MIN_WIDTH: f32 = 120.0;
 const TAB_MAX_WIDTH: f32 = 220.0;
 
+/// The air between a tab's close button and its name. The name is held off
+/// both ends by this much, not only the button's, so it stays centred whichever
+/// side the button is on; without it a name long enough to be cut short ran
+/// right up against the cross.
+const TAB_CLOSE_GAP: f32 = 6.0;
+
+/// How tall a tab is: a little taller than a button, so the strip reads as
+/// tabs rather than as one more row of buttons. The title bar sizes its row by
+/// this when the tabs are in it, or the buttons ahead of them would be centred
+/// on a row the tabs then make taller.
+pub(super) fn tab_height(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y + 4.0
+}
+
 /// One tab, drawn the way elementary's Files and Terminal draw theirs: the
 /// whole height of its bar, square, the one shown filled with the terminal's
 /// colour so it runs on into the terminal, the rest flat until hovered. The
-/// close button is inside it on the left - shown on the tab being looked at
-/// and on the one under the pointer - and the name is centred. `width` is
+/// close button is inside it, at whichever end `close_at` says - shown on the
+/// tab being looked at and on the one under the pointer - and the name is
+/// centred. `width` is
 /// the tab's share of a row it fills; `None` sizes it to its name.
 ///
 /// The close button is registered after the tab, so it is the one a click on
@@ -744,14 +768,16 @@ fn tab_pill(
     text: String,
     colours: (Option<egui::Color32>, Option<egui::Color32>),
     width: Option<f32>,
+    close_at: crate::config::TabCloseSide,
 ) -> (egui::Response, Option<egui::Response>) {
-    let base = ui.spacing().interact_size.y + 4.0;
+    let base = tab_height(ui);
     let height = ui.available_height().max(base);
     let close_side = base - 8.0;
     let pad = 8.0;
     let font = egui::TextStyle::Button.resolve(ui.style());
     let outer = width.unwrap_or(TAB_MAX_WIDTH);
-    let room = outer - 2.0 * (pad + close_side);
+    let inset = pad + close_side + TAB_CLOSE_GAP;
+    let room = outer - 2.0 * inset;
     let mut job = egui::text::LayoutJob::simple_singleline(text, font, egui::Color32::PLACEHOLDER);
     job.wrap = egui::text::TextWrapping {
         max_width: room,
@@ -760,17 +786,20 @@ fn tab_pill(
         overflow_character: Some('…'),
     };
     let galley = ui.fonts(|f| f.layout_job(job));
-    let width = width.unwrap_or_else(|| {
-        (galley.size().x + 2.0 * (pad + close_side)).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
-    });
+    let width = width
+        .unwrap_or_else(|| (galley.size().x + 2.0 * inset).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH));
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let response = ui.interact(
         rect,
         egui::Id::new(("nit-tab", uid)),
         egui::Sense::click_and_drag(),
     );
+    let close_x = match close_at {
+        crate::config::TabCloseSide::Left => rect.left() + pad + close_side / 2.0,
+        crate::config::TabCloseSide::Right => rect.right() - pad - close_side / 2.0,
+    };
     let close_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + pad + close_side / 2.0, rect.center().y),
+        egui::pos2(close_x, rect.center().y),
         egui::Vec2::splat(close_side),
     );
     let shows_close = selected || ui.rect_contains_pointer(rect);
